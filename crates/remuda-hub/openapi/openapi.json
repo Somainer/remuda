@@ -7071,7 +7071,8 @@
                 "schema": {
                   "properties": {
                     "ok": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "True on 200, false on 503."
                     },
                     "version": {
                       "type": "string",
@@ -7082,24 +7083,129 @@
                       "format": "uint64",
                       "description": "Whole seconds since this Hub process started.",
                       "minimum": 0
+                    },
+                    "lastTickAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the wake tick last completed; absent before the first."
+                    },
+                    "tickAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "Seconds since the last completed wake tick (since the store opened, before the first)."
+                    },
+                    "tickPeriodSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "The wake tick's period (5 s)."
+                    },
+                    "tickStaleAfterSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "tickAgeSecs past which the Hub answers 503: 12 tick periods."
+                    },
+                    "deliveryAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "How long the oldest wake run that fired has waited for delivery; absent when none waits."
                     }
                   },
                   "required": [
                     "ok",
                     "version",
-                    "uptimeSecs"
+                    "uptimeSecs",
+                    "tickAgeSecs",
+                    "tickPeriodSecs",
+                    "tickStaleAfterSecs"
                   ],
                   "type": "object"
                 }
               }
             },
             "description": "ok"
+          },
+          "503": {
+            "description": "The wake tick is stale: the Hub serves but no longer claims due wake-ups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "description": "True on 200, false on 503."
+                    },
+                    "version": {
+                      "type": "string",
+                      "description": "Hub package version (matches the remuda CLI version)."
+                    },
+                    "uptimeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "description": "Whole seconds since this Hub process started.",
+                      "minimum": 0
+                    },
+                    "lastTickAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the wake tick last completed; absent before the first."
+                    },
+                    "tickAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "Seconds since the last completed wake tick (since the store opened, before the first)."
+                    },
+                    "tickPeriodSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "The wake tick's period (5 s)."
+                    },
+                    "tickStaleAfterSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "tickAgeSecs past which the Hub answers 503: 12 tick periods."
+                    },
+                    "deliveryAgeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "description": "How long the oldest wake run that fired has waited for delivery; absent when none waits."
+                    },
+                    "code": {
+                      "const": "HUB_TICK_STALE",
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "version",
+                    "uptimeSecs",
+                    "tickAgeSecs",
+                    "tickPeriodSecs",
+                    "tickStaleAfterSecs",
+                    "code",
+                    "error"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
           }
         },
         "summary": "Liveness",
         "tags": [
           "health"
-        ]
+        ],
+        "description": "Liveness, plus the wake tick (D-060 §11): the last completed tick, its age and period, and the delivery age of the oldest waiting wake run. 503 once no tick completed for 12 tick periods."
       }
     },
     "/node/v1/connect": {

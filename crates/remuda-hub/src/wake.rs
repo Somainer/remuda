@@ -367,6 +367,15 @@ impl WakeState {
     }
 }
 
+/// The tick and delivery fields `/healthz` reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HealthReport {
+    pub(crate) last_tick_at: Option<String>,
+    pub(crate) tick_age_secs: u64,
+    pub(crate) delivery_age_secs: Option<u64>,
+    pub(crate) stale: bool,
+}
+
 /// The tick period in seconds.
 pub(crate) fn tick_period_secs() -> u64 {
     TICK_EVERY * crate::gatequeue::SCHEDULE_TICK_MILLIS / 1000
@@ -375,6 +384,27 @@ pub(crate) fn tick_period_secs() -> u64 {
 /// Seconds without a completed tick after which the tick is stale.
 pub(crate) fn stale_after_secs() -> u64 {
     tick_period_secs() * STALE_AFTER_TICKS
+}
+
+/// The health of the tick as of `now`. Before the first tick completes the
+/// age counts from `started`, so a Hub whose scheduler never ran turns stale
+/// too.
+pub(crate) fn health(state: &AppState, now: OffsetDateTime) -> HealthReport {
+    let health = *state
+        .wake
+        .health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let started = state.store.opened_at();
+    let since = health.last_tick.unwrap_or(started);
+    let age = |at: OffsetDateTime| u64::try_from((now - at).whole_seconds()).unwrap_or(0);
+    let tick_age_secs = age(since);
+    HealthReport {
+        last_tick_at: health.last_tick.map(rfc3339),
+        tick_age_secs,
+        delivery_age_secs: health.oldest_waiting.map(age),
+        stale: tick_age_secs > stale_after_secs(),
+    }
 }
 
 // ── validation ─────────────────────────────────────────────────────────────

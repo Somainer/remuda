@@ -1329,6 +1329,53 @@ async fn an_interval_of_i64_max_does_not_panic_the_tick() -> Result<()> {
     Ok(())
 }
 
+// ─── /healthz ───────────────────────────────────────────────────────────────
+
+/// `/healthz` reports the last tick and the delivery age, and answers 503
+/// once no tick completed for the stale bound (12 tick periods).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_answers_503_when_the_tick_is_stale() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-health").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    ctx.journal(&seat, activity("working", &at(2))).await?;
+    let wake = ctx
+        .add_ok(&token, &seat, every(600, "beat", "never"))
+        .await?;
+    ctx.tick(&shift(&next_fire(&wake), 1)).await?;
+    let health = |ctx: &Ctx| {
+        let url = format!("{}/healthz", ctx.base());
+        let http = ctx.http.clone();
+        async move {
+            let response = http.get(url).send().await?;
+            let status = response.status().as_u16();
+            Ok::<_, anyhow::Error>((status, response.json::<Value>().await?))
+        }
+    };
+    let (status, body) = health(&ctx).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert!(body["lastTickAt"].is_string(), "{body}");
+    assert_eq!(body["tickPeriodSecs"], 5);
+    let stale_after = remuda_hub::wake_test_support::stale_after_secs();
+    assert_eq!(body["tickStaleAfterSecs"], stale_after);
+    assert!(body["tickAgeSecs"].as_u64().unwrap() <= stale_after);
+    assert!(body["deliveryAgeSecs"].is_u64(), "a run waits: {body}");
+
+    ctx.hub
+        .test_backdate_wake_tick(i64::try_from(stale_after).unwrap() + 5);
+    let (status, body) = health(&ctx).await?;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["code"], "HUB_TICK_STALE");
+    assert!(body["tickAgeSecs"].as_u64().unwrap() > stale_after);
+
+    ctx.tick(&shift(&next_fire(&wake), 2)).await?;
+    let (status, body) = health(&ctx).await?;
+    assert_eq!(status, 200, "a completed tick: {body}");
+    Ok(())
+}
+
 // ─── backup ─────────────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {

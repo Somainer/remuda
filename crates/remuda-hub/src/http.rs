@@ -307,15 +307,40 @@ pub(crate) const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// `GET /healthz`
 ///
 /// Liveness probe fields:
-/// - `ok`: always `true` on 200; existing probes depend on this exact key.
+/// - `ok`: `true` on 200; existing probes depend on this exact key. `false`
+///   on 503.
 /// - `version`: Hub package version (matches the `remuda` CLI version).
 /// - `uptimeSecs`: whole seconds since this Hub process started.
-pub async fn healthz() -> Json<Value> {
-    Json(json!({
-        "ok": true,
+/// - cb-wake-engine (D-060 §11): `lastTickAt` (when the scheduler's wake
+///   tick last completed, absent before the first), `tickAgeSecs` (since
+///   then, or since the store opened), `tickPeriodSecs`, `tickStaleAfterSecs`
+///   (12 periods) and `deliveryAgeSecs` (how long the oldest wake run that
+///   fired has waited for delivery, absent when none waits).
+///
+/// 503 with `code: HUB_TICK_STALE` once the tick is older than the bound: the
+/// Hub still serves, but it no longer claims due wake-ups.
+pub async fn healthz(State(state): State<AppState>) -> Response {
+    let report = crate::wake::health(&state, time::OffsetDateTime::now_utc());
+    let mut body = json!({
+        "ok": !report.stale,
         "version": crate::supervise::HUB_VERSION,
         "uptimeSecs": crate::supervise::uptime_secs(),
-    }))
+        "tickAgeSecs": report.tick_age_secs,
+        "tickPeriodSecs": crate::wake::tick_period_secs(),
+        "tickStaleAfterSecs": crate::wake::stale_after_secs(),
+    });
+    if let Some(at) = report.last_tick_at {
+        body["lastTickAt"] = json!(at);
+    }
+    if let Some(age) = report.delivery_age_secs {
+        body["deliveryAgeSecs"] = json!(age);
+    }
+    if report.stale {
+        body["code"] = json!("HUB_TICK_STALE");
+        body["error"] = json!("the wake tick is stale: due wake-ups are not being claimed");
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    Json(body).into_response()
 }
 
 /// `POST /v1/login` — bootstrap access code → device token + cookie.

@@ -11,7 +11,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Liveness */
+        /**
+         * Liveness
+         * @description Liveness, plus the wake tick (D-060 §11): the last completed tick, its age and period, and the delivery age of the oldest waiting wake run. 503 once no tick completed for 12 tick periods.
+         */
         get: operations["healthz"];
         put?: never;
         post?: never;
@@ -4452,7 +4455,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        /**
+                         * Format: uint64
+                         * @description How long the oldest wake run that fired has waited for delivery; absent when none waits.
+                         */
+                        deliveryAgeSecs?: number;
+                        /**
+                         * Format: date-time
+                         * @description When the wake tick last completed; absent before the first.
+                         */
+                        lastTickAt?: string;
+                        /** @description True on 200, false on 503. */
                         ok: boolean;
+                        /**
+                         * Format: uint64
+                         * @description Seconds since the last completed wake tick (since the store opened, before the first).
+                         */
+                        tickAgeSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description The wake tick's period (5 s).
+                         */
+                        tickPeriodSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description tickAgeSecs past which the Hub answers 503: 12 tick periods.
+                         */
+                        tickStaleAfterSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description Whole seconds since this Hub process started.
+                         */
+                        uptimeSecs: number;
+                        /** @description Hub package version (matches the remuda CLI version). */
+                        version: string;
+                    };
+                };
+            };
+            /** @description The wake tick is stale: the Hub serves but no longer claims due wake-ups */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        code: "HUB_TICK_STALE";
+                        /**
+                         * Format: uint64
+                         * @description How long the oldest wake run that fired has waited for delivery; absent when none waits.
+                         */
+                        deliveryAgeSecs?: number;
+                        error: string;
+                        /**
+                         * Format: date-time
+                         * @description When the wake tick last completed; absent before the first.
+                         */
+                        lastTickAt?: string;
+                        /** @description True on 200, false on 503. */
+                        ok: boolean;
+                        /**
+                         * Format: uint64
+                         * @description Seconds since the last completed wake tick (since the store opened, before the first).
+                         */
+                        tickAgeSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description The wake tick's period (5 s).
+                         */
+                        tickPeriodSecs: number;
+                        /**
+                         * Format: uint64
+                         * @description tickAgeSecs past which the Hub answers 503: 12 tick periods.
+                         */
+                        tickStaleAfterSecs: number;
                         /**
                          * Format: uint64
                          * @description Whole seconds since this Hub process started.

@@ -1435,6 +1435,15 @@ impl DeliverState {
         }
     }
 
+    /// Test seam: whether a same-id retry is armed for `command_id`.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn retry_armed(&self, command_id: &str) -> bool {
+        self.retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(command_id)
+    }
+
     fn clear_retry(&self, batch_id: &str) {
         self.retry
             .lock()
@@ -1594,10 +1603,13 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
     push_owed(state).await;
 }
 
-/// Drop the retry entries of sends that left the queue (forwarded, settled,
+/// Drop the retry entries of sends that left the queue (accepted, settled,
 /// cancelled by a fence): batches and restart notices share the map, so it
-/// is pruned by the command rows, not by the batch list.
-async fn prune_retries(state: &AppState) {
+/// is pruned by the command rows, not by the batch list. A row still
+/// `queued` keeps its entry whether or not it is marked forwarded: a
+/// release arms the entry before its commit clears the mark, so a prune
+/// reading in between must not take the mark for an advance.
+pub(crate) async fn prune_retries(state: &AppState) {
     let ids: Vec<String> = state
         .deliver
         .retry
@@ -1613,8 +1625,7 @@ async fn prune_retries(state: &AppState) {
         .store
         .read("hub_input_retry_pending", move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT EXISTS (SELECT 1 FROM commands
-                                 WHERE id = ?1 AND state = 'queued' AND forwarded = 0)",
+                "SELECT EXISTS (SELECT 1 FROM commands WHERE id = ?1 AND state = 'queued')",
             )?;
             let mut keep = std::collections::HashSet::new();
             for id in ids {

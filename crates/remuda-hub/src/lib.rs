@@ -1423,6 +1423,47 @@ impl RunningHub {
         (reached, release_tx)
     }
 
+    /// Test-only: arm a one-shot park point in the release of the
+    /// Hub-written send `command_id` on `host_id`, between its retry arm and
+    /// the release's commit. Returns `(reached, release)`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_hub_release_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::HubReleaseBeforeCommit,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test-only: one prune of the same-id retry entries, as a drive runs
+    /// it before its forwards.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_prune_inbox_retries(&self) {
+        crate::inbox_deliver::prune_retries(&self.state).await;
+    }
+
+    /// Test-only: whether a same-id retry is armed for `command_id`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_inbox_retry_armed(&self, command_id: &str) -> bool {
+        self.state.deliver.retry_armed(command_id)
+    }
+
     /// Test-only: the next `times` forwards of Hub-written input initiated
     /// by `lineage_id` (its restart notice, its batches) are refused
     /// NODE_BUSY.

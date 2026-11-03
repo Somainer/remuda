@@ -5245,6 +5245,16 @@ async fn release_hub_written(
     // Armed before the release commits: a drive running meanwhile sees the
     // backoff, never an unsent row it may forward again at once.
     let spent = crate::inbox_deliver::arm_retry(state, &command.command_id);
+    // Test seam: park between the arm and the release's commit (no-op
+    // unless a test armed it), so a concurrent drive's prune runs there.
+    state
+        .race_barriers
+        .wait_if_armed(
+            crate::workspaces::RacePhase::HubReleaseBeforeCommit,
+            &command.host_id,
+            &command.command_id,
+        )
+        .await;
     let row = release_forward_intent(state, &command.command_id).await?;
     if row.state != "queued" || row.forwarded {
         crate::inbox_deliver::disarm_retry(state, &command.command_id);

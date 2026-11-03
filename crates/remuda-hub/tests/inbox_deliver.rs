@@ -1350,6 +1350,72 @@ async fn a_fence_held_batch_released_on_the_ack_path_is_retried_once() -> Result
     Ok(())
 }
 
+/// A prune that runs while a release sits between its retry arm and its
+/// commit (the row still `queued`, marked forwarded) keeps the armed retry,
+/// as a drive's prune does when the release came from the fence
+/// acknowledgement or a restart notice: the batch is not left unsent with
+/// nothing armed, and the retry delivers it once, under its id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prune_between_the_arm_and_the_release_keeps_the_retry() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-prune-race").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let batch = ctx.batch_rows()?[0].0.clone();
+    // The forward meets a full host; its release parks after the arm,
+    // before the commit.
+    ctx.hub.test_arm_node_busy(&batch, 1);
+    let (reached, release) = ctx.hub.test_arm_hub_release_barrier(&ctx.host, &batch);
+    let parked = reached.notified();
+    tokio::pin!(parked);
+    parked.as_mut().enable();
+    ctx.hub.test_hold_inbox_forward(false);
+    let (driven, pruned) = tokio::join!(ctx.settle(), async {
+        tokio::time::timeout(Duration::from_secs(30), parked)
+            .await
+            .context("the release never parked")?;
+        // Read on the side: a GET would join the parked forward attempt.
+        let row: (String, bool) = ctx.db()?.query_row(
+            "SELECT state, forwarded FROM commands WHERE id = ?1",
+            [&batch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            row,
+            ("queued".to_owned(), true),
+            "parked before the release commits"
+        );
+        ctx.hub.test_prune_inbox_retries().await;
+        let _ = release.send(());
+        anyhow::Ok(())
+    });
+    driven?;
+    pruned?;
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(
+        (row["state"].as_str(), row["forwarded"].as_bool()),
+        (Some("queued"), Some(false)),
+        "released: {row:#}"
+    );
+    assert!(
+        ctx.hub.test_inbox_retry_armed(&batch),
+        "the prune kept the retry the release armed"
+    );
+    retry_until(&ctx, || frames_for(&ctx, &batch) == 1).await?;
+    assert_eq!(ctx.batch_rows()?.len(), 1, "the same id");
+    for _ in 0..3 {
+        ctx.hub.test_waive_inbox_backoff();
+        ctx.settle().await?;
+        ctx.hub.test_inbox_retry_tick().await;
+    }
+    assert_eq!(frames_for(&ctx, &batch), 1, "once");
+    Ok(())
+}
+
 /// Same-id retries end: a batch whose host stays full is given up after its
 /// ten attempts, settled `not-delivered`, and its rows go back to waiting;
 /// they form a new batch, under a new id, which is delivered.

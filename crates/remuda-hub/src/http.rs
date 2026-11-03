@@ -5094,6 +5094,27 @@ pub(crate) async fn forward_if_online(
             // to the queue and the same id is sent again later, never settled
             // into a refusal that would strand what it carries.
             if hub_written_send(&command) {
+                // The Node does not know the chapter: that is terminal for it,
+                // never retried. The batch ends `instance-not-found` and its
+                // rows go back; that chapter takes no more batches.
+                if node_reports_unknown_instance(&response) {
+                    tracing::info!("hub-written input to an instance its Node does not know; ended");
+                    if let Some(rejected) = state
+                        .store
+                        .reject_command(
+                            command.command_id.clone(),
+                            crate::inbox_deliver::INSTANCE_NOT_FOUND_REASON.into(),
+                        )
+                        .await?
+                    {
+                        return Ok(rejected);
+                    }
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
                 tracing::debug!(
                     command_id = %command.command_id,
                     "node refused hub-written input; releasing intent for a same-id retry"

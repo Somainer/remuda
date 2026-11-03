@@ -35,6 +35,9 @@ enum Sends {
     /// Keeps every send's reply until `Seen::release` is notified: each held
     /// call occupies one of the Hub's in-flight slots for the host.
     Hold,
+    /// Answers the next hub-origin send "instance not found" (the Node lost
+    /// the chapter), then accepts again.
+    UnknownInstanceOnce,
 }
 
 /// `(commandId, the batch row's text when the frame arrived)`.
@@ -191,6 +194,19 @@ async fn connect_node(
                     Sends::Silent => continue,
                     Sends::Hold => {
                         seen.held.lock().unwrap().push(id);
+                        continue;
+                    }
+                    Sends::UnknownInstanceOnce if frame["params"]["origin"] == "hub" => {
+                        *sends.lock().unwrap() = Sends::Accept;
+                        let refusal = json!({ "jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32004, "message": "instance not found" } });
+                        if node
+                            .send(Message::Text(refusal.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         continue;
                     }
                     Sends::RefuseHubOnce if frame["params"]["origin"] == "hub" => {
@@ -1299,6 +1315,133 @@ async fn spent_same_id_retries_end_the_batch_and_release_its_rows() -> Result<()
     assert_ne!(rows[1].0, first);
     assert_eq!(rows[1].1, carried, "the same rows");
     assert_eq!(frames_for(&ctx, &rows[1].0), 1);
+    Ok(())
+}
+
+/// A subscriber without continuity that dies while its batch is still queued
+/// ends that batch `not-delivered`: its rows are released and take the
+/// no-subscriber fallback exactly once (a still-pending question pages the
+/// owner once), and the batch never leaves the Hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscriber_that_dies_with_its_batch_queued_falls_back_once() -> Result<()> {
+    let ctx = Ctx::spawn_with_push().await?;
+    let push = ctx.push.clone().context("push")?;
+    let store = ctx.hub.store().context("store")?;
+    let parent = store
+        .insert_instance(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-pty".into(),
+            None,
+            json!({ "origin": "agent" }),
+        )
+        .await?
+        .instance_id;
+    let child = store
+        .insert_instance(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-pty".into(),
+            None,
+            json!({ "origin": "agent", "parentInstanceId": parent }),
+        )
+        .await?
+        .instance_id;
+    ctx.journal(&parent, entity("running", &at(0))).await?;
+    ctx.journal(&parent, activity("working", &at(1))).await?;
+    ctx.journal(&child, entity("running", &at(2))).await?;
+    ctx.journal(&child, question("int_dies", "Proceed?", &at(3)))
+        .await?;
+    ctx.hub.test_hold_inbox_forward(true);
+    ctx.journal(&parent, activity("idle", &at(4))).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 1, "formed, forward held");
+    let batch = rows[0].0.clone();
+    let pushed_before = push.sent.lock().unwrap().len();
+
+    // The subscriber's process ends with its batch still queued.
+    ctx.journal(&parent, entity("exited", &at(10))).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 1, "no second batch");
+    assert_eq!(rows[0].2.as_deref(), Some("rejected"), "{rows:?}");
+    assert!(rows[0].3.is_some(), "released: {rows:?}");
+    let page = ctx.inbox(&parent).await?;
+    for fact in page["items"].as_array().unwrap() {
+        assert_eq!(fact["fallback"]["reason"], "no-subscriber", "{fact:#}");
+        assert!(fact["batchId"].is_null(), "{fact:#}");
+    }
+    assert_eq!(
+        push.sent.lock().unwrap().len(),
+        pushed_before + 1,
+        "paged once"
+    );
+    // Nothing more: the batch never leaves, and the rows are not offered again.
+    ctx.hub.test_hold_inbox_forward(false);
+    for _ in 0..3 {
+        ctx.settle().await?;
+        ctx.hub.test_inbox_retry_tick().await;
+    }
+    assert_eq!(frames_for(&ctx, &batch), 0);
+    assert_eq!(ctx.batch_rows()?.len(), 1);
+    assert_eq!(
+        push.sent.lock().unwrap().len(),
+        pushed_before + 1,
+        "exactly once"
+    );
+    Ok(())
+}
+
+/// A Node that answers a batch "instance not found" ends it: the batch is
+/// settled `instance-not-found`, never retried, its rows wait, and that
+/// chapter takes no more batches; the successor gets the rows once, under a
+/// new id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_unknown_to_its_node_ends_the_batch_and_the_successor_gets_its_rows()
+-> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-unknown-instance").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    *ctx.sends.lock().unwrap() = Sends::UnknownInstanceOnce;
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let (first, carried, ..) = ctx.batch_rows()?[0].clone();
+    let row = command_row(&ctx, &seat, &first).await?;
+    assert_eq!(row["settlement"]["reason"], "instance-not-found", "{row:#}");
+    let page = ctx.inbox(&seat).await?;
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|fact| fact["batchId"].is_null() && fact["fallback"].is_null()),
+        "the rows wait: {page:#}"
+    );
+    // Not retried, and that chapter takes no new batch.
+    ctx.journal(&seat, activity("working", &at(30))).await?;
+    ctx.journal(&seat, activity("idle", &at(31))).await?;
+    for _ in 0..3 {
+        ctx.settle().await?;
+        ctx.hub.test_inbox_retry_tick().await;
+    }
+    assert_eq!(frames_for(&ctx, &first), 1);
+    assert_eq!(ctx.batch_rows()?.len(), 1, "no batch to the lost chapter");
+
+    pause(&ctx, &seat).await?;
+    let successor = resume(&ctx, &seat).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_ne!(rows[1].0, first);
+    assert_eq!(rows[1].1, carried, "the same rows");
+    let sends = ctx.seen.sends_to(&successor);
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert_eq!(sends[0]["commandId"], rows[1].0.as_str());
     Ok(())
 }
 

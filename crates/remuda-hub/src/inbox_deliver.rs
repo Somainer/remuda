@@ -150,7 +150,8 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
            VALUES (COALESCE(NEW.lineage_id, NEW.id));
          END;
          -- A lineage without continuity whose one instance ended or was
-         -- deleted: its waiting rows have no subscriber left.
+         -- deleted: its waiting rows, and the rows of a batch still queued
+         -- for it, have no subscriber left.
          DROP TRIGGER IF EXISTS inbox_due_ended;
          CREATE TRIGGER inbox_due_ended AFTER UPDATE OF lifecycle, ended_at ON instances
          WHEN ((NEW.ended_at IS NOT NULL AND OLD.ended_at IS NULL)
@@ -158,9 +159,11 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                    AND OLD.lifecycle NOT IN ('exited', 'failed', 'closed')))
           AND NOT EXISTS (SELECT 1 FROM lineages
                            WHERE lineage_id = COALESCE(NEW.lineage_id, NEW.id))
-          AND ",
+          AND (",
         waiting_rows!("COALESCE(NEW.lineage_id, NEW.id)"),
-        "
+        " OR ",
+        unsent_batch!("COALESCE(NEW.lineage_id, NEW.id)"),
+        ")
          BEGIN
            INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
            VALUES (COALESCE(NEW.lineage_id, NEW.id));
@@ -169,9 +172,11 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TRIGGER inbox_due_deleted AFTER DELETE ON instances
          WHEN NOT EXISTS (SELECT 1 FROM lineages
                            WHERE lineage_id = COALESCE(OLD.lineage_id, OLD.id))
-          AND ",
+          AND (",
         waiting_rows!("COALESCE(OLD.lineage_id, OLD.id)"),
-        "
+        " OR ",
+        unsent_batch!("COALESCE(OLD.lineage_id, OLD.id)"),
+        ")
          BEGIN
            INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
            VALUES (COALESCE(OLD.lineage_id, OLD.id));
@@ -214,13 +219,13 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                   settled_at = NEW.updated_at,
                   released_at = CASE
                     WHEN NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                      OR NEW.settlement_reason IN ('fenced', 'not-delivered')
+                      OR NEW.settlement_reason IN ('fenced', 'not-delivered', 'instance-not-found')
                       OR NEW.settlement_not_dispatched = 1 THEN NEW.updated_at END
             WHERE batch_id = NEW.id AND outcome IS NULL;
            UPDATE inbox_facts SET batch_id = NULL
             WHERE batch_id = NEW.id
               AND (NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                   OR NEW.settlement_reason IN ('fenced', 'not-delivered')
+                   OR NEW.settlement_reason IN ('fenced', 'not-delivered', 'instance-not-found')
                    OR NEW.settlement_not_dispatched = 1);
            -- Also a lineage whose formed batch waits in the queue behind
            -- the input that just settled.
@@ -380,6 +385,22 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
     };
     if live_generation.is_none() && own == lineage_id && ended(&lifecycle, &ended_at) {
         return Ok(Err(Hold::Gone));
+    }
+    // Its Node answered a batch "instance not found": that chapter takes no
+    // more batches. Without continuity the lineage is gone; a continuity
+    // lineage keeps its rows for a successor.
+    let unknown_to_node: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM inbox_batches b JOIN commands c ON c.id = b.batch_id
+                         WHERE b.instance_id = ?1 AND c.settlement_reason = ?2)",
+        params![chapter_id, INSTANCE_NOT_FOUND_REASON],
+        |row| row.get(0),
+    )?;
+    if unknown_to_node {
+        return Ok(Err(if live_generation.is_none() {
+            Hold::Gone
+        } else {
+            Hold::NoLiveChapter
+        }));
     }
     if own != lineage_id
         || fenced_at.is_some()
@@ -902,6 +923,19 @@ struct Formed {
     pushes: bool,
 }
 
+/// The ids of `lineage_id`'s formed batches still queued and unforwarded.
+fn unsent_batch_ids(conn: &Connection, lineage_id: &str) -> Result<Vec<String>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.batch_id FROM inbox_batches b JOIN commands c ON c.id = b.batch_id
+          WHERE b.lineage_id = ?1 AND b.outcome IS NULL
+            AND c.state = 'queued' AND c.forwarded = 0",
+    )?;
+    let ids = stmt
+        .query_map(params![lineage_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
 /// Whether `lineage_id` has a formed batch still queued and unforwarded.
 fn unsent_batch(conn: &Connection, lineage_id: &str) -> Result<bool, StoreError> {
     Ok(conn.query_row(
@@ -925,7 +959,13 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
     let chapter = match gate(conn, lineage_id)? {
         Ok(chapter) => chapter,
         Err(Hold::Gone) => {
-            // Neither held forever nor consumed (§10.1 item 4).
+            // Neither held forever nor consumed (§10.1 item 4). A batch still
+            // queued for the gone chapter ends first, `not-delivered`: the
+            // release trigger hands its rows back in this transaction, so
+            // they fall back here with the rest.
+            for batch in unsent_batch_ids(conn, lineage_id)? {
+                settle_not_delivered(conn, &batch)?;
+            }
             let now = now_rfc3339();
             let mut formed = Formed::default();
             for row in waiting(conn, lineage_id)? {
@@ -1196,6 +1236,10 @@ pub(crate) async fn note_released(state: &AppState, row: &crate::store::CommandR
 
 /// Same-id attempts at one Hub-written send before it is given up.
 pub(crate) const RETRY_ATTEMPTS: u32 = 10;
+
+/// Settlement reason of a Hub-written send its Node answered "instance not
+/// found": terminal for that chapter, never retried.
+pub(crate) const INSTANCE_NOT_FOUND_REASON: &str = "instance-not-found";
 
 /// Settlement reason of a Hub-written send whose same-id attempts are spent:
 /// it never reached its chapter, so a batch's rows are released.

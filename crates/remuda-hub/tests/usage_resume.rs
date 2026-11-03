@@ -1165,6 +1165,23 @@ async fn a_second_turn_end_for_the_same_run_keeps_the_wait() -> Result<()> {
     ctx.tick(&first.fire_at).await?;
     assert_eq!(ctx.facts(&seat, "supply-reset").await?.len(), 1);
     assert_eq!(ctx.seen.hub_sends_to(&worker).len(), 1);
+
+    // A further end for the same run once it has continued reports the wait
+    // as it stands: still waiting in effect, state `continued` (r3 item 4).
+    ctx.journal(&worker, turn_result("error", "cmd_x_1", Some(NOTICE)))
+        .await?;
+    ctx.settle().await?;
+    let failed = ctx.facts(&seat, "turn-failed").await?;
+    let last = &failed.last().context("a turn-failed fact")?["payload"]["usageLimit"];
+    assert_eq!(last["waitState"], "continued", "{last}");
+    assert_eq!(last["waits"], true, "{last}");
+    assert!(last.get("reason").is_none(), "{last}");
+    assert_eq!(ctx.waits(&worker)?.len(), 1);
+    assert_eq!(
+        ctx.seen.hub_sends_to(&worker).len(),
+        1,
+        "nothing more is sent"
+    );
     Ok(())
 }
 

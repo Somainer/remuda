@@ -1136,12 +1136,17 @@ fn record_wait(
                 )
                 .optional()?;
             if let Some((state, resets_at, fire_at, source, window)) = existing {
-                let waits = matches!(state.as_str(), "waiting" | "holding");
+                // The wait still stands while it is waiting, holding, or has
+                // continued (its continuation is the wait acting); only an
+                // ended row (done, capped, cancelled) no longer waits. The
+                // row's own state is reported either way (r3 item 4).
+                let waits = matches!(state.as_str(), "waiting" | "holding" | "continued");
                 detail["resetsAt"] = json!(resets_at);
                 detail["fireAt"] = json!(fire_at);
                 detail["source"] = json!(source);
                 detail["window"] = json!(window);
                 detail["waits"] = json!(waits);
+                detail["waitState"] = json!(state);
                 if !waits {
                     detail["reason"] = json!(state);
                 }

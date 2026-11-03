@@ -42,6 +42,8 @@ import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSea
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
 import type { MemoryWriteItem } from "../memory/api";
+import type { OwnerNotice } from "../home/notices";
+import { OwnerNoticeCards } from "./OwnerNoticeCards";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 import { profileRegion, profilingEnabled, reportProbe } from "../../lib/profileFlags";
 
@@ -234,6 +236,14 @@ export type TranscriptProps = {
    */
   onOpenMemory?: (slug: string) => void;
   /**
+   * D-060 §11.5 (cb-owner-notify): 「告诉你」 notices per reply node id, from
+   * `noticesByReply`. Each renders as Main's card under the reply of the turn
+   * that wrote it, never as the owner's bubble.
+   */
+  notices?: ReadonlyMap<string, readonly OwnerNotice[]>;
+  /** 知道了 on a transcript notice card; absent = no button. */
+  onAckNotice?: (noticeId: string) => Promise<void>;
+  /**
    * Whether the transcript draws its own action strip (全部折叠 / 搜索正文 /
    * 注入内容). A page that moves these actions into its header passes false
    * and drives them through TranscriptHandle instead.
@@ -294,6 +304,8 @@ function TranscriptInner({
   onSteerHeld,
   remembered,
   onOpenMemory,
+  notices,
+  onAckNotice,
   toolbar = true,
   earlierFloor,
   handleRef,
@@ -2086,6 +2098,8 @@ function TranscriptInner({
                 onSteerHeld={stableOnSteerHeld}
                 remembered={remembered?.get(node.id)}
                 onOpenMemory={onOpenMemory}
+                notices={notices?.get(node.id)}
+                onAckNotice={onAckNotice}
                 steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
@@ -2143,6 +2157,8 @@ type TranscriptRowProps = {
   onSteerHeld?: SteerHeldHandler;
   remembered?: readonly MemoryWriteItem[];
   onOpenMemory?: (slug: string) => void;
+  notices?: readonly OwnerNotice[];
+  onAckNotice?: (noticeId: string) => Promise<void>;
   steering: Set<string>;
   dismissedWorkflows: ReadonlySet<string>;
   onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
@@ -2207,6 +2223,8 @@ function sameRowProps(prev: TranscriptRowProps, next: TranscriptRowProps): boole
     && prev.onSteerHeld === next.onSteerHeld
     && prev.remembered === next.remembered
     && prev.onOpenMemory === next.onOpenMemory
+    && prev.notices === next.notices
+    && prev.onAckNotice === next.onAckNotice
     && prev.steering === next.steering
     && prev.onToggleWorkflowDismiss === next.onToggleWorkflowDismiss
     && prev.onToggleToolExpand === next.onToggleToolExpand
@@ -2241,6 +2259,8 @@ const TranscriptRow = memo(function TranscriptRow({
   onSteerHeld,
   remembered,
   onOpenMemory,
+  notices,
+  onAckNotice,
   steering,
   dismissedWorkflows,
   onToggleWorkflowDismiss,
@@ -2281,6 +2301,8 @@ const TranscriptRow = memo(function TranscriptRow({
     onSteerHeld,
     remembered,
     onOpenMemory,
+    notices,
+    onAckNotice,
     steering,
     dismissedWorkflows,
     onToggleWorkflowDismiss,
@@ -2413,6 +2435,8 @@ function renderNode(
     onSteerHeld?: SteerHeldHandler;
     remembered?: readonly MemoryWriteItem[];
     onOpenMemory?: (slug: string) => void;
+    notices?: readonly OwnerNotice[];
+    onAckNotice?: (noticeId: string) => Promise<void>;
     steering: Set<string>;
     dismissedWorkflows: ReadonlySet<string>;
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
@@ -2616,6 +2640,11 @@ function renderNode(
               );
             })}
           </ul>
+        ) : null}
+        {/* D-060 §11.5: Main's 「告诉你」 cards for this turn, in Main's
+            voice under its reply. */}
+        {node.role === "assistant" && opts.notices?.length ? (
+          <OwnerNoticeCards notices={opts.notices} onAck={opts.onAckNotice} />
         ) : null}
       </section>
     );

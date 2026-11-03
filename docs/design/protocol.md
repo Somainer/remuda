@@ -2129,6 +2129,28 @@ payload.tail      = turn-done only: the text that turn ended with, redacted,
 - 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
 - **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本先按 digest 的秘密形状脱敏，再以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；Node 以 `execution: not-dispatched` 结算的批同样交还它的行。Hub 能证明没有送达的转发（Hub 侧 NODE_BUSY、连接已断、Node 在记录前以 JSON-RPC 错误拒绝）不结算这条 send，而是放回队列，以同一 id 退避重试（1 s 起，最长 60 s，最多 10 次；次数记在命令行上，与放回在同一事务里计数，第 10 次在同一事务里以 `not-delivered` 结算，批的行回到未投递）。重启通知用同一退避。周期检查也会驱动没有任何重试登记、未被扣住的未发送批与重启通知，所以登记丢失也不会让它们搁浅。Node 回答 instance not found 时以 `instance-not-found` 结算，不再重试，该章节不再接批。成批之后、转发之前到达的所有者输入仍然先行：转发意图提交的同一 writer 任务里再查一次，批留在队列里，所有者输入结算后再驱动它。可能已到达章节的批保留它的行（每批至多一次）。
 
+**所有者通知（`cb-owner-notify`）。** 机制见 [main-agent.md §11.7](./main-agent.md#117-implementation-notes-cb-owner-notify-2026-11-03)。
+
+~~~text
+POST /v1/owner/notify
+  body {title, body, dedupeKey?}
+  -> 201 {notice: OwnerNotice, created: true}       claim row written, push queued
+  -> 200 {notice: OwnerNotice, created: false}      same dedupeKey: the original row, no push
+GET  /v1/owner/notices?unacked=1&instanceId=<chapter>&limit=<n>
+  -> 200 {items: [OwnerNotice]}                     newest first; limit defaults to 50, at most 200
+POST /v1/owner/notices/{id}/ack
+  -> 200 {notice: OwnerNotice}                      idempotent; every device
+
+OwnerNotice = {noticeId, lineageId, chapterInstanceId, turnSeq, title, body,
+               dedupeKey, source: cli|wake, origin: agent|human|hub,
+               createdAt, ackedAt}
+push tag    = notice:<noticeId>; landing /sessions?focus=<noticeId>
+~~~
+
+- 调用者只能是持有 `address-owner` 的 Agent（Main）或所有者自己的 Human 设备。没有这个 grant 的 Agent：403，`reason: "grant-required"`，`next.grant: "address-owner"`；Bot 凭证（不论用 `x-remuda-instance-id` 指名哪个实例）：403，`reason: "address-owner-required"`。Agent 调用过提交时的 initiator 检查，已被 fence 或暂停的章节得到 409 `fenced`。中间件只放行 Agent 的这一个 POST。两个 notices 路由只给 Human：Bot 凭证与 Agent（包括用 `x-remuda-instance-id` 收窄的 Human 令牌）都得到 403，`reason: "owner-only"`（Agent 先被中间件以 `agent-route` 拦下）；确认因此只能来自所有者自己的设备。转给聊天 Bot 是之后单独的决定（T24）。
+- 标题一行、至多 120 字符；正文至多 2000 字符；`dedupeKey` 至多 128 个 `[A-Za-z0-9._:/-]` 字符。超界：400，`reason: "invalid-notice"`。秘密 lint 先于边界检查覆盖三者：命中为 422，`code: "OWNER_NOTIFY_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。
+- Hub 在一个写事务里写认领行、它的审计行（`owner.notify`，不带文本）与推送 outbox 行，提交后才推送；推送之前（或推送之后、标记之前）崩溃，重启后以同一 tag 补发一次，替换而不是新增通知。去重键按写入血缘（所有者自己的为 `owner`）划分。确认先于推送时不再推送。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象

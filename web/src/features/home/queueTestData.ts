@@ -1,3 +1,4 @@
+import type { OwnerNotice } from "./notices";
 import type { Host, Instance } from "../../types/instance";
 import type { Interaction, InteractionRequest, QuestionField } from "../../types/interaction";
 import type { Task } from "../../types/generated";
@@ -163,6 +164,23 @@ export function source(overrides: Partial<GlanceSource> = {}): GlanceSource {
     answering: {},
     deviceId: "dev_1",
     nowMs: NOW,
+    ...overrides,
+  };
+}
+
+/** An `owner notify` notice (D-060 §11.5) Main wrote at T1, unacknowledged. */
+export function notice(overrides: Partial<OwnerNotice> & { noticeId: string }): OwnerNotice {
+  return {
+    lineageId: "ins_main",
+    chapterInstanceId: "ins_main",
+    turnSeq: null,
+    title: "Nightly gate red",
+    body: "Lane 2 failed: wire_golden.\nI paused landing.",
+    dedupeKey: null,
+    source: "cli",
+    origin: "agent",
+    createdAt: T1,
+    ackedAt: null,
     ...overrides,
   };
 }

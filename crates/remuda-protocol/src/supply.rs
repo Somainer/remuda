@@ -301,6 +301,99 @@ fn i64_is_zero(value: &i64) -> bool {
     *value == 0
 }
 
+// ── the harness's structured rate-limit event (main-agent.md §11.6) ──────
+
+/// The `relatedIds` keys a carrier writes on its `rate_limit_event`
+/// diagnostic lifecycle, from the harness's `rate_limit_info` (Claude
+/// stream-json). The Hub reads them as the first source of a usage-limit
+/// reset time (cb-usage-resume). Every value is a string, as `relatedIds`
+/// values are; a field the harness did not send is absent.
+pub mod rate_limit_event {
+    use std::collections::BTreeMap;
+
+    /// The lifecycle's `nativeName`.
+    pub const NATIVE_NAME: &str = "rate_limit_event";
+    /// `rate_limit_info.status`: `allowed`, `allowed_warning` or `rejected`.
+    pub const STATUS: &str = "rateLimitStatus";
+    /// `rate_limit_info.resetsAt`, Unix-epoch seconds, as a decimal string.
+    pub const RESETS_AT: &str = "rateLimitResetsAt";
+    /// `rate_limit_info.rateLimitType`: the window (`five_hour`,
+    /// `seven_day`, `seven_day_opus`, …).
+    pub const WINDOW: &str = "rateLimitType";
+    /// `rate_limit_info.overageStatus`.
+    pub const OVERAGE_STATUS: &str = "rateLimitOverageStatus";
+    /// `rate_limit_info.isUsingOverage`, `true` or `false`.
+    pub const USING_OVERAGE: &str = "rateLimitUsingOverage";
+
+    /// The `relatedIds` entries for one `rate_limit_info` object. Only
+    /// scalar fields of the expected types are carried; anything else in the
+    /// frame (per-window utilization, free text) stays out of the journal.
+    #[must_use]
+    pub fn related_ids(info: Option<&serde_json::Value>) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Some(info) = info.and_then(serde_json::Value::as_object) else {
+            return out;
+        };
+        let token = |field: &str| {
+            info.get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| {
+                    !text.is_empty()
+                        && text.len() <= 64
+                        && text
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                })
+                .map(str::to_owned)
+        };
+        if let Some(status) = token("status") {
+            out.insert(STATUS.into(), status);
+        }
+        if let Some(resets) = info.get("resetsAt").and_then(serde_json::Value::as_i64) {
+            out.insert(RESETS_AT.into(), resets.to_string());
+        }
+        if let Some(window) = token("rateLimitType") {
+            out.insert(WINDOW.into(), window);
+        }
+        if let Some(overage) = token("overageStatus") {
+            out.insert(OVERAGE_STATUS.into(), overage);
+        }
+        if let Some(using) = info
+            .get("isUsingOverage")
+            .and_then(serde_json::Value::as_bool)
+        {
+            out.insert(USING_OVERAGE.into(), using.to_string());
+        }
+        out
+    }
+
+    /// The `relatedIds` key a carrier writes on its session-start lifecycle
+    /// for the harness's credential source (Claude `system/init`
+    /// `apiKeySource`): `none` is a claude.ai login (a subscription); any
+    /// other value names an API key source (`ANTHROPIC_API_KEY`,
+    /// `apiKeyHelper`, …).
+    pub const API_KEY_SOURCE: &str = "apiKeySource";
+
+    /// The `apiKeySource` value, bounded to a short printable name (it is a
+    /// source name, never a key).
+    #[must_use]
+    pub fn api_key_source(raw: Option<&str>) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|text| {
+                !text.is_empty()
+                    && text.len() <= 64
+                    && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+            })
+            .map(str::to_owned)
+    }
+
+    /// `rate_limit_info.status`, when it is a plain token.
+    #[must_use]
+    pub fn status(info: Option<&serde_json::Value>) -> Option<String> {
+        related_ids(info).remove(STATUS)
+    }
+}
+
 // ── TaskSpec (§4.3) ────────────────────────────────────────────────────────
 
 /// Generic low/normal/high sensitivity knob.
@@ -454,5 +547,36 @@ mod tests {
         );
         let parsed: SupplyProfile = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, supply);
+    }
+
+    #[test]
+    fn rate_limit_info_becomes_bounded_related_ids() {
+        let info = json!({
+            "status": "rejected", "resetsAt": 1_789_155_600_i64, "rateLimitType": "five_hour",
+            "overageStatus": "rejected", "isUsingOverage": false,
+            "unifiedWindows": { "five_hour": { "utilization": 1.0 } },
+            "message": "free text never carried"
+        });
+        let ids = rate_limit_event::related_ids(Some(&info));
+        assert_eq!(
+            ids.get(rate_limit_event::STATUS).map(String::as_str),
+            Some("rejected")
+        );
+        assert_eq!(
+            ids.get(rate_limit_event::RESETS_AT).map(String::as_str),
+            Some("1789155600")
+        );
+        assert_eq!(
+            ids.get(rate_limit_event::WINDOW).map(String::as_str),
+            Some("five_hour")
+        );
+        assert_eq!(
+            ids.get(rate_limit_event::USING_OVERAGE).map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        let odd = json!({ "status": "has spaces", "resetsAt": "soon" });
+        assert!(rate_limit_event::related_ids(Some(&odd)).is_empty());
+        assert!(rate_limit_event::related_ids(None).is_empty());
     }
 }

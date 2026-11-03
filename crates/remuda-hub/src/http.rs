@@ -144,6 +144,12 @@ pub struct CreateInstanceBody {
     /// Node-facing spec; the C1 supervisor (`crate::restart`) acts on it.
     #[serde(default)]
     restart: Option<RestartPolicyBody>,
+    /// cb-usage-resume (main-agent.md §11.6): after a subscription usage
+    /// limit resets, the Hub sends the instance one continuation input.
+    /// Default off; any creator may set it (an Agent for its own child, the
+    /// owner for any instance).
+    #[serde(default, rename = "autoContinue")]
+    auto_continue: bool,
 }
 
 /// `restart: {onProcessLoss, maxPerHour}` on the create body (D-057 §6.1).
@@ -1257,6 +1263,7 @@ pub(crate) fn resolve_delegation(
         enforce_tree: true,
         restart: None,
         seated_by: None,
+        auto_continue: false,
     })
 }
 
@@ -1557,6 +1564,7 @@ async fn create_instance_as(
         });
     }
     delegation.restart = restart_policy;
+    delegation.auto_continue = body.auto_continue;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
     let placement_outcome = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;

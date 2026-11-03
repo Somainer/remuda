@@ -750,7 +750,11 @@ export interface paths {
         delete: operations["instanceDelete"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Change an instance's properties
+         * @description Change a per-instance property; today `autoContinue` (cb-usage-resume, main-agent.md §11.6). An absent field keeps its value. Human devices only: an Agent sets the property for its child at dispatch or create and gets 403 here, as does a Bot. Turning it off does not recall a continuation already formed.
+         */
+        patch: operations["instancePatch"];
         trace?: never;
     };
     "/v1/instances/{id}/commands": {
@@ -2689,6 +2693,8 @@ export interface components {
             apiVia?: string;
             /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
             args?: string[];
+            /** @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance. */
+            autoContinue?: boolean;
             /** @description Host-absolute executable override. The Node validates and pins it; the Hub only stores the string. */
             binaryPath?: string;
             /** @description Expected sha256: digest of binaryPath. The launch is refused when the Node's pin disagrees. */
@@ -2763,6 +2769,10 @@ export interface components {
             items: components["schemas"]["InstanceRecord"][];
             nextCursor?: string | null;
         };
+        InstancePatch: {
+            /** @description Turn the instance's autoContinue on or off (cb-usage-resume). Absent keeps it. */
+            autoContinue?: boolean;
+        };
         InstanceRecord: {
             /**
              * @description idle only after a Node/herdr agent_status or session idle observation. Create default is unknown.
@@ -2771,6 +2781,8 @@ export interface components {
             activity: "unknown" | "idle" | "working" | "blocked" | "draining";
             /** @description Model-API route this instance actually uses (D-047); absent on a direct session. */
             readonly apiRoute?: components["schemas"]["ApiRoute"];
+            /** @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Copied to every chapter of a continuity lineage; the owner changes it with `PATCH /v1/instances/{id}`. */
+            readonly autoContinue?: boolean;
             /** @description D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance. */
             readonly chapterCause?: string | null;
             connectivity: string;
@@ -4172,6 +4184,8 @@ export interface components {
             apiRoute?: "auto" | "hub-relay" | "direct-net";
             /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. Omitted leaves the decision to the project and profile layers. */
             apiVia?: string;
+            /** @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. The dispatching Agent or the owner sets it at dispatch; a replace or respawn keeps it. */
+            autoContinue?: boolean;
             /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
             brief: string;
             briefName?: string;
@@ -5987,6 +6001,36 @@ export interface operations {
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    instancePatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstancePatch"];
+            };
+        };
+        responses: {
+            /** @description The instance after the change */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceRecord"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     instanceCommands: {

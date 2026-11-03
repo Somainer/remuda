@@ -1719,6 +1719,7 @@ async fn respawn_scoped(
         enforce_tree: true,
         restart: None,
         seated_by: None,
+        auto_continue: old.auto_continue,
     };
     let (respawn_initiator, respawn_device_id) = initiator_and_device(state, device).await?;
     let (instance, _command) = crate::placement::spawn_on_host(
@@ -1778,6 +1779,17 @@ async fn relaunch_instance(
     worker: &WorkerRoster,
 ) -> Result<String, HubError> {
     let device = caller(state, headers).await?;
+    // cb-usage-resume: a relaunched worker keeps the autoContinue its
+    // previous instance had.
+    let previous_auto_continue = match &worker.instance_id {
+        Some(id) => state
+            .store
+            .get_instance(id.as_id().to_string())
+            .await
+            .map_err(map_store)?
+            .is_some_and(|previous| previous.auto_continue),
+        None => false,
+    };
     let host = state
         .store
         .get_host(worker.host_id.as_id().to_string())
@@ -1890,6 +1902,7 @@ async fn relaunch_instance(
         enforce_tree: true,
         restart: None,
         seated_by: None,
+        auto_continue: previous_auto_continue,
     };
     // D-057 §7.1: a respawn the Hub authors on the caller's behalf carries
     // that caller's initiator and device id.
@@ -1930,6 +1943,16 @@ async fn replace_worker(
     // D-057 §4.2 item 1: an Agent replaces only workers in its subtree.
     crate::agent_scope::require_worker_owned(&state, &device, &worker).await?;
 
+    // cb-usage-resume: the replacement keeps the worker's autoContinue.
+    let previous_auto_continue = match &worker.instance_id {
+        Some(id) => state
+            .store
+            .get_instance(id.as_id().to_string())
+            .await
+            .map_err(map_store)?
+            .is_some_and(|previous| previous.auto_continue),
+        None => false,
+    };
     // Recover the original brief so the replacement gets the same task.
     let brief = match &worker.brief_object_id {
         Some(object_id) => state
@@ -1975,6 +1998,8 @@ async fn replace_worker(
         // And the mode the original dispatch named, verbatim (D-057 §4.2
         // item 2): an omitted one stays omitted and is resolved again.
         permission_mode: worker.permission_mode_requested.clone(),
+        // cb-usage-resume: and its autoContinue, read from its instance.
+        auto_continue: previous_auto_continue,
     };
 
     // D-057 §4.2 item 4: decide an Agent replacement's D-017 approval before

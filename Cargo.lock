@@ -3319,6 +3319,7 @@ dependencies = [
  "ece",
  "fancy-regex",
  "futures",
+ "jiff",
  "nix",
  "openssl",
  "regex",

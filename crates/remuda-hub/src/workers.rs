@@ -133,6 +133,10 @@ pub(crate) struct DispatchBody {
     /// D-047 route sub-mode for `apiVia`: auto | hub-relay | direct-net.
     #[serde(default, rename = "apiRoute")]
     pub(crate) api_route: Option<String>,
+    /// cb-usage-resume (main-agent.md §11.6): after a subscription usage
+    /// limit resets, continue the worker once. Default off.
+    #[serde(default)]
+    pub(crate) auto_continue: bool,
 }
 
 #[derive(Deserialize)]
@@ -743,6 +747,7 @@ pub(crate) async fn dispatch_core(
         enforce_tree: true,
         restart: None,
         seated_by: None,
+        auto_continue: body.auto_continue,
     };
     // Capture what a rollback needs before the block below moves these.
     let rollback_name = name.clone();

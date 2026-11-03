@@ -1,5 +1,5 @@
 //! Durable wake-ups (cb-wake-engine; D-060 §11, main-agent.md §11.1, §11.3,
-//! §11.4, §11.8).
+//! §11.4, §11.9).
 //!
 //! A lineage (or the owner, for any lineage) adds wake-ups with
 //! `remuda wake add|list|rm`. The Hub keeps them in `hub.sqlite`, claims each

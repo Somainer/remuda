@@ -969,6 +969,12 @@ pub struct InstanceRecord {
         rename = "turnEndSeq"
     )]
     pub turn_end_seq: Option<String>,
+    /// cb-usage-resume (main-agent.md §11.6): after a subscription usage
+    /// limit resets, the Hub sends this instance one continuation input.
+    /// Off unless its creator (an Agent at dispatch or create) or the owner
+    /// turned it on.
+    #[serde(default)]
+    pub auto_continue: bool,
 }
 
 /// Additive marker for a root turn that ended in failure while the process
@@ -1166,6 +1172,9 @@ pub struct InstanceDelegation {
     /// records who gave it and with what origin; the supervisor's successor
     /// creates carry that origin and name the device beside its own actor.
     pub seated_by: Option<Seating>,
+    /// cb-usage-resume (§11.6): continue once after a subscription usage
+    /// limit resets.
+    pub auto_continue: bool,
 }
 
 /// Who seated a continuity lineage (D-057 §6.3.1, OA5): the authenticating
@@ -1191,6 +1200,7 @@ impl Default for InstanceDelegation {
             enforce_tree: false,
             restart: None,
             seated_by: None,
+            auto_continue: false,
         }
     }
 }
@@ -1863,6 +1873,7 @@ fn continuation_resume_tx(
             .clone()
             .and_then(|value| serde_json::from_value(value).ok()),
         seated_by: None,
+        auto_continue: current.auto_continue,
     };
     // The predecessor is fenced inside this same transaction, so the copied
     // seat grants do not collide with it.
@@ -1872,11 +1883,11 @@ fn continuation_resume_tx(
             (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
              title, journal_id, durable_seq, spec_json, created_at, updated_at,
              role, scope_json, grants_json, task_id,
-             lineage_id, generation, chapter_cause, fenced_at, restart_json)
+             lineage_id, generation, chapter_cause, fenced_at, restart_json, auto_continue)
          VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                  ?7, ?8, 0, ?9, ?10, ?10,
                  ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?18, NULL, ?17)",
+                 ?15, ?16, ?18, NULL, ?17, ?19)",
         params![
             successor_id,
             current.host_id,
@@ -1896,6 +1907,7 @@ fn continuation_resume_tx(
             successor_generation,
             restart_json,
             request.chapter_cause,
+            successor_delegation.auto_continue,
         ],
     )?;
     // 5. Queue the successor's resume create (forwarded after commit).
@@ -5294,11 +5306,12 @@ impl Store {
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at,
                      role, scope_json, grants_json, task_id,
-                     lineage_id, generation, chapter_cause, fenced_at, restart_json)
+                     lineage_id, generation, chapter_cause, fenced_at, restart_json,
+                     auto_continue)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                          ?7, ?8, 0, ?9, ?10, ?10,
                          ?11, ?12, ?13, ?14,
-                         ?1, 1, NULL, NULL, ?15)",
+                         ?1, 1, NULL, NULL, ?15, ?16)",
                 params![
                     instance_id,
                     host_id,
@@ -5315,6 +5328,7 @@ impl Store {
                     grants_json,
                     delegation.task_id,
                     restart_json,
+                    delegation.auto_continue,
                 ],
             )?;
             // D-057 §5: a lineage row exists for every continuity instance —
@@ -6917,12 +6931,42 @@ impl Store {
     }
 
     /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
+    /// Mirror an answer the Node committed. `first_commit` is whether this
+    /// call committed it (the interaction was pending before the RPC and the
+    /// Node did not report a replay): only then is it new input to the
+    /// instance, so only then does it cancel the instance's usage wait. An
+    /// idempotent replay of the same commandId must not cancel a wait the
+    /// instance opened since (cb-usage-resume r3).
     pub async fn record_interaction_answer(
         &self,
         interaction_id: String,
+        first_commit: bool,
     ) -> Result<(), StoreError> {
         self.run_named("record_interaction_answer", move |conn| {
-            conn.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            let tx = immediate_tx(conn)?;
+            tx.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            // cb-usage-resume r2: an answer is input to the instance, and it
+            // arrives as a direct RPC that never inserts a command row, so
+            // the input trigger cannot see it. Cancel the wait here, in the
+            // same transaction as the settlement. The instance is read from
+            // the interaction row now, so a live-only answer (no row when the
+            // handler looked) cancels too once the request has been
+            // ingested. If the Hub has still never ingested the request, the
+            // Node's reply names no instance and nothing is cancelled: a
+            // stated limit (main-agent.md §11.8).
+            let instance: Option<String> = tx
+                .query_row(
+                    "SELECT instance_id FROM interactions WHERE id = ?1",
+                    params![interaction_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(instance) = instance.filter(|_| first_commit) {
+                crate::inbox::guard("usage_resume_cancel", &tx, || {
+                    crate::usage_resume::cancel(&tx, &instance, "input")
+                });
+            }
+            tx.commit()?;
             Ok(())
         }).await
     }
@@ -8486,6 +8530,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // cb-wake-engine: after the inbox and its delivery (their rows and the
     // command settlement columns its triggers read).
     crate::wake::migrate(&conn)?;
+    // cb-usage-resume: after the inbox (its supply parks) and the commands,
+    // instances and lineages its triggers read.
+    crate::usage_resume::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -15946,7 +15993,8 @@ pub(crate) fn load_instance(
                 lineage_id, generation, chapter_cause, fenced_at, restart_json,
                 turn_error_json, turn_end_seq,
                 (SELECT seen_seq FROM instance_views
-                  WHERE instance_id = instances.id AND scope = ?2)
+                  WHERE instance_id = instances.id AND scope = ?2),
+                auto_continue
          FROM instances WHERE id = ?1",
         params![id, crate::seen::OWNER_SCOPE],
         |row| {
@@ -16187,6 +16235,7 @@ pub(crate) fn load_instance(
                 unseen: seen_marks.unseen(),
                 seen_seq: seen_marks.seen_seq.map(|seq| seq.to_string()),
                 turn_end_seq: seen_marks.turn_end_seq.map(|seq| seq.to_string()),
+                auto_continue: row.get(32)?,
             })
         },
     )
@@ -16321,6 +16370,12 @@ fn append_loaded_event(
     }
     crate::push_route::guard("fold_reply", conn, || {
         crate::push_route::fold_reply(conn, instance_id, &event, seq, turn_ended)
+    });
+    // cb-usage-resume: the usage-limit wait this event implies, before the
+    // inbox fold, whose `turn-failed` fact carries its verdict. Like the
+    // inbox fold it can never fail the append.
+    crate::inbox::guard("usage_resume_fold", conn, || {
+        crate::usage_resume::fold(conn, instance_id, &event, &now, turn_ended)
     });
     // cb-inbox-facts: the facts this event implies, in the same transaction
     // as the row; a replayed append (returned above) writes none.

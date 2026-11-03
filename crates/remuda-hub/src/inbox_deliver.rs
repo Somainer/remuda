@@ -1650,17 +1650,23 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
     push_owed(state).await;
 }
 
-/// Formed batches whose send is still queued and unforwarded, oldest first.
+/// Formed batches whose send is still queued and unforwarded, and formed
+/// usage-resume continuations likewise, oldest first.
 async fn unsent_batches(state: &AppState) -> Result<Vec<Unsent>, StoreError> {
     state
         .store
         .read("inbox_batches_unsent", |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT b.batch_id, b.host_id FROM inbox_batches b
-                   JOIN commands c ON c.id = b.batch_id
-                  WHERE b.outcome IS NULL AND c.state = 'queued' AND c.forwarded = 0
-                  ORDER BY b.created_at",
-            )?;
+            // cb-usage-resume: a formed continuation is Hub-written input
+            // too, forwarded and retried under its id exactly as a batch.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, host_id FROM (
+                    SELECT b.batch_id AS id, b.host_id AS host_id, b.created_at AS at
+                      FROM inbox_batches b JOIN commands c ON c.id = b.batch_id
+                     WHERE b.outcome IS NULL AND c.state = 'queued' AND c.forwarded = 0
+                    UNION ALL {}
+                 ) ORDER BY at",
+                crate::usage_resume::UNSENT_SQL
+            ))?;
             let rows = stmt
                 .query_map([], |row| {
                     Ok(Unsent {

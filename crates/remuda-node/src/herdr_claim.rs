@@ -487,14 +487,13 @@ impl DevNode {
         if let Ok(mut live) = self.inner.herdr_claims.live.lock() {
             live.insert(id.clone(), Arc::clone(&pane));
         }
+        // A herdr control session sizes the pane it attaches to. Open it at
+        // the pane's current size so claiming never reflows the human's
+        // terminal; a PWA viewer resizes it like any herdr client later.
+        let (cols, rows) = pane_geometry(&pane.client(), &pane.claim.pane_id).await;
         if let Err(error) = self
             .tty()
-            .start(
-                id.clone(),
-                pane.bridge(),
-                crate::TTY_DEFAULT_COLS,
-                crate::TTY_DEFAULT_ROWS,
-            )
+            .start(id.clone(), pane.bridge(), cols, rows)
             .await
         {
             tracing::warn!(%error, instance = %id.as_id(), "claimed pane tty bridge failed to start");
@@ -1029,6 +1028,42 @@ async fn pane_listing(
             })
             .map(|(_, _, id)| id.as_id().to_string()),
     }
+}
+
+/// The pane's current size: rows from herdr's viewport, columns from the
+/// widest visible line (agent TUIs draw full-width rules). Falls back to the
+/// Node's TTY defaults for anything herdr does not say.
+async fn pane_geometry(client: &Client, pane_id: &str) -> (u16, u16) {
+    let rows = client
+        .session_snapshot()
+        .await
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .panes
+                .into_iter()
+                .find(|pane| pane.pane_id == pane_id)
+        })
+        .and_then(|pane| pane.scroll)
+        .map(|scroll| scroll.viewport_rows)
+        .filter(|rows| (2..=500).contains(rows))
+        .and_then(|rows| u16::try_from(rows).ok())
+        .unwrap_or(crate::TTY_DEFAULT_ROWS);
+    let cols = client
+        .pane_read(PaneReadParams {
+            pane_id: pane_id.to_owned(),
+            source: ReadSource::Visible,
+            lines: None,
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        })
+        .await
+        .ok()
+        .and_then(|read| read.text().lines().map(|line| line.chars().count()).max())
+        .filter(|cols| *cols >= usize::from(crate::TTY_DEFAULT_COLS) && *cols <= 1000)
+        .and_then(|cols| u16::try_from(cols).ok())
+        .unwrap_or(crate::TTY_DEFAULT_COLS);
+    (cols, rows)
 }
 
 /// Probe a claim: pane present in its recorded workspace and tab, process

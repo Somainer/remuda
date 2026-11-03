@@ -499,8 +499,16 @@ async fn send_keys_and_tty_reach_only_the_claimed_pane() {
         .expect("claim");
     let id = claimed.meta.id.clone();
     let wire_id = id.as_id().to_string();
-    // The TTY bridge is a control session on the claimed pane, opened at claim.
+    // The TTY bridge is a control session on the claimed pane, opened at claim
+    // at the pane's own size (the fake's viewport is 40 rows), never the 80x24
+    // default that would reflow the human's terminal.
     harness.wait_call("terminal.control", "w1:p1").await;
+    let control = harness
+        .calls()
+        .into_iter()
+        .find(|call| call["method"] == "terminal.control")
+        .expect("control session");
+    assert_eq!(control["target"], "80x40", "{control}");
 
     crate::transport::hubnode::dispatch_method(
         &harness.node,

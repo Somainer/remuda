@@ -559,7 +559,7 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
                 append_call(
                     &calls,
                     &format!("terminal.{mode}"),
-                    &json!({ "pane_id": pane }),
+                    &json!({ "pane_id": pane, "target": format!("{cols}x{rows}") }),
                 );
             }
             write_frames(&frames, cols, rows, logged)?;

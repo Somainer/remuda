@@ -2151,6 +2151,44 @@ push tag    = notice:<noticeId>; landing /sessions?focus=<noticeId>
 - 标题一行、至多 120 字符；正文至多 2000 字符；`dedupeKey` 至多 128 个 `[A-Za-z0-9._:/-]` 字符。超界：400，`reason: "invalid-notice"`。秘密 lint 先于边界检查覆盖三者：命中为 422，`code: "OWNER_NOTIFY_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。
 - Hub 在一个写事务里写认领行、它的审计行（`owner.notify`，不带文本）与推送 outbox 行，提交后才推送；推送之前（或推送之后、标记之前）崩溃，重启后以同一 tag 补发一次，替换而不是新增通知。去重键按写入血缘（所有者自己的为 `owner`）划分。确认先于推送时不再推送。
 
+**唤醒（`cb-wake-engine`）。** 机制见 [main-agent.md §11.8](./main-agent.md#118-implementation-notes-cb-wake-engine-2026-11-04)。
+
+~~~text
+GET    /v1/lineages/{id}/wake-ups
+  -> 200 {lineageId, items: [WakeUp], runs: [WakeRun]}   items oldest first; runs: the latest 50, newest first
+POST   /v1/lineages/{id}/wake-ups
+  body {name?, text, trigger, mode?: persistent|fresh, notify: never|failure|always, check?}
+  -> 201 {wakeUp: WakeUp, created: true}
+  -> 200 {wakeUp: WakeUp, created: false}               the same add under the same name
+DELETE /v1/lineages/{id}/wake-ups/{wake}                 {wake} = wak_… or the name
+  -> 200 {wakeId, name}
+
+trigger = {kind: at, at?, afterSecs?}                    exactly one of at / afterSecs; stored with at
+        | {kind: every, everySecs, startAt?}             60 ≤ everySecs ≤ 31536000
+        | {kind: when, factKind, subjectInstanceId?}     an inbox fact kind; not wake-due
+WakeUp  = {wakeId, lineageId, name, text, trigger, mode, notify, state: active|done,
+           nextFireAt?, missedCount, createdAt, updatedAt, lastFiredAt?,
+           creator: {origin: agent|human, instanceId?}}
+WakeRun = {runId, wakeId, lineageId, name, mode, scheduledAt, firedAt,
+           state: queued|running|success|failed|skipped|interrupted,
+           startedAt?, endedAt?, checkExit: null, factId?, batchId?, childInstanceId?,
+           missedBefore, failureKind?}
+wake-due payload = {wakeId, runId, name, text, trigger, mode, scheduledAt, firedAt,
+                    missed, creator, everySecs?, cause?: {factId, factKind}}
+
+GET /healthz
+  -> 200 {ok: true, version, uptimeSecs, lastTickAt?, tickAgeSecs, tickPeriodSecs,
+          tickStaleAfterSecs, deliveryAgeSecs?}
+  -> 503 {ok: false, code: HUB_TICK_STALE, error, ...same fields}   tickAgeSecs > tickStaleAfterSecs
+~~~
+
+- 调用方：Agent 只管自己的血缘（路径里的 `{id}` 必须是它的规范血缘 id，中间件钉住，处理器再查；写入过提交时的 initiator 检查，已被 fence 或暂停的章节得到 409 `fenced`）；Human 设备可管任意血缘，也可用它的任一章节 id 指名；Bot 凭证一律 403。中间件只放行这三种形状。
+- 边界：`name` 至多 64 个 `[A-Za-z0-9._:/-]` 字符（缺省时 Hub 生成）；`text` 至多 2000 字符；`at` 至多一年之后；每个血缘至多 64 个 wake-up。秘密 lint 先于其他检查覆盖 `name` 与 `text`：命中为 422，`code: "WAKE_SECRET_REJECTED"`，只给 `field` 与 `rule`，不回显文本，什么也不存。超界为 400，`reason: "invalid-wake-up"`。`notify` 必填，Hub 从不替调用方选。
+- 同名重复：请求按原样（`afterSecs` 原值，而非解析后的时间）存下；同名且请求相同返回已存的行，200 `created: false`；同名但请求不同为 409，`reason: "wake-name-taken"`。
+- 尚未实现的部分：带 `check` 为 422，`code: "WAKE_UNSUPPORTED"`，`reason: "check-unsupported"`（`cb-wake-check`）；`when` 的 `factKind` 为 `context-threshold` 为 422，`reason: "condition-unsupported"`（还没有任何来源记录上下文百分比越线）。血缘收不到事实时为 409 `wake-not-received`；超过 64 个为 409 `wake-limit`。
+- 投递：`persistent` 的 run 是血缘的一条 `wake-due` 事实，dedupe key 与 occurrence 上限的主体都是 run id；一个批次至多带一个 wake run，文本模板 v2，以该 run 的信封开头（main-agent.md §11.3）。`fresh` 的 run 不发事实，而由 Hub 以章节自己的 Agent 凭证发起一次普通的实例创建（`claude-print`，同 host），子实例 spec 带 `wakeRunId`，其事实经父边回到血缘。
+- `/healthz` 的 503 只表示 wake tick 已停（12 个周期、60 秒没有完成的 tick）；其余路由照常服务。容器探针把它当作不健康；PWA 的连通探针把这一种 503 当作可达。
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象

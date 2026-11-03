@@ -1251,7 +1251,6 @@
           },
           "autoContinue": {
             "type": "boolean",
-            "default": false,
             "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance."
           }
         },
@@ -5213,7 +5212,6 @@
           },
           "autoContinue": {
             "type": "boolean",
-            "default": false,
             "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. The dispatching Agent or the owner sets it at dispatch; a replace or respawn keeps it."
           }
         },

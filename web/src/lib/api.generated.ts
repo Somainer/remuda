@@ -2586,11 +2586,8 @@ export interface components {
             apiVia?: string;
             /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
             args?: string[];
-            /**
-             * @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance.
-             * @default false
-             */
-            autoContinue: boolean;
+            /** @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance. */
+            autoContinue?: boolean;
             /** @description Host-absolute executable override. The Node validates and pins it; the Hub only stores the string. */
             binaryPath?: string;
             /** @description Expected sha256: digest of binaryPath. The launch is refused when the Node's pin disagrees. */
@@ -3889,11 +3886,8 @@ export interface components {
             apiRoute?: "auto" | "hub-relay" | "direct-net";
             /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. Omitted leaves the decision to the project and profile layers. */
             apiVia?: string;
-            /**
-             * @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. The dispatching Agent or the owner sets it at dispatch; a replace or respawn keeps it.
-             * @default false
-             */
-            autoContinue: boolean;
+            /** @description cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. The dispatching Agent or the owner sets it at dispatch; a replace or respawn keeps it. */
+            autoContinue?: boolean;
             /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
             brief: string;
             briefName?: string;

@@ -28,6 +28,8 @@ mod host_files;
 mod hosts;
 mod http;
 mod inbox;
+mod inbox_deliver;
+mod inbox_voice;
 mod instances;
 mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
@@ -202,6 +204,9 @@ pub struct AppState {
     pub(crate) fences: crate::fence::FenceState,
     /// D-057 §6.3.1 (ma-restart): the C1 supervisor's tick serialization.
     pub(crate) restart: crate::restart::SupervisorState,
+    /// cb-inbox-deliver: the delivery driver's serialization (and its test
+    /// hold).
+    pub(crate) deliver: crate::inbox_deliver::DeliverState,
     /// cb-stall-tooluse: hosts whose screen stall sweep is still running.
     pub(crate) screen_sweeps: crate::stall_screen::SweepsInFlight,
     /// D-057 §8.3 (ma-push): the push outbox drive.
@@ -1359,6 +1364,138 @@ impl RunningHub {
         self.state.config.host_lost_grace_ms
     }
 
+    /// Test-only: hold (or release) every inbox batch forward
+    /// (cb-inbox-deliver). A held batch forms and stays queued.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_hold_inbox_forward(&self, hold: bool) {
+        self.state
+            .deliver
+            .hold_forward
+            .store(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: let the inbox delivery settle: one writer job (so every
+    /// earlier job's post-job formation has run), then one driver pass (so
+    /// every batch formed by then has been forwarded, or held). The pass
+    /// honours the retry backoff, as every production pass after boot does.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_settle_inbox(&self) -> anyhow::Result<()> {
+        self.state
+            .store
+            .run_named("test_inbox_barrier", |_| Ok(()))
+            .await?;
+        crate::inbox_deliver::drive(&self.state, crate::inbox_deliver::Pace::Backoff).await;
+        Ok(())
+    }
+
+    /// Test-only: every armed same-id retry is due now (its backoff waived).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_waive_inbox_backoff(&self) {
+        self.state.deliver.waive_backoff();
+    }
+
+    /// Test-only: arm a one-shot park point in the inbox delivery driver
+    /// between its own precedence read and the forward of `batch_id` on
+    /// `host_id`. Returns `(reached, release)`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_inbox_forward_barrier(
+        &self,
+        host_id: &str,
+        batch_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::InboxBeforeForward,
+            (host_id.to_owned(), batch_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test-only: arm a one-shot park point in the release of the
+    /// Hub-written send `command_id` on `host_id`, between its retry arm and
+    /// the release's commit. Returns `(reached, release)`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_hub_release_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::HubReleaseBeforeCommit,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test-only: one prune of the same-id retry entries, as a drive runs
+    /// it before its forwards.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_prune_inbox_retries(&self) {
+        crate::inbox_deliver::prune_retries(&self.state).await;
+    }
+
+    /// Test-only: lose every armed same-id retry entry.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_forget_inbox_retries(&self) {
+        self.state.deliver.forget_retries();
+    }
+
+    /// Test-only: whether a same-id retry is armed for `command_id`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_inbox_retry_armed(&self, command_id: &str) -> bool {
+        self.state.deliver.retry_armed(command_id)
+    }
+
+    /// Test-only: the next `times` forwards of Hub-written input initiated
+    /// by `lineage_id` (its restart notice, its batches) are refused
+    /// NODE_BUSY.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_node_busy_lineage(&self, lineage_id: &str, times: usize) {
+        crate::inbox_deliver::test_seams::arm_node_busy_lineage(lineage_id, times);
+    }
+
+    /// Test-only: the next `times` forwards of `command_id` are refused
+    /// NODE_BUSY, as when its host's in-flight slots are full.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_node_busy(&self, command_id: &str, times: usize) {
+        crate::inbox_deliver::test_seams::arm_node_busy(command_id, times);
+    }
+
+    /// Test-only: one periodic delivery retry check, as the scheduler runs
+    /// it (the backoff is honoured).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_inbox_retry_tick(&self) {
+        crate::inbox_deliver::retry_tick(&self.state).await;
+    }
+
     /// Test-only: one evaluation of the inbox's time-driven facts (supply
     /// resets, stalls, wall budgets) as of `now` (RFC3339), returning how
     /// many facts it recorded.
@@ -2288,6 +2425,7 @@ async fn spawn_inner(
         gate_decision_guards: crate::gatequeue::GateDecisionGuards::new(),
         fences: crate::fence::FenceState::default(),
         restart: crate::restart::SupervisorState::default(),
+        deliver: crate::inbox_deliver::DeliverState::default(),
         screen_sweeps: crate::stall_screen::SweepsInFlight::default(),
         outbox: crate::push_route::OutboxState::default(),
     };
@@ -2326,6 +2464,20 @@ async fn spawn_inner(
     // Batch 6: jobs left running by a previous Hub process re-enter the queue.
     crate::gatequeue::reconcile(&state).await;
     crate::gatequeue::tick(&state).await;
+    // cb-inbox-deliver test seam (RC builds with `test-faults` only): hold
+    // every batch forward, so a batch can be formed and the Hub restarted
+    // before it leaves.
+    #[cfg(any(test, feature = "test-faults"))]
+    if std::env::var_os("REMUDA_TEST_INBOX_HOLD_FORWARD").is_some() {
+        state
+            .deliver
+            .hold_forward
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // cb-inbox-deliver: owner pushes a previous process still owed. Batches
+    // it formed go out once their host says hello.
+    crate::inbox_deliver::drive(&state, crate::inbox_deliver::Pace::Now).await;
+    let deliver_signal = state.store.deliver_signal();
     let reaper_state = state.clone();
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -2360,6 +2512,18 @@ async fn spawn_inner(
                 result = &mut server => {
                     if let Err(err) = result { tracing::error!(error = %err, "hub server exited"); }
                     break;
+                }
+                // cb-inbox-deliver: the writer formed a batch or owes a
+                // fallback push. Off the loop, like the other drivers.
+                () = deliver_signal.notified() => {
+                    let deliver_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::inbox_deliver::drive(
+                            &deliver_state,
+                            crate::inbox_deliver::Pace::Backoff,
+                        )
+                        .await;
+                    });
                 }
                 // D-057 §8.3: a writer job committed push outbox rows.
                 () = outbox_ready.notified() => {
@@ -2409,6 +2573,13 @@ async fn spawn_inner(
                         let inbox_state = reaper_state.clone();
                         tokio::spawn(async move {
                             crate::inbox::run_tick(&inbox_state).await;
+                        });
+                    }
+                    // cb-inbox-deliver: same-id retries whose backoff passed.
+                    if inbox_ticks.is_multiple_of(crate::inbox_deliver::RETRY_TICK_EVERY) {
+                        let retry_state = reaper_state.clone();
+                        tokio::spawn(async move {
+                            crate::inbox_deliver::retry_tick(&retry_state).await;
                         });
                     }
                     inbox_ticks = inbox_ticks.wrapping_add(1);

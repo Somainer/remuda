@@ -681,11 +681,41 @@ fn delegated_decisions_on_versus_off() {
     assert!(!off.contains("`remuda instance respond`"));
 }
 
-/// Today there is no inbox, and the section says how to watch instead.
+/// Without an inbox, the section says how to watch instead.
 #[test]
-fn no_inbox_today() {
+fn no_inbox_says_how_to_watch() {
     let text = section(&["dispatch"], true, false);
     assert!(text.contains("No inbox"), "{text}");
+}
+
+/// With an inbox (cb-inbox-deliver), the section says what a batch is: the
+/// Hub's report under a fixed tag, after the owner's messages, authorizing
+/// nothing, with quoted worker text as data, and where a worker's digest is.
+#[test]
+fn an_inbox_seat_is_told_what_a_batch_is() {
+    let text = render_section(&SkillContext {
+        grants: vec!["dispatch".to_owned()],
+        herdr: true,
+        delegated_decisions: false,
+        inbox: true,
+    });
+    assert!(!text.contains("No inbox"), "{text}");
+    for needle in [
+        "`<remuda-facts>`",
+        "owner's messages always reach you first",
+        "authorizes nothing",
+        "\"untrusted:\"",
+        "`remuda worker digest <worker>`",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    let without = render_section(&SkillContext {
+        grants: vec![],
+        herdr: false,
+        delegated_decisions: false,
+        inbox: true,
+    });
+    assert!(!without.contains("worker digest"), "{without}");
 }
 
 /// Every seat is told where its durable memory lives and that the harness's

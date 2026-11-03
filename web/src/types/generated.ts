@@ -1673,11 +1673,29 @@ export type HostTransportMode = ("outbound-wss" | "ssh-tunnel");
 
 export type Id = (string);
 
+/** One delivery batch (cb-inbox-deliver; D-060 §10.1 items 6 and 7): the Hub-origin row written before its `instance.send` is forwarded. The batch id is that send's `commandId`. */
+export type InboxBatch = ({
+  "batchId": (string);
+  "createdAt": (string);
+  "factIds": (((number))[]);
+  "generation": (number);
+  "instanceId": (string);
+  "lineageId": (string);
+  "listed": (number);
+  "openingTag": (string);
+  "outcome"?: (string | null);
+  "releasedAt"?: (string | null);
+  "templateVersion": (number);
+  "text": (string);
+  [key: string]: unknown;
+});
+
 /** One inbox row. */
 export type InboxFact = ({
   "batchId"?: (string | null);
   "createdAt": (string);
   "dedupeKey": (string);
+  "fallback"?: (InboxFallback | (null));
   "id": (number);
   "kind": InboxFactKind;
   "lineageId": (string);
@@ -1691,6 +1709,16 @@ export type InboxFact = ({
 /** InboxFactKind wire values; `protocol.md` §8.4. */
 export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold");
 
+/** Why and when a row fell back to the owner push (§10.1 item 4). */
+export type InboxFallback = ({
+  "at": (string);
+  "reason": InboxFallbackReason;
+  [key: string]: unknown;
+});
+
+/** InboxFallbackReason wire values; `protocol.md` §8.4. */
+export type InboxFallbackReason = ("muted" | "re-parented" | "no-subscriber");
+
 /** How often the same fact occurred for this subscriber in the rolling window ending at the fact's `stateEnteredAt` (§10.1 item 2). The count survives a Hub restart; occurrences over the cap are counted but write no row, so the next recorded fact carries them. */
 export type InboxOccurrence = ({
   "cap": (number);
@@ -1702,6 +1730,7 @@ export type InboxOccurrence = ({
 
 /** `GET /v1/lineages/{id}/inbox`: one page of a lineage's inbox, oldest first. */
 export type InboxPage = ({
+  "batches": ((InboxBatch)[]);
   "items": ((InboxFact)[]);
   "lineageId": (string);
   "more": (boolean);
@@ -2751,7 +2780,7 @@ export type MemoryWriteResult = ({
 });
 
 /** MessageOrigin wire values; `protocol.md` §5.2. */
-export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "unknown");
+export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "hub" | "unknown");
 
 /** MessagePayload; `protocol.md` §5.2. */
 export type MessagePayload = ({

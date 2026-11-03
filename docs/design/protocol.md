@@ -1027,7 +1027,7 @@ type MessagePayload = NodeMutation & {
   parentToolCallId: Id|null;
   nativeOrigin: Knowledge<string>;
   origin: "human"|"injected-skill"|"injected-command-output"
-        |"hook-context"|"tool-result"|"compaction"|"unknown";
+        |"hook-context"|"tool-result"|"compaction"|"hub"|"unknown";
   commandId?: CommandId;
   // c-steer: how a Remuda-queued prompt reaches the agent. Set on the queued
   // user node and kept through its revisions; absent on natively-observed
@@ -1064,6 +1064,8 @@ PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user me
 同一 node 的 source 优先级由字段定义：结构化 native item/message 负责内容和最终 tool 结果；hook 负责它自身的前后事件和交互请求；screen 只负责展示提示。低信息来源不能把高信息值改成空值。usage 不随 message replace 被累加第二次。thought 只显示原生实际输出的文本/summary，redacted thinking 保存 redaction 标记，不尝试恢复隐藏内容。
 
 **`origin`（D-028 P3 增量字段）**：`role` 说的是这条记录被记在谁名下，`origin` 说的是**它到底是谁写的**。Claude transcript 把 skill 正文、slash 命令展开（`<command-message>` / `<command-name>`）、`<local-command-stdout>`、hook additionalContext、`<task-notification>`、tool result、compact 摘要**一律记成 `user` 记录**——把它们都画成用户气泡，既重复又让人误以为是自己发的。因此分类必须落在 mapper 上，由**证据**判定而不是猜文本：`isCompactSummary` → `compaction`；`sourceToolUseID` 或含 `tool_result` block → `tool-result`；`isMeta` → `injected-skill`；`<command-*>` 开头 → `injected-skill`（命令调用）；`<local-command-*>` 开头 → `injected-command-output`；`<system-reminder>` / `<task-notification>` 开头 → `hook-context`；其余为 `human`。Claude 自报的 `origin.kind`（`human` / `task-notification` / …）与 `promptSource`（`typed` / `sdk` / `system`）**优先于**上述启发式，因为那是 harness 的直接陈述。
+
+**`hub`（cb-inbox-deliver）**：Hub 自己写的输入（事实批、重启通知；命令的 origin 为 `hub`，Node 侧为 `system`）由 Node 在为该命令写用户消息时标成 `hub`，transcript/stdout 回显并入同一节点时保留 `hub`。客户端把它画成 Hub 的系统行，绝不画成所有者的气泡；未升级的 Node 仍写 `human`。
 
 **不得丢弃**：注入项仍要进 journal（否则无法解释 agent 为什么那样答），只是 UI 默认折叠成一行。`unknown` 按 `human` 渲染——漏判要表现为多显示一条，不能表现为静默吞掉用户的话。同一条人类 prompt 可能既有入队记录又有投递记录（共享 `promptId`），按 `promptId` + 文本去重**保留第一条**。
 
@@ -2099,25 +2101,33 @@ GET /v1/lineages/{id}/glance
 ~~~text
 GET   /v1/lineages/{id}/inbox?after=<rowId>&limit=<n>
   -> 200 {lineageId, items: [InboxFact], nextAfter, more,
-          settings: {optIn, mutedKinds: [kind]}}
-     rows with id > after, oldest first; limit defaults to 50, at most 200
+          settings: {optIn, mutedKinds: [kind]}, batches: [InboxBatch]}
+     rows with id > after, oldest first; limit defaults to 50, at most 200;
+     batches: the delivery batches that carried this page's rows
 PATCH /v1/lineages/{id}/inbox
   body {optIn?: bool, mutedKinds?: [kind]}      absent fields keep their value
   -> 200 {optIn, mutedKinds}
 
 InboxFact = {id, lineageId, kind, dedupeKey, subjectInstanceId?, runGeneration,
-             stateEnteredAt, createdAt, batchId?, payload}
+             stateEnteredAt, createdAt, batchId?, fallback?, payload}
+fallback  = {at, reason: muted | re-parented | no-subscriber}
+InboxBatch = {batchId, lineageId, instanceId, generation, openingTag,
+              templateVersion, factIds: [id], listed, text, createdAt,
+              outcome?, releasedAt?}
 dedupeKey = kind:subject:runGeneration:stateEnteredAt
 kind      = started | exited | waiting | turn-done | turn-failed | interaction
           | interaction-superseded | gate | supply-reset | host-online
           | host-offline | stalled | budget-expired | wake-due | context-threshold
 payload.occurrence = {count, capped, cap, windowHours}
+payload.tail      = turn-done only: the text that turn ended with, redacted,
+                    its last 200 characters (untrusted)
 ~~~
 
 - 读写都在血缘读谓词之下：Human 设备可读任意血缘（也可用它的任一章节 id 指名）；Agent 只能读写自己的血缘，路径里的 `{id}` 必须是它的规范血缘 id；Bot 凭证一律 403（与记忆路由同法，按认证时的设备种类判定）。中间件只放行这一形状的 GET 与 PATCH，并把 `{id}` 钉在调用者自己的血缘上；处理器再查一次。
 - `optIn` 只有 Human 能改（"创建者打开"）；Agent 写它得到 403。`mutedKinds` 是整组替换，血缘自己或 Human 都可以改。被 mute 的种类不写行。
 - `payload` 里 worker 或工具产出的文本（问题、错误）是不可信数据，读者不得把它当指令或授权。
 - 新增的项目设置：`policy.configurable.factOccurrenceCap`（默认 6）与 `policy.configurable.stallToolThresholdMins`（缺省表示工具在途时永不产生 stall 事实）。
+- **投递（`cb-inbox-deliver`）。** 血缘的当前章节空闲、没有自己的待决交互、也没有所有者输入在排队或在途时，Hub 把全部未投递的行合成一批，作为一条 `instance.send`（`origin: hub`）发给该章节；`batchId` 就是这条 send 的 `commandId`，成批时选定并落库，带该章节代数的 Hub 内部 initiator，不带设备 id。批行（`InboxBatch`：原文、开头标签、模板版本、事实 id）与命令行在同一事务里提交，早于任何转发意图。文本是 Hub 的口吻，以固定标签 `<remuda-facts>` 开头、`</remuda-facts>` 结尾，不超过 4096 字节；worker 或工具写的文本先按 digest 的秘密形状脱敏，再以 `untrusted: "…"` 的 JSON 字符串引用（引号、换行、控制字符、`<`、`>`、`&` 与不可见格式字符都被转义），读者按 JSON 字符串解出原文，并把它当数据。成批时逐行复查：订阅者已 mute 该种类、主体换了父血缘或已无订阅者的行带 `fallback` 退回所有者推送（只有今天会推送的种类才推：`interaction`、`exited`、`waiting`），不再进入任何批，也不算已消费。F 取消尚未转发的批时，它的行回到未投递，之后以新 id 成批；Node 以 `execution: not-dispatched` 结算的批同样交还它的行。Hub 能证明没有送达的转发（Hub 侧 NODE_BUSY、连接已断、Node 在记录前以 JSON-RPC 错误拒绝）不结算这条 send，而是放回队列，以同一 id 退避重试（1 s 起，最长 60 s，最多 10 次；次数记在命令行上，与放回在同一事务里计数，第 10 次在同一事务里以 `not-delivered` 结算，批的行回到未投递）。重启通知用同一退避。周期检查也会驱动没有任何重试登记、未被扣住的未发送批与重启通知，所以登记丢失也不会让它们搁浅。Node 回答 instance not found 时以 `instance-not-found` 结算，不再重试，该章节不再接批。成批之后、转发之前到达的所有者输入仍然先行：转发意图提交的同一 writer 任务里再查一次，批留在队列里，所有者输入结算后再驱动它。可能已到达章节的批保留它的行（每批至多一次）。
 
 ## 9. 错误码、未知值与兼容性
 

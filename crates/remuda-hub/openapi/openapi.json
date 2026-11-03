@@ -6317,6 +6317,9 @@
             "description": "Delivery batch that carried the row; absent until one does.",
             "type": "string"
           },
+          "fallback": {
+            "$ref": "#/components/schemas/InboxFallback"
+          },
           "payload": {
             "additionalProperties": true,
             "description": "Kind-specific detail, with occurrence {count, capped, cap, windowHours}. Worker- and tool-produced text in it is untrusted data.",
@@ -6391,6 +6394,13 @@
           },
           "settings": {
             "$ref": "#/components/schemas/InboxSettings"
+          },
+          "batches": {
+            "description": "The delivery batches that carried this page's rows (by batchId), oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/InboxBatch"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -6398,7 +6408,101 @@
           "items",
           "nextAfter",
           "more",
-          "settings"
+          "settings",
+          "batches"
+        ],
+        "type": "object"
+      },
+      "InboxFallbackReason": {
+        "description": "Why a row fell back to the owner push at batch formation.",
+        "enum": [
+          "muted",
+          "re-parented",
+          "no-subscriber"
+        ],
+        "type": "string"
+      },
+      "InboxFallback": {
+        "description": "The row failed the re-check at batch formation and fell back to the owner push; it is neither held nor recorded as consumed.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/InboxFallbackReason"
+          }
+        },
+        "required": [
+          "at",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "InboxBatch": {
+        "description": "One delivery batch: the Hub-origin row written before its instance.send is forwarded. batchId is that send's commandId.",
+        "properties": {
+          "batchId": {
+            "description": "The batch's instance.send command id, chosen when it was formed.",
+            "type": "string"
+          },
+          "lineageId": {
+            "type": "string"
+          },
+          "instanceId": {
+            "description": "The live chapter it targets.",
+            "type": "string"
+          },
+          "generation": {
+            "description": "That chapter's generation.",
+            "type": "integer"
+          },
+          "openingTag": {
+            "description": "The fixed tag the text opens with.",
+            "type": "string"
+          },
+          "templateVersion": {
+            "type": "integer"
+          },
+          "factIds": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "listed": {
+            "description": "Rows the text lists in full; the rest are counted per kind.",
+            "type": "integer"
+          },
+          "text": {
+            "description": "The text, verbatim, as sent with origin hub.",
+            "type": "string"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "The send's settlement outcome once settled; absent while in flight or unknown.",
+            "type": "string"
+          },
+          "releasedAt": {
+            "description": "When its rows were handed back because the send provably never reached the chapter; they are re-batched under a new id.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "batchId",
+          "lineageId",
+          "instanceId",
+          "generation",
+          "openingTag",
+          "templateVersion",
+          "factIds",
+          "listed",
+          "text",
+          "createdAt"
         ],
         "type": "object"
       }

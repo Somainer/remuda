@@ -79,6 +79,20 @@ pub(crate) fn input_origin(origin: CommandOrigin) -> InputOrigin {
     }
 }
 
+/// Who authored the user message a Node writes for a delivered input
+/// (cb-inbox-deliver; D-057 §6.4, §9). Hub-written input (the restart notice,
+/// a fact batch) is the Hub's, so a client draws it as a system row and never
+/// as the owner's bubble; every other input keeps the correspondent's
+/// `human` it always had.
+pub(crate) fn message_origin(origin: InputOrigin) -> remuda_protocol::MessageOrigin {
+    match origin {
+        InputOrigin::Hub => remuda_protocol::MessageOrigin::Hub,
+        InputOrigin::Human | InputOrigin::Bot | InputOrigin::Agent => {
+            remuda_protocol::MessageOrigin::Human
+        }
+    }
+}
+
 pub(crate) fn instance_mcp(
     launch: &crate::DriverLaunch,
 ) -> remuda_driver::agent_mcp::AgentMcpContext {

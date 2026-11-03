@@ -214,6 +214,7 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | `worker resume` | `POST /v1/workers/{id}/resume` | Agent route, as `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
 | `worker replace` | `POST /v1/workers/{id}/replace` | Agent route, as `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
 | `worker stop` | `POST /v1/workers/{id}/stop` | Agent route, as `retire` | — |
+| `worker digest` | `GET /v1/workers/{id}/digest` | Agent route. `dispatch` and project scope, like the other scope-wide worker reads (main-agent.md §10.2); a fact batch's footer points at it | — |
 | `brief send` | `POST /v1/workers/{id}/brief` | Agent route, as `retire` | — |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 

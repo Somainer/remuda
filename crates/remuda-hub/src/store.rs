@@ -371,6 +371,9 @@ pub struct Store {
     /// When this process opened the store: the inbox measures a host's
     /// offline grace from no earlier than its own start (cb-inbox-facts).
     opened_at: time::OffsetDateTime,
+    /// Raised by the writer after it formed an inbox batch or owes a
+    /// fallback push (cb-inbox-deliver); the delivery driver waits on it.
+    deliver_signal: Arc<tokio::sync::Notify>,
     /// D-057 §8.3: notified after a writer job queued push outbox rows.
     outbox_notify: Arc<tokio::sync::Notify>,
 }
@@ -1647,6 +1650,10 @@ pub(crate) enum ForwardMark {
     HeldForFence,
     /// Continuity-lineage work for a Node without fence support.
     NodeLacksFence,
+    /// cb-inbox-deliver: a fact batch whose chapter got owner input (or other
+    /// Hub input) after the batch formed; that input goes first, the batch
+    /// stays queued and is re-driven when it settles.
+    HeldBehindInput,
 }
 
 /// Payload of the winning continuation transaction.
@@ -2638,6 +2645,8 @@ impl Store {
         // back a Store, so the first read cannot race schema creation.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let writer_path = path.clone();
+        let deliver_signal = Arc::new(tokio::sync::Notify::new());
+        let writer_signal = deliver_signal.clone();
         let outbox_notify = Arc::new(tokio::sync::Notify::new());
         let writer_outbox = Arc::clone(&outbox_notify);
         let thread = thread::Builder::new()
@@ -2657,6 +2666,13 @@ impl Store {
                 drop(ready_tx);
                 // cb-inbox-facts: facts the previous process left queued.
                 crate::inbox::drain_sources(&mut conn);
+                // cb-inbox-deliver: rows the previous process left waiting.
+                if let Err(err) = crate::inbox_deliver::mark_all_due(&conn) {
+                    tracing::error!(error = %err, "inbox delivery boot mark failed");
+                }
+                if crate::inbox_deliver::form_due(&mut conn) {
+                    writer_signal.notify_one();
+                }
                 while let Ok(job) = rx.recv() {
                     match job {
                         Job::Run(work) => {
@@ -2664,6 +2680,11 @@ impl Store {
                             // cb-inbox-facts: the state changes this job
                             // committed that queued a fact source.
                             crate::inbox::drain_sources(&mut conn);
+                            // cb-inbox-deliver: the lineages whose delivery
+                            // gate this job's state changes may have opened.
+                            if crate::inbox_deliver::form_due(&mut conn) {
+                                writer_signal.notify_one();
+                            }
                             // D-057 §8.3: push outbox rows this job queued
                             // are sent after its commit.
                             if crate::push_route::take_outbox_dirty() {
@@ -2724,6 +2745,7 @@ impl Store {
             faults: Arc::new(test_faults::FaultFlags::default()),
             seen_presence: Arc::default(),
             opened_at: time::OffsetDateTime::now_utc(),
+            deliver_signal,
             outbox_notify,
         })
     }
@@ -2737,6 +2759,17 @@ impl Store {
     /// When this process opened the store.
     pub(crate) fn opened_at(&self) -> time::OffsetDateTime {
         self.opened_at
+    }
+
+    /// The signal the inbox delivery driver waits on (cb-inbox-deliver).
+    pub(crate) fn deliver_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.deliver_signal.clone()
+    }
+
+    /// Wake the inbox delivery driver: a host came back, so a batch held
+    /// while it was away may be forwarded now.
+    pub(crate) fn kick_delivery(&self) {
+        self.deliver_signal.notify_one();
     }
 
     /// Finish in-flight jobs, checkpoint WAL, and close every connection.
@@ -5986,6 +6019,9 @@ impl Store {
             if row.forwarded {
                 return Ok(ForwardMark::AlreadyForwarded);
             }
+            if crate::inbox_deliver::forward_waits(conn, &command_id)? {
+                return Ok(ForwardMark::HeldBehindInput);
+            }
             if crate::fence::host_gated(conn, &row.host_id)? {
                 return Ok(ForwardMark::HeldForFence);
             }
@@ -8183,6 +8219,20 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "commands", "initiator_lineage_id", "TEXT")?;
     ensure_column(&conn, "commands", "initiator_generation", "INTEGER")?;
     ensure_column(&conn, "commands", "initiator_device_id", "TEXT")?;
+    // cb-inbox-deliver: the Node attested the command never reached its
+    // driver (`execution: not-dispatched` on its settlement), so what it
+    // carried was not delivered.
+    ensure_column(&conn, "commands", "settlement_not_dispatched", "INTEGER")?;
+    // cb-inbox-deliver r4: same-id attempts at a Hub-written send (a fact
+    // batch, a restart notice) that provably did not reach its chapter,
+    // counted on the row so the retry cap holds whatever happens to the
+    // in-memory backoff.
+    ensure_column(
+        &conn,
+        "commands",
+        "hub_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // D-060 decision 1 (cb-rootturn): the per-instance root-turn ledger and
     // the root turn stamped beside the initiator on command and audit rows.
     crate::root_turn::migrate(&conn)?;
@@ -8420,6 +8470,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // cb-inbox-facts: after `restart` (its `end_seen_at` column) and the gate
     // queue (its `gate_jobs` table), which the inbox's source triggers read.
     crate::inbox::migrate(&conn)?;
+    // cb-inbox-deliver: after the inbox (its rows), lineages, interactions,
+    // commands and hosts, which its due triggers read.
+    crate::inbox_deliver::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -9170,12 +9223,19 @@ fn apply_command_projection(
                 .and_then(Value::as_str)
                 .filter(|_| outcome == "rejected")
                 .map(str::to_owned);
+            // cb-inbox-deliver: the Node's own word that the command never
+            // reached its driver (rejected before dispatch).
+            let not_dispatched = payload
+                .pointer("/entity/settlement/value/error/execution")
+                .and_then(Value::as_str)
+                == Some("not-dispatched");
             conn.execute(
                 "UPDATE commands
                  SET state = 'settled', resolution = 'clear',
-                     settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3
+                     settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3,
+                     settlement_not_dispatched = ?5
                  WHERE id = ?4 AND state != 'settled'",
-                params![outcome, reason, now, command_id],
+                params![outcome, reason, now, command_id, not_dispatched],
             )?;
         }
         _ => {}

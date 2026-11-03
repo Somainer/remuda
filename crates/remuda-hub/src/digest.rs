@@ -670,7 +670,20 @@ fn scan_tail(events: &[Value]) -> Tail {
     tail
 }
 
+/// Text of the last root assistant message in `events` (ascending seq), for
+/// a delivered fact batch's quoted tail (cb-inbox-deliver).
+pub(crate) fn last_assistant_text(events: &[Value]) -> Option<String> {
+    scan_tail(events).last_text
+}
+
 // ── pending interaction ────────────────────────────────────────────────────
+
+/// The kind and the question of one interaction row, as the digest shows
+/// them (secrets redacted), for a delivered fact batch (cb-inbox-deliver).
+pub(crate) fn interaction_question(record: &InteractionRecord) -> (String, String) {
+    let parts = pending_parts(record, &[]);
+    (parts.kind, parts.question)
+}
 
 struct PendingParts {
     kind: String,

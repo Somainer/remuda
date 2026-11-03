@@ -3612,48 +3612,7 @@ async fn release_forward_intent(
         .store
         .run_named("release_forward_intent", {
             let command_id = command_id.to_owned();
-            move |conn| {
-                let now = crate::config::now_rfc3339();
-                // D-057 §7.7: a row whose initiator is fenced is not returned
-                // to the queue (a same-id replay would only be refused); it
-                // settles `rejected(fenced)` — the frame was never queued on
-                // the Node, so it did not run.
-                let fenced = match crate::store::load_command(conn, &command_id)? {
-                    Some(row) => matches!(
-                        crate::store::check_initiator(
-                            conn,
-                            row.initiator.as_ref(),
-                            row.initiator_device_id.as_deref(),
-                        ),
-                        Err(crate::store::StoreError::Fenced)
-                    ),
-                    None => false,
-                };
-                if fenced {
-                    conn.execute(
-                        "UPDATE commands
-                            SET state = 'settled', resolution = 'clear', forwarded = 0,
-                                settlement_outcome = 'rejected', settlement_reason = ?1,
-                                updated_at = ?2
-                          WHERE id = ?3 AND state = 'queued' AND forwarded = 1",
-                        rusqlite::params![remuda_protocol::FENCED_REASON, now, command_id],
-                    )?;
-                    crate::fence::resolve_op_outcome(
-                        conn,
-                        "command",
-                        &command_id,
-                        crate::fence::outcome::CANCELLED_AT_HUB,
-                    )?;
-                    return Ok(());
-                }
-                conn.execute(
-                    "UPDATE commands
-                        SET forwarded = 0, resolution = 'clear', updated_at = ?1
-                      WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
-                    rusqlite::params![now, command_id],
-                )?;
-                Ok(())
-            }
+            move |conn| release_intent(conn, &command_id)
         })
         .await?;
     state
@@ -3661,6 +3620,53 @@ async fn release_forward_intent(
         .get_command(command_id.to_owned())
         .await?
         .ok_or(HubError::NotFound)
+}
+
+/// The writes of [`release_forward_intent`].
+fn release_intent(
+    conn: &rusqlite::Connection,
+    command_id: &str,
+) -> Result<(), crate::store::StoreError> {
+    let now = crate::config::now_rfc3339();
+    // D-057 §7.7: a row whose initiator is fenced is not returned
+    // to the queue (a same-id replay would only be refused); it
+    // settles `rejected(fenced)` — the frame was never queued on
+    // the Node, so it did not run.
+    let fenced = match crate::store::load_command(conn, command_id)? {
+        Some(row) => matches!(
+            crate::store::check_initiator(
+                conn,
+                row.initiator.as_ref(),
+                row.initiator_device_id.as_deref(),
+            ),
+            Err(crate::store::StoreError::Fenced)
+        ),
+        None => false,
+    };
+    if fenced {
+        conn.execute(
+            "UPDATE commands
+                SET state = 'settled', resolution = 'clear', forwarded = 0,
+                    settlement_outcome = 'rejected', settlement_reason = ?1,
+                    updated_at = ?2
+              WHERE id = ?3 AND state = 'queued' AND forwarded = 1",
+            rusqlite::params![remuda_protocol::FENCED_REASON, now, command_id],
+        )?;
+        crate::fence::resolve_op_outcome(
+            conn,
+            "command",
+            command_id,
+            crate::fence::outcome::CANCELLED_AT_HUB,
+        )?;
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE commands
+            SET forwarded = 0, resolution = 'clear', updated_at = ?1
+          WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
+        rusqlite::params![now, command_id],
+    )?;
+    Ok(())
 }
 
 /// Broadcast capacity for one attempt's followers. A leader publishes exactly
@@ -4704,6 +4710,16 @@ pub(crate) async fn forward_if_online(
                         .await?
                         .ok_or(HubError::NotFound);
                 }
+                crate::store::ForwardMark::HeldBehindInput => {
+                    // cb-inbox-deliver: owner input reached the batch's
+                    // chapter after the batch formed and goes first; the
+                    // batch stays queued and its settling re-drives it.
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
                 crate::store::ForwardMark::HeldForFence => {
                     // D-057 §7.6: the host has unacknowledged fences. Exactly
                     // as for an offline host the row stays queued and nothing
@@ -4844,7 +4860,19 @@ pub(crate) async fn forward_if_online(
         ) {
             let delegated =
                 crate::interactions::delegated_decisions_enabled(instance.project_id.as_deref());
-            if let Some(context) = crate::skill_context::facts(&instance, &host, delegated) {
+            // cb-inbox-deliver: whether this lineage gets Hub-voiced fact
+            // batches, read from the same rows delivery reads.
+            let inbox = state
+                .store
+                .read("skill_context_inbox", {
+                    let instance_id = instance_id.clone();
+                    move |conn| crate::inbox_deliver::delivers_to(conn, &instance_id)
+                })
+                .await
+                .unwrap_or(false);
+            if let Some(context) =
+                crate::skill_context::facts(&instance, &host, delegated, inbox)
+            {
                 object.insert(
                     "skillContext".into(),
                     serde_json::to_value(context)
@@ -4919,15 +4947,30 @@ pub(crate) async fn forward_if_online(
             &command.command_id,
         )
         .await;
-    let rpc = state
-        .nodes
-        .call(
-            &command.host_id,
-            &command.operation,
-            params,
-            Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
-        )
-        .await;
+    #[cfg(any(test, feature = "test-faults"))]
+    let refused_busy = crate::inbox_deliver::test_seams::take_node_busy(&command.command_id)
+        || (hub_written_send(&command)
+            && command.initiator.as_ref().is_some_and(|initiator| {
+                crate::inbox_deliver::test_seams::take_node_busy_lineage(&initiator.lineage_id)
+            }));
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let refused_busy = false;
+    let rpc = if refused_busy {
+        // Test seam: the host's in-flight slots are full for this command.
+        Err(HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        })
+    } else {
+        state
+            .nodes
+            .call(
+                &command.host_id,
+                &command.operation,
+                params,
+                Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
+            )
+            .await
+    };
     match rpc {
         Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
             // The Node just told us which driver it really built. Record it
@@ -5055,6 +5098,39 @@ pub(crate) async fn forward_if_online(
                     .await?
                     .ok_or(HubError::NotFound);
             }
+            // cb-inbox-deliver: input the Hub wrote itself (a fact batch, a
+            // restart notice) has no caller to retry it. The Node refused it
+            // before recording anything, so it did not run: the row goes back
+            // to the queue and the same id is sent again later, never settled
+            // into a refusal that would strand what it carries.
+            if hub_written_send(&command) {
+                // The Node does not know the chapter: that is terminal for it,
+                // never retried. The batch ends `instance-not-found` and its
+                // rows go back; that chapter takes no more batches.
+                if node_reports_unknown_instance(&response) {
+                    tracing::info!("hub-written input to an instance its Node does not know; ended");
+                    if let Some(rejected) = state
+                        .store
+                        .reject_command(
+                            command.command_id.clone(),
+                            crate::inbox_deliver::INSTANCE_NOT_FOUND_REASON.into(),
+                        )
+                        .await?
+                    {
+                        return Ok(rejected);
+                    }
+                    return state
+                        .store
+                        .get_command(command.command_id.clone())
+                        .await?
+                        .ok_or(HubError::NotFound);
+                }
+                tracing::debug!(
+                    command_id = %command.command_id,
+                    "node refused hub-written input; releasing intent for a same-id retry"
+                );
+                return release_hub_written(state, &command).await;
+            }
             fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
         Ok(Some(response)) => {
@@ -5080,10 +5156,26 @@ pub(crate) async fn forward_if_online(
                 command_id = %command.command_id,
                 "node link gone after forward intent; frame never queued; releasing intent"
             );
+            if hub_written_send(&command) {
+                return release_hub_written(state, &command).await;
+            }
             release_forward_intent(state, &command.command_id).await
         }
 
         Err(err) => {
+            if let HubError::NodeBusy { .. } = &err
+                && hub_written_send(&command)
+            {
+                // cb-inbox-deliver: NODE_BUSY is refused before the frame is
+                // queued and Hub-written input has no caller to retry it, so
+                // the row goes back to the queue (same id) instead of being
+                // settled into a refusal that would strand what it carries.
+                tracing::debug!(
+                    command_id = %command.command_id,
+                    "node busy for hub-written input; releasing intent for a same-id retry"
+                );
+                return release_hub_written(state, &command).await;
+            }
             if let HubError::NodeBusy { .. } = &err {
                 // NODE_BUSY is refused BEFORE the frame is queued, so the Node
                 // never saw this command. Unlike a lost ACK there is nothing to
@@ -5145,6 +5237,61 @@ pub(crate) async fn forward_if_online(
         forward_attempt.complete(row.clone());
     }
     outcome
+}
+
+/// Release a Hub-written send whose forward proved it never ran, and arm its
+/// same-id retry. Every path that releases one goes through here (the
+/// driver's forward, the fence acknowledgement's forward of held work, a
+/// restart notice's), so a released row is always re-tried, and its
+/// attempts are capped, whoever forwarded it.
+async fn release_hub_written(
+    state: &AppState,
+    command: &CommandRecord,
+) -> Result<CommandRecord, HubError> {
+    // Armed before the release commits: a drive running meanwhile sees a
+    // backoff, never an unsent row it may forward again at once.
+    crate::inbox_deliver::arm_retry(state, &command.command_id);
+    // Test seam: park between the arm and the release's commit (no-op
+    // unless a test armed it), so a concurrent drive's prune runs there.
+    state
+        .race_barriers
+        .wait_if_armed(
+            crate::workspaces::RacePhase::HubReleaseBeforeCommit,
+            &command.host_id,
+            &command.command_id,
+        )
+        .await;
+    // The release and the attempt it ends are one transaction: the count
+    // lives on the row, so a lost backoff entry never resets it, and the
+    // last attempt settles the send not-delivered in that same transaction.
+    // The entry changes only once it committed.
+    let attempt = state
+        .store
+        .run_named("release_hub_written", {
+            let command_id = command.command_id.clone();
+            move |conn| {
+                let tx = crate::store::immediate_tx(conn)?;
+                release_intent(&tx, &command_id)?;
+                let attempt = crate::inbox_deliver::count_attempt(&tx, &command_id)?;
+                tx.commit()?;
+                Ok(attempt)
+            }
+        })
+        .await?;
+    crate::inbox_deliver::rearm_retry(state, &command.command_id, attempt);
+    state
+        .store
+        .get_command(command.command_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)
+}
+
+/// Input the Hub wrote itself (`origin: hub`): a fact batch or a restart
+/// notice. No caller holds its id to retry it, so a refusal that proves it
+/// never ran releases it for a same-id retry rather than settling it.
+pub(crate) fn hub_written_send(command: &CommandRecord) -> bool {
+    command.operation == "instance.send"
+        && command.payload.get("origin").and_then(Value::as_str) == Some("hub")
 }
 
 /// Settle a stop/close the Node cannot honour because it lost the instance.

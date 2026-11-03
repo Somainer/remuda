@@ -2465,6 +2465,33 @@ export interface components {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
         };
+        /** @description One delivery batch: the Hub-origin row written before its instance.send is forwarded. batchId is that send's commandId. */
+        InboxBatch: {
+            /** @description The batch's instance.send command id, chosen when it was formed. */
+            batchId: string;
+            /** Format: date-time */
+            createdAt: string;
+            factIds: number[];
+            /** @description That chapter's generation. */
+            generation: number;
+            /** @description The live chapter it targets. */
+            instanceId: string;
+            lineageId: string;
+            /** @description Rows the text lists in full; the rest are counted per kind. */
+            listed: number;
+            /** @description The fixed tag the text opens with. */
+            openingTag: string;
+            /** @description The send's settlement outcome once settled; absent while in flight or unknown. */
+            outcome?: string;
+            /**
+             * Format: date-time
+             * @description When its rows were handed back because the send provably never reached the chapter; they are re-batched under a new id.
+             */
+            releasedAt?: string;
+            templateVersion: number;
+            /** @description The text, verbatim, as sent with origin hub. */
+            text: string;
+        };
         InboxFact: {
             /** @description Delivery batch that carried the row; absent until one does. */
             batchId?: string;
@@ -2472,6 +2499,7 @@ export interface components {
             createdAt: string;
             /** @description kind:subject:runGeneration:stateEnteredAt; unique in the lineage's inbox, stable across a Hub restart and a replayed journal append. */
             dedupeKey: string;
+            fallback?: components["schemas"]["InboxFallback"];
             /** @description Row id; the after cursor. */
             id: number;
             kind: components["schemas"]["InboxFactKind"];
@@ -2496,7 +2524,20 @@ export interface components {
          * @enum {string}
          */
         InboxFactKind: "started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold";
+        /** @description The row failed the re-check at batch formation and fell back to the owner push; it is neither held nor recorded as consumed. */
+        InboxFallback: {
+            /** Format: date-time */
+            at: string;
+            reason: components["schemas"]["InboxFallbackReason"];
+        };
+        /**
+         * @description Why a row fell back to the owner push at batch formation.
+         * @enum {string}
+         */
+        InboxFallbackReason: "muted" | "re-parented" | "no-subscriber";
         InboxPage: {
+            /** @description The delivery batches that carried this page's rows (by batchId), oldest first. */
+            batches: components["schemas"]["InboxBatch"][];
             items: components["schemas"]["InboxFact"][];
             lineageId: string;
             /** @description Whether rows beyond this page exist. */

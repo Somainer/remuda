@@ -1044,6 +1044,7 @@ wire_enum!(MessageOrigin, "5.2", {
     HookContext => "hook-context",
     ToolResult => "tool-result",
     Compaction => "compaction",
+    Hub => "hub",
     Unknown => "unknown",
 });
 

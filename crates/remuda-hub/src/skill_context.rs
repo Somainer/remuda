@@ -15,10 +15,6 @@ use crate::store::{HostRecord, InstanceRecord};
 use remuda_protocol::hubnode::{SKILL_CONTEXT_CAPABILITY, SkillContext};
 use serde_json::Value;
 
-/// Whether the Hub delivers inbox facts to a seat. False until the inbox
-/// lands (`cb-inbox-facts`, `cb-inbox-deliver`, main-agent.md §15.1).
-const INBOX: bool = false;
-
 /// Kinds whose launches read a skill or a first-input block as an agent.
 fn is_agent_kind(kind: &str) -> bool {
     matches!(kind, "claude" | "codex" | "grok" | "agy")
@@ -38,11 +34,14 @@ fn advertises_herdr(host: &HostRecord) -> bool {
 /// The facts for one forwarded create or resume of `instance` on `host`, or
 /// `None` when nothing is stamped (not an agent kind, or a Node that does not
 /// advertise the capability). `delegated_decisions` is the D-051 switch as
-/// the answer gate reads it for the instance's project.
+/// the answer gate reads it for the instance's project; `inbox` is whether
+/// the Hub delivers inbox facts to the instance's lineage
+/// (`inbox_deliver::delivers_to`, cb-inbox-deliver).
 pub(crate) fn facts(
     instance: &InstanceRecord,
     host: &HostRecord,
     delegated_decisions: bool,
+    inbox: bool,
 ) -> Option<SkillContext> {
     if !is_agent_kind(&instance.kind) || !advertises(host) {
         return None;
@@ -51,6 +50,6 @@ pub(crate) fn facts(
         grants: instance.grants.clone(),
         herdr: advertises_herdr(host),
         delegated_decisions,
-        inbox: INBOX,
+        inbox,
     })
 }

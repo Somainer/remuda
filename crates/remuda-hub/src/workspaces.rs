@@ -122,6 +122,13 @@ pub(crate) struct RaceBarriers {
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
     /// Parks a gate dispatch between claim and send gate.
     gate_claimed: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks the inbox delivery driver before a batch's forward.
+    inbox_before_forward:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks a Hub-written send's release between its retry arm and the
+    /// release's commit.
+    hub_release_before_commit:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -137,6 +144,8 @@ impl RaceBarriers {
             RacePhase::ForwardIntentMarked => &self.forward_intent_marked,
             RacePhase::NodeOpAdmitted => &self.node_op_admitted,
             RacePhase::GateClaimed => &self.gate_claimed,
+            RacePhase::InboxBeforeForward => &self.inbox_before_forward,
+            RacePhase::HubReleaseBeforeCommit => &self.hub_release_before_commit,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -155,6 +164,8 @@ impl RaceBarriers {
                 RacePhase::ForwardIntentMarked => &self.forward_intent_marked,
                 RacePhase::NodeOpAdmitted => &self.node_op_admitted,
                 RacePhase::GateClaimed => &self.gate_claimed,
+                RacePhase::InboxBeforeForward => &self.inbox_before_forward,
+                RacePhase::HubReleaseBeforeCommit => &self.hub_release_before_commit,
             };
             table
                 .lock()
@@ -196,6 +207,13 @@ pub(crate) enum RacePhase {
     /// D-057 §7.10: parks a gate dispatch between the claim and the send
     /// gate; key is (lane host_id, job_id).
     GateClaimed,
+    /// cb-inbox-deliver r3: parks the delivery driver between its own
+    /// precedence read and the forward that marks the batch's intent; key is
+    /// (host_id, batch_id).
+    InboxBeforeForward,
+    /// cb-inbox-deliver r4: parks the release of a Hub-written send between
+    /// its retry arm and the release's commit; key is (host_id, command_id).
+    HubReleaseBeforeCommit,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race

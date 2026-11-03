@@ -3,8 +3,8 @@
 //! A fact is a durable row for a *subscriber lineage*: something it may act
 //! on happened to a subject it is responsible for. This module writes and
 //! keeps those rows; delivering them (batching, the idle gate, the owner-push
-//! fallback, the paused hold) is `cb-inbox-deliver`'s, which reads the table
-//! through [`Store::inbox_page`] and stamps `batch_id`.
+//! fallback, the paused hold) is `inbox_deliver.rs` (cb-inbox-deliver), which
+//! stamps `batch_id` or the fallback marker.
 //!
 //! Tables (idempotent DDL, so no `user_version` rung; they live in
 //! `hub.sqlite`, which `scripts/hub-backup.sh` carries whole):
@@ -44,8 +44,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use remuda_protocol::{
     DEFAULT_FACT_OCCURRENCE_CAP, FACT_OCCURRENCE_WINDOW_HOURS, INBOX_PAGE_DEFAULT_LIMIT,
-    INBOX_PAGE_MAX_LIMIT, InboxFact, InboxFactKind, InboxOccurrence, InboxPage, InboxSettings,
-    InboxSettingsPatch, InputOrigin,
+    INBOX_PAGE_MAX_LIMIT, InboxFact, InboxFactKind, InboxFallback, InboxFallbackReason,
+    InboxOccurrence, InboxPage, InboxSettings, InboxSettingsPatch, InputOrigin,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -333,6 +333,14 @@ fn fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<InboxFact>>
         return Ok(None);
     };
     let payload: String = row.get(6)?;
+    let fallback_at: Option<String> = row.get(10)?;
+    let fallback_reason: Option<String> = row.get(11)?;
+    let fallback = fallback_at.and_then(|at| {
+        fallback_reason
+            .as_deref()
+            .and_then(InboxFallbackReason::parse)
+            .map(|reason| InboxFallback { at, reason })
+    });
     Ok(Some(InboxFact {
         id: row.get(0)?,
         lineage_id: row.get(1)?,
@@ -344,6 +352,7 @@ fn fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<InboxFact>>
         state_entered_at: row.get(7)?,
         created_at: row.get(8)?,
         batch_id: row.get(9)?,
+        fallback,
     }))
 }
 
@@ -357,7 +366,8 @@ pub(crate) fn page(
     let limit = limit.clamp(1, INBOX_PAGE_MAX_LIMIT);
     let mut stmt = conn.prepare_cached(
         "SELECT id, subscriber_lineage_id, kind, dedupe_key, subject_instance_id,
-                run_generation, payload_json, state_entered_at, created_at, batch_id
+                run_generation, payload_json, state_entered_at, created_at, batch_id,
+                fallback_at, fallback_reason
            FROM inbox_facts
           WHERE subscriber_lineage_id = ?1 AND id > ?2
           ORDER BY id ASC
@@ -373,17 +383,24 @@ pub(crate) fn page(
     let next_after = rows[..rows.len().min(limit as usize)]
         .last()
         .map_or(after, |(id, _)| *id);
-    let items = rows
+    let items: Vec<InboxFact> = rows
         .into_iter()
         .take(limit as usize)
         .filter_map(|(_, fact)| fact)
         .collect();
+    let mut batch_ids: Vec<String> = Vec::new();
+    for id in items.iter().filter_map(|fact| fact.batch_id.as_ref()) {
+        if !batch_ids.contains(id) {
+            batch_ids.push(id.clone());
+        }
+    }
     Ok(InboxPage {
         lineage_id: lineage_id.to_owned(),
         items,
         next_after,
         more,
         settings: load_settings(conn, lineage_id)?,
+        batches: crate::inbox_deliver::batches(conn, &batch_ids)?,
     })
 }
 
@@ -586,6 +603,21 @@ fn receives(conn: &Connection, lineage_id: &str, kind: InboxFactKind) -> Result<
     if settings.muted_kinds.contains(&kind) {
         return Ok(false);
     }
+    receives_with(conn, lineage_id, &settings)
+}
+
+/// Whether `lineage_id` receives facts at all, whatever it muted (the
+/// skill's `inbox` flag, cb-inbox-deliver).
+pub(crate) fn receives_any(conn: &Connection, lineage_id: &str) -> Result<bool, StoreError> {
+    let settings = load_settings(conn, lineage_id)?;
+    receives_with(conn, lineage_id, &settings)
+}
+
+fn receives_with(
+    conn: &Connection,
+    lineage_id: &str,
+    settings: &InboxSettings,
+) -> Result<bool, StoreError> {
     if settings.opt_in {
         return Ok(true);
     }
@@ -1375,6 +1407,18 @@ pub(crate) fn fold_append(
         {
             detail["error"] = json!(error);
         }
+        // cb-inbox-deliver r2: the text this turn ended with, recorded now
+        // while it is still the journal's latest turn, so a batch formed
+        // after more turns quotes each turn's own conclusion. Only the
+        // current run's end: a late or unattributable result's text is no
+        // longer at the tail.
+        if attributed
+            && run == tracker.run
+            && detail["outcome"] == "done"
+            && let Some(tail) = turn_tail(conn, instance_id)?
+        {
+            detail["tail"] = json!(tail);
+        }
         let fact = instance_fact(conn, kind, instance_id, run, entered_at.clone(), detail)?;
         fold_record(conn, instance_id, fact)?;
         if attributed {
@@ -1386,6 +1430,43 @@ pub(crate) fn fold_append(
         save_tracker(conn, instance_id, &tracker)?;
     }
     Ok(())
+}
+
+/// Journal rows a turn's tail is read back from, at most.
+const TAIL_EVENTS: i64 = 64;
+
+/// The last root assistant text of the turn that has just ended on
+/// `instance_id`: read back from the journal's tail as far as that turn's
+/// root `turn_started` (or [`TAIL_EVENTS`] rows on a carrier without turn
+/// boundaries), secrets redacted, keeping its last
+/// [`crate::inbox_voice::QUOTE_MAX_CHARS`] characters. Worker text: a
+/// reader quotes it as untrusted data.
+fn turn_tail(conn: &Connection, instance_id: &str) -> Result<Option<String>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT payload_json FROM journal WHERE instance_id = ?1 ORDER BY seq DESC LIMIT ?2",
+    )?;
+    let mut events = Vec::new();
+    for raw in stmt.query_map(params![instance_id, TAIL_EVENTS], |row| {
+        row.get::<_, String>(0)
+    })? {
+        let Ok(event) = serde_json::from_str::<Value>(&raw?) else {
+            continue;
+        };
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let started = event_kind(&event) == "lifecycle"
+            && payload.get("topic").and_then(Value::as_str) == Some("turn")
+            && payload.get("nativeName").and_then(Value::as_str) == Some("turn_started")
+            && !crate::store::native_payload_is_subagent(payload);
+        if started {
+            break;
+        }
+        events.push(event);
+    }
+    events.reverse();
+    Ok(crate::digest::last_assistant_text(&events)
+        .map(|text| crate::digest::redact_secrets(&text))
+        .map(|text| crate::inbox_voice::clip_tail(&text))
+        .filter(|text| !text.is_empty()))
 }
 
 // ── facts from the Hub's own committed state changes ───────────────────────

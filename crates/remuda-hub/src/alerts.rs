@@ -224,6 +224,98 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
     }
 }
 
+/// An owner alert an inbox row fell back to (cb-inbox-deliver; D-060 §10.1
+/// item 4): one of the kinds that page today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Paged {
+    /// "Need your input", tagged by the interaction.
+    Interaction(String),
+    /// "Session exited".
+    Exited,
+    /// "Still waiting".
+    Waiting,
+    /// Nothing pages for it.
+    Nothing,
+}
+
+/// Page the owner for an inbox row that fell back (§10.1 item 4), with the
+/// same title, body, tag and landing as the alert of that kind, so on a
+/// device still showing an earlier page this replaces it rather than adding
+/// a second one. Logged in the push log under its own category; per-device
+/// follow suppression applies as for every page.
+pub(crate) async fn page_owner(state: &AppState, instance_id: &str, paged: Paged) -> Fanout {
+    let instance = || PushTag::Instance {
+        id: instance_id.to_owned(),
+    };
+    let (title, body, tag, url) = match paged {
+        Paged::Interaction(id) => {
+            if routed_by_push_rules(state, &id, instance_id).await {
+                return Fanout::Nothing;
+            }
+            let (title, body) = INTERACTION_PUSH;
+            let url = interaction_landing_url(&id);
+            (title, body, PushTag::Interaction { id }, url)
+        }
+        Paged::Exited => (
+            "Session exited",
+            "An instance left the ready state.",
+            instance(),
+            format!("/s/{instance_id}"),
+        ),
+        Paged::Waiting => (
+            "Still waiting",
+            "This session has been blocked for more than 30s.",
+            instance(),
+            format!("/s/{instance_id}"),
+        ),
+        Paged::Nothing => return Fanout::Nothing,
+    };
+    fanout(state, "inbox-fallback", instance_id, title, body, tag, url).await
+}
+
+/// Whether §8 owns the page about `interaction_id`, so an inbox fallback
+/// must not page it (D-057 §8.1, §8.3): a suppression row exists (unlifted,
+/// the item is routed to a running parent and the lift pages it if that
+/// parent stops; lifted, the lift already paged it), or §8.1 routing at this
+/// moment suppresses it (and writes that row). A store failure pages, as at
+/// fire time.
+async fn routed_by_push_rules(state: &AppState, interaction_id: &str, instance_id: &str) -> bool {
+    let interaction = interaction_id.to_owned();
+    let instance = instance_id.to_owned();
+    match state
+        .store
+        .run_named("inbox_fallback_route", move |conn| {
+            let owned: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM push_suppressions WHERE interaction_id = ?1)",
+                rusqlite::params![interaction],
+                |row| row.get(0),
+            )?;
+            if owned {
+                return Ok(true);
+            }
+            Ok(
+                crate::push_route::route_interaction(conn, &interaction, &instance)?
+                    == crate::push_route::Route::Suppressed,
+            )
+        })
+        .await
+    {
+        Ok(routed) => {
+            if routed {
+                tracing::info!(
+                    category = "inbox-fallback",
+                    "fallback page left to the push routing"
+                );
+            }
+            routed
+        }
+        Err(_) => {
+            tracing::warn!(category = "inbox-fallback", "push routing failed; paging");
+            false
+        }
+    }
+}
+
 /// Today's title and body of a push about a pending interaction; the lift
 /// (D-057 §8.3) resends exactly this.
 pub(crate) const INTERACTION_PUSH: (&str, &str) =

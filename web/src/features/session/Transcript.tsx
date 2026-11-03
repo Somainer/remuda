@@ -62,6 +62,9 @@ const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
   "hook-context": "hook 上下文",
   "tool-result": "工具结果",
   compaction: "对话压缩",
+  // D-057 §6.4 / D-060 §10.1: input the Hub itself wrote (a fact batch, the
+  // restart notice). Never the owner's bubble.
+  hub: "Hub 送达",
   unknown: "未知来源",
 };
 

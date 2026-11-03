@@ -2888,3 +2888,110 @@ async fn a_restart_carries_the_chapters_claude_config_dir_and_settings_overlay()
     assert_eq!(view["settingsOverlayPath"], json!(overlay));
     Ok(())
 }
+
+/// cb-inbox-deliver r3: a restart notice released after a forward that never
+/// ran (the host full) is retried under its own id on the delivery backoff,
+/// not on every evaluation, and goes out once.
+#[tokio::test]
+async fn a_released_restart_notice_is_retried_on_the_backoff_under_its_id() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    // Its first two forwards meet a full host.
+    ctx.hub.test_arm_node_busy_lineage(&seat, 2);
+    ctx.supervise().await;
+    let record = ctx.lineage(&seat).await?;
+    let notice_id = record["restartDecisions"][0]["noticeCommandId"]
+        .as_str()
+        .context("notice id")?
+        .to_owned();
+    // Evaluations right after the refusal leave it alone (backoff): without
+    // it they would spend the second refusal and send it at once.
+    for _ in 0..3 {
+        ctx.supervise().await;
+    }
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "not re-sent on every evaluation"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let notice = loop {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the notice never went out"
+        );
+        ctx.supervise().await;
+        if let Some((_, params)) = node
+            .drain()
+            .into_iter()
+            .find(|(method, _)| method == "instance.send")
+        {
+            break params;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(notice["commandId"], json!(notice_id), "the same id");
+    ctx.supervise().await;
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "sent once"
+    );
+    Ok(())
+}
+
+/// cb-inbox-deliver r4: a released restart notice with nothing armed for it
+/// (its entry lost) is forwarded by the delivery retry tick alone, once,
+/// under its id; no lineage evaluation is needed.
+#[tokio::test]
+async fn a_released_notice_with_nothing_armed_is_driven_by_the_retry_tick() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    ctx.report_killed(&node, &seat).await?;
+    ctx.hub.test_arm_node_busy_lineage(&seat, 1);
+    ctx.supervise().await;
+    let record = ctx.lineage(&seat).await?;
+    let notice_id = record["restartDecisions"][0]["noticeCommandId"]
+        .as_str()
+        .context("notice id")?
+        .to_owned();
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "the first forward met a full host"
+    );
+    ctx.hub.test_forget_inbox_retries();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let notice = loop {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the notice never went out"
+        );
+        ctx.hub.test_inbox_retry_tick().await;
+        if let Some((_, params)) = node
+            .drain()
+            .into_iter()
+            .find(|(method, _)| method == "instance.send")
+        {
+            break params;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(notice["commandId"], json!(notice_id), "the same id");
+    ctx.hub.test_inbox_retry_tick().await;
+    assert!(
+        node.drain()
+            .iter()
+            .all(|(method, _)| method != "instance.send"),
+        "sent once"
+    );
+    Ok(())
+}

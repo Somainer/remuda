@@ -270,10 +270,12 @@ async fn a_capable_node_gets_the_seat_facts_on_create_and_resume() -> Result<()>
             json!({"grants": ["dispatch", "land"]}),
         )
         .await?;
+    // cb-inbox-deliver: a seat holding grants is a continuity lineage, so
+    // the Hub delivers its inbox facts to it.
     assert_eq!(
         params["skillContext"],
         json!({"grants": ["dispatch", "land"], "herdr": true,
-               "delegatedDecisions": false, "inbox": false}),
+               "delegatedDecisions": false, "inbox": true}),
         "{params}"
     );
     assert!(params["spec"].get("skillContext").is_none(), "{params}");
@@ -288,6 +290,7 @@ async fn a_capable_node_gets_the_seat_facts_on_create_and_resume() -> Result<()>
         "{resumed}"
     );
     assert_eq!(resumed["skillContext"]["herdr"], json!(true), "{resumed}");
+    assert_eq!(resumed["skillContext"]["inbox"], json!(true), "{resumed}");
     Ok(())
 }
 

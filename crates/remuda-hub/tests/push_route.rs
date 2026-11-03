@@ -1292,6 +1292,150 @@ async fn reply_ready_only_for_turns_reached_by_human_input() -> Result<()> {
     Ok(())
 }
 
+/// `(operation, payload origin, initiator instance, launch prompt)` of a
+/// command row as the Hub stored it.
+fn command_row(ctx: &Ctx, id: &str) -> Result<(String, String, Option<String>, String)> {
+    Ok(ctx.db()?.query_row(
+        "SELECT operation, json_extract(payload_json, '$.origin'), initiator_instance_id,
+                json_extract(payload_json, '$.initialInput.text')
+           FROM commands WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?)
+}
+
+/// Reply rows the outbox holds for `instance`.
+fn reply_rows(ctx: &Ctx, instance: &str) -> Result<i64> {
+    ctx.query_i64(
+        "SELECT COUNT(*) FROM push_outbox WHERE kind = 'reply' AND instance_id = ?1",
+        [instance],
+    )
+}
+
+/// r2 item 1: Main seated through the real Human create path. Its launch
+/// prompt rides the create command (stamped `human` from the device, no
+/// initiator), the Node journals that command's user message, and the end of
+/// the turn it reached pushes exactly one "Main replied".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_created_seats_first_turn_pushes_main_replied() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let created = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": ctx.host_p, "kind": "claude", "driver": "claude-sdk",
+                "name": "main", "title": "Main", "grants": ["address-owner"],
+                "permissionMode": "auto", "model": "claude-test-model",
+                "restart": {"onProcessLoss": true, "maxPerHour": 3},
+                "prompt": "Owner's opening brief for Main.",
+            }),
+        )
+        .await?;
+    let main = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let create = created["command"]["commandId"]
+        .as_str()
+        .context("create command")?
+        .to_owned();
+    assert_eq!(
+        command_row(&ctx, &create)?,
+        (
+            "instance.create".to_owned(),
+            "human".to_owned(),
+            None,
+            "Owner's opening brief for Main.".to_owned()
+        ),
+        "the create command as the Hub stored it"
+    );
+    ctx.report_running(ctx.node_p(), &main).await?;
+    ctx.wait_lineage(&main, "running").await?;
+    turn(&ctx, &main, &create, "Seated and ready.\nDetails follow.").await?;
+    let tag = format!("instance:{main}");
+    let pushes = ctx.wait_pushes(&ctx.phone, &tag, 1).await?;
+    assert_eq!(pushes[0]["title"], "Main replied: Seated and ready.");
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(reply_rows(&ctx, &main)?, 1);
+    assert_eq!(ctx.pushes_tagged(&ctx.phone, &tag).len(), 1);
+    Ok(())
+}
+
+/// r2 item 1: a seat an Agent created. Its create command (the real Agent
+/// shape: stamped `agent`, with the creator as initiator) reaches its first
+/// turn, which pushes nothing. An Agent can only delegate grants it holds and
+/// `address-owner` is one per Hub, so the grant is written onto the
+/// Agent-created continuity chapter directly. A later Human input to the
+/// same seat does push, so the Agent origin is the only difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_created_seats_first_turn_pushes_nothing() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let parent = ctx.parent(true).await?;
+    let token = ctx
+        .post(&format!("/v1/instances/{parent}/mcp-token"), json!({}))
+        .await?["token"]
+        .as_str()
+        .context("agent token")?
+        .to_owned();
+    let response = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&token)
+        .json(&json!({
+            "hostId": ctx.host_p, "kind": "claude", "driver": "claude-sdk",
+            "title": "Agent seat", "grants": ["dispatch"],
+            "permissionMode": "manual", "model": "claude-test-model",
+            "scope": {"hostIds": [ctx.host_p]},
+            "prompt": "The coordinator's launch prompt.",
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let created: Value = response.json().await?;
+    anyhow::ensure!(status.is_success(), "agent create {status}: {created}");
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat")?
+        .to_owned();
+    let create = created["command"]["commandId"]
+        .as_str()
+        .context("create command")?
+        .to_owned();
+    assert_eq!(
+        command_row(&ctx, &create)?,
+        (
+            "instance.create".to_owned(),
+            "agent".to_owned(),
+            Some(parent.clone()),
+            "The coordinator's launch prompt.".to_owned()
+        ),
+        "the Agent create command as the Hub stored it"
+    );
+    ctx.db()?.execute(
+        "UPDATE instances SET grants_json = '[\"address-owner\",\"dispatch\"]' WHERE id = ?1",
+        [&seat],
+    )?;
+    ctx.report_running(ctx.node_p(), &seat).await?;
+    ctx.wait_lineage(&seat, "running").await?;
+    turn(&ctx, &seat, &create, "Agent-started turn done.").await?;
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(
+        reply_rows(&ctx, &seat)?,
+        0,
+        "an Agent-created first turn pushes nothing"
+    );
+    let tag = format!("instance:{seat}");
+    assert!(ctx.pushes_tagged(&ctx.phone, &tag).is_empty());
+    // The same seat answering the owner pushes.
+    let human = human_send(&ctx, &seat).await?;
+    turn(&ctx, &seat, &human, "Answer for the owner.").await?;
+    let pushes = ctx.wait_pushes(&ctx.phone, &tag, 1).await?;
+    assert_eq!(pushes[0]["title"], "Main replied: Answer for the owner.");
+    Ok(())
+}
+
 /// End pushes need process-end evidence (OA6): "Main closed itself" waits
 /// for the end its close brings, and an exited event that ends nothing (a
 /// subagent's) sends no exited push.

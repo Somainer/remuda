@@ -167,9 +167,13 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          END;
          -- A command settling: the owner's input has gone first, or a batch
          -- ended. A batch whose send provably never reached its chapter
-         -- (never forwarded, withheld at the send gate, or refused or
-         -- cancelled as fenced) hands its rows back for a new batch under a
-         -- new id; any other outcome keeps them (at most once per batch).
+         -- (never forwarded, withheld at the send gate, refused or cancelled
+         -- as fenced, or settled by its Node as never dispatched) hands its
+         -- rows back for a new batch under a new id; any other outcome keeps
+         -- them (at most once per batch). A refusal before the frame left
+         -- the Hub (NODE_BUSY, the link gone) or before the Node recorded it
+         -- never settles the batch: it is released back to the queue and the
+         -- same id is retried (`drive`).
          DROP TRIGGER IF EXISTS inbox_due_command;
          CREATE TRIGGER inbox_due_command AFTER UPDATE OF state ON commands
          WHEN NEW.state = 'settled' AND OLD.state <> 'settled' AND NEW.instance_id IS NOT NULL
@@ -179,12 +183,14 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                   settled_at = NEW.updated_at,
                   released_at = CASE
                     WHEN NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                      OR NEW.settlement_reason = 'fenced' THEN NEW.updated_at END
+                      OR NEW.settlement_reason = 'fenced'
+                      OR NEW.settlement_not_dispatched = 1 THEN NEW.updated_at END
             WHERE batch_id = NEW.id AND outcome IS NULL;
            UPDATE inbox_facts SET batch_id = NULL
             WHERE batch_id = NEW.id
               AND (NEW.forwarded = 0 OR NEW.settlement_outcome = 'withheld'
-                   OR NEW.settlement_reason = 'fenced');
+                   OR NEW.settlement_reason = 'fenced'
+                   OR NEW.settlement_not_dispatched = 1);
            INSERT OR IGNORE INTO inbox_deliver_due (lineage_id)
            SELECT COALESCE(i.lineage_id, i.id) FROM instances i
             WHERE i.id = NEW.instance_id AND ",
@@ -1079,9 +1085,88 @@ pub(crate) struct DeliverState {
     /// once (the forward's own leader slot and the push's sent mark are the
     /// durable guards).
     drive: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Batches released back to the queue after a forward that provably did
+    /// not reach the chapter (NODE_BUSY, the link gone, a Node refusal before
+    /// it recorded anything), by batch id: the same id is retried once its
+    /// backoff has passed. In memory: after a Hub restart every unsent batch
+    /// is tried again at once.
+    retry: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Retry>>>,
     /// Test seam: hold every forward (a batch forms and stays queued).
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) hold_forward: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One batch's same-id retry schedule.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Retry {
+    attempts: u32,
+    next: tokio::time::Instant,
+}
+
+/// First retry delay after a forward that did not reach the chapter.
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+/// Longest retry delay: the backoff doubles up to this and stays there.
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The delay before attempt `attempts + 1`: 1 s, 2 s, 4 s, … capped at
+/// [`RETRY_MAX`].
+pub(crate) fn retry_delay(attempts: u32) -> std::time::Duration {
+    let factor = 1_u32
+        .checked_shl(attempts.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    RETRY_FIRST.saturating_mul(factor).min(RETRY_MAX)
+}
+
+/// Whether a driver pass honours the retry backoff: the periodic tick and
+/// the writer's signal do; boot and an explicit test drive do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pace {
+    Backoff,
+    Now,
+}
+
+impl DeliverState {
+    fn retry_due(&self, batch_id: &str, now: tokio::time::Instant) -> bool {
+        self.retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(batch_id)
+            .is_none_or(|retry| retry.next <= now)
+    }
+
+    /// Schedule the next same-id attempt; returns the attempt count.
+    fn note_retry(&self, batch_id: &str) -> (u32, std::time::Duration) {
+        let mut retry = self
+            .retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let attempts = retry.get(batch_id).map_or(0, |r| r.attempts) + 1;
+        let delay = retry_delay(attempts);
+        retry.insert(
+            batch_id.to_owned(),
+            Retry {
+                attempts,
+                next: tokio::time::Instant::now() + delay,
+            },
+        );
+        (attempts, delay)
+    }
+
+    fn clear_retry(&self, batch_id: &str) {
+        self.retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(batch_id);
+    }
+
+    /// Whether some released batch's backoff has passed.
+    fn retry_pending(&self, now: tokio::time::Instant) -> bool {
+        self.retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .any(|retry| retry.next <= now)
+    }
 }
 
 #[cfg(any(test, feature = "test-faults"))]
@@ -1121,7 +1206,7 @@ struct Owed {
 /// journal to settle on that id); a host with unacknowledged fences holds it
 /// until they are acknowledged; the send gate withholds it if its chapter
 /// was fenced meanwhile.
-pub(crate) async fn drive(state: &AppState) {
+pub(crate) async fn drive(state: &AppState, pace: Pace) {
     let _drive = state.deliver.drive.lock().await;
     let unsent = state
         .store
@@ -1145,12 +1230,24 @@ pub(crate) async fn drive(state: &AppState) {
         .await;
     match unsent {
         Ok(unsent) if !forward_held(state) => {
+            let now = tokio::time::Instant::now();
+            // A batch that left the queue (forwarded, cancelled by a fence)
+            // has no retry left to make.
+            state
+                .deliver
+                .retry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .retain(|id, _| unsent.iter().any(|batch| &batch.batch_id == id));
             for batch in unsent {
+                if pace == Pace::Backoff && !state.deliver.retry_due(&batch.batch_id, now) {
+                    continue;
+                }
                 if state.nodes.kind_of(&batch.host_id).await.is_none() {
                     // Offline: the host's next hello drives it.
                     continue;
                 }
-                let command = match state.store.get_command(batch.batch_id).await {
+                let command = match state.store.get_command(batch.batch_id.clone()).await {
                     Ok(Some(command)) => command,
                     Ok(None) => continue,
                     Err(err) => {
@@ -1159,11 +1256,27 @@ pub(crate) async fn drive(state: &AppState) {
                     }
                 };
                 match crate::http::forward_if_online(state, command, true).await {
-                    Ok(row) => tracing::info!(
-                        state = row.state.as_str(),
-                        forwarded = row.forwarded,
-                        "inbox batch forward"
-                    ),
+                    Ok(row) if row.state == "queued" && !row.forwarded => {
+                        // Back in the queue: the forward proved it never
+                        // reached the chapter (NODE_BUSY, the link gone, a
+                        // refusal before the Node recorded it) or a fence
+                        // holds its host. The same id is tried again after
+                        // the backoff.
+                        let (attempts, delay) = state.deliver.note_retry(&batch.batch_id);
+                        tracing::info!(
+                            attempts,
+                            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            "inbox batch not delivered; retried under the same id"
+                        );
+                    }
+                    Ok(row) => {
+                        state.deliver.clear_retry(&batch.batch_id);
+                        tracing::info!(
+                            state = row.state.as_str(),
+                            forwarded = row.forwarded,
+                            "inbox batch forward"
+                        );
+                    }
                     Err(err) => {
                         let (status, body) = err.status_code_and_body();
                         let code = body
@@ -1171,7 +1284,8 @@ pub(crate) async fn drive(state: &AppState) {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_owned();
-                        tracing::warn!(status, code = %code, "inbox batch forward failed");
+                        let (attempts, _) = state.deliver.note_retry(&batch.batch_id);
+                        tracing::warn!(status, code = %code, attempts, "inbox batch forward failed");
                     }
                 }
             }
@@ -1180,6 +1294,19 @@ pub(crate) async fn drive(state: &AppState) {
         Err(err) => tracing::warn!(code = error_code(&err), "inbox batches read failed"),
     }
     push_owed(state).await;
+}
+
+/// Scheduler ticks between two delivery retry checks (the 1 s schedule
+/// tick).
+pub(crate) const RETRY_TICK_EVERY: u64 = 5;
+
+/// The periodic retry check: a driver pass, honouring the backoff, when a
+/// released batch's backoff has passed. One in-memory look; nothing polls a
+/// Node.
+pub(crate) async fn retry_tick(state: &AppState) {
+    if state.deliver.retry_pending(tokio::time::Instant::now()) {
+        drive(state, Pace::Backoff).await;
+    }
 }
 
 /// Send each owner push a fallen-back row owes through `alerts.rs`, and

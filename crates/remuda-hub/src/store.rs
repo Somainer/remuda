@@ -8176,6 +8176,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "commands", "initiator_lineage_id", "TEXT")?;
     ensure_column(&conn, "commands", "initiator_generation", "INTEGER")?;
     ensure_column(&conn, "commands", "initiator_device_id", "TEXT")?;
+    // cb-inbox-deliver: the Node attested the command never reached its
+    // driver (`execution: not-dispatched` on its settlement), so what it
+    // carried was not delivered.
+    ensure_column(&conn, "commands", "settlement_not_dispatched", "INTEGER")?;
     // D-060 decision 1 (cb-rootturn): the per-instance root-turn ledger and
     // the root turn stamped beside the initiator on command and audit rows.
     crate::root_turn::migrate(&conn)?;
@@ -9165,12 +9169,19 @@ fn apply_command_projection(
                 .and_then(Value::as_str)
                 .filter(|_| outcome == "rejected")
                 .map(str::to_owned);
+            // cb-inbox-deliver: the Node's own word that the command never
+            // reached its driver (rejected before dispatch).
+            let not_dispatched = payload
+                .pointer("/entity/settlement/value/error/execution")
+                .and_then(Value::as_str)
+                == Some("not-dispatched");
             conn.execute(
                 "UPDATE commands
                  SET state = 'settled', resolution = 'clear',
-                     settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3
+                     settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3,
+                     settlement_not_dispatched = ?5
                  WHERE id = ?4 AND state != 'settled'",
-                params![outcome, reason, now, command_id],
+                params![outcome, reason, now, command_id, not_dispatched],
             )?;
         }
         _ => {}

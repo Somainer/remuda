@@ -1355,8 +1355,16 @@ impl RunningHub {
             .store
             .run_named("test_inbox_barrier", |_| Ok(()))
             .await?;
-        crate::inbox_deliver::drive(&self.state).await;
+        crate::inbox_deliver::drive(&self.state, crate::inbox_deliver::Pace::Now).await;
         Ok(())
+    }
+
+    /// Test-only: one periodic delivery retry check, as the scheduler runs
+    /// it (the backoff is honoured).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_inbox_retry_tick(&self) {
+        crate::inbox_deliver::retry_tick(&self.state).await;
     }
 
     /// Test-only: one evaluation of the inbox's time-driven facts (supply
@@ -2306,7 +2314,7 @@ async fn spawn_inner(
     }
     // cb-inbox-deliver: owner pushes a previous process still owed. Batches
     // it formed go out once their host says hello.
-    crate::inbox_deliver::drive(&state).await;
+    crate::inbox_deliver::drive(&state, crate::inbox_deliver::Pace::Now).await;
     let deliver_signal = state.store.deliver_signal();
     let reaper_state = state.clone();
     let app = router(state.clone());
@@ -2347,7 +2355,11 @@ async fn spawn_inner(
                 () = deliver_signal.notified() => {
                     let deliver_state = reaper_state.clone();
                     tokio::spawn(async move {
-                        crate::inbox_deliver::drive(&deliver_state).await;
+                        crate::inbox_deliver::drive(
+                            &deliver_state,
+                            crate::inbox_deliver::Pace::Backoff,
+                        )
+                        .await;
                     });
                 }
                 _ = interval.tick() => {
@@ -2386,6 +2398,13 @@ async fn spawn_inner(
                         let inbox_state = reaper_state.clone();
                         tokio::spawn(async move {
                             crate::inbox::run_tick(&inbox_state).await;
+                        });
+                    }
+                    // cb-inbox-deliver: same-id retries whose backoff passed.
+                    if inbox_ticks.is_multiple_of(crate::inbox_deliver::RETRY_TICK_EVERY) {
+                        let retry_state = reaper_state.clone();
+                        tokio::spawn(async move {
+                            crate::inbox_deliver::retry_tick(&retry_state).await;
                         });
                     }
                     inbox_ticks = inbox_ticks.wrapping_add(1);

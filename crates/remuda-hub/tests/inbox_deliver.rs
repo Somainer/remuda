@@ -29,6 +29,12 @@ enum Sends {
     Accept,
     /// Never answers: the Hub's forward times out and the outcome is unknown.
     Silent,
+    /// Answers the next hub-origin send with a JSON-RPC error (the Node
+    /// refused it before recording anything), then accepts again.
+    RefuseHubOnce,
+    /// Keeps every send's reply until `Seen::release` is notified: each held
+    /// call occupies one of the Hub's in-flight slots for the host.
+    Hold,
 }
 
 /// `(commandId, the batch row's text when the frame arrived)`.
@@ -44,6 +50,10 @@ struct Seen {
     /// For each `instance.send` that names a batch: whether the batch row was
     /// already readable when the frame arrived, and its text then.
     rows_at_receipt: Receipts,
+    /// RPC ids whose replies `Sends::Hold` keeps.
+    held: Arc<Mutex<Vec<Value>>>,
+    /// Answers every held call.
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl Seen {
@@ -125,7 +135,21 @@ async fn connect_node(
     let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
     let task = tokio::spawn(async move {
         loop {
-            let Ok(frame) = recv_json(&mut node).await else {
+            let frame = tokio::select! {
+                frame = recv_json(&mut node) => frame,
+                () = seen.release.notified() => {
+                    let held: Vec<Value> = std::mem::take(&mut *seen.held.lock().unwrap());
+                    for id in held {
+                        let response =
+                            json!({ "jsonrpc": "2.0", "id": id, "result": { "accepted": true } });
+                        if node.send(Message::Text(response.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Ok(frame) = frame else {
                 break;
             };
             let (Some(id), Some(method)) = (frame.get("id").cloned(), frame.get("method")) else {
@@ -148,8 +172,29 @@ async fn connect_node(
                         .ok();
                     seen.rows_at_receipt.lock().unwrap().push((command, text));
                 }
-                if *sends.lock().unwrap() == Sends::Silent {
-                    continue;
+                let mode = *sends.lock().unwrap();
+                match mode {
+                    Sends::Silent => continue,
+                    Sends::Hold => {
+                        seen.held.lock().unwrap().push(id);
+                        continue;
+                    }
+                    Sends::RefuseHubOnce if frame["params"]["origin"] == "hub" => {
+                        *sends.lock().unwrap() = Sends::Accept;
+                        let refusal = json!({ "jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32010, "message": "node busy: try again",
+                            "data": { "code": "NODE_BUSY", "retry": "after",
+                                      "execution": "not-dispatched" } } });
+                        if node
+                            .send(Message::Text(refusal.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             let response = json!({ "jsonrpc": "2.0", "id": id, "result": { "accepted": true } });
@@ -213,16 +258,25 @@ fn test_config(dir: &std::path::Path) -> HubConfig {
 
 impl Ctx {
     async fn spawn() -> Result<Ctx> {
-        Self::spawn_inner(false).await
+        Self::spawn_inner(false, None).await
     }
 
     async fn spawn_with_push() -> Result<Ctx> {
-        Self::spawn_inner(true).await
+        Self::spawn_inner(true, None).await
     }
 
-    async fn spawn_inner(with_push: bool) -> Result<Ctx> {
+    /// A Hub whose forwards wait `accept_ms` for a Node's reply, so held
+    /// replies keep their in-flight slots for the test's whole length.
+    async fn spawn_with_accept_timeout(accept_ms: u64) -> Result<Ctx> {
+        Self::spawn_inner(false, Some(accept_ms)).await
+    }
+
+    async fn spawn_inner(with_push: bool, accept_ms: Option<u64>) -> Result<Ctx> {
         let dir = tempfile::tempdir()?;
-        let config = test_config(dir.path());
+        let mut config = test_config(dir.path());
+        if let Some(accept_ms) = accept_ms {
+            config.command_accept_timeout_ms = accept_ms;
+        }
         let push = with_push.then(|| Arc::new(FakePush::default()));
         let hub = match &push {
             Some(push) => remuda_hub::spawn_with_push(config, push.clone()).await?,
@@ -878,6 +932,198 @@ async fn the_same_batch_id_is_never_forwarded_twice_and_unknown_is_not_resent() 
     assert!(next.iter().all(|id| !carried.contains(id)), "at most once");
     assert!(!next.is_empty());
     ctx.disconnect().await?;
+    Ok(())
+}
+
+// ─── a forward that did not reach the chapter ──────────────────────────────
+
+/// The batch command row as `GET /v1/instances/{id}/commands/{commandId}`
+/// returns it.
+async fn command_row(ctx: &Ctx, instance: &str, command: &str) -> Result<Value> {
+    let (status, row) = ctx
+        .request(
+            reqwest::Method::GET,
+            &ctx.human,
+            &format!("/v1/instances/{instance}/commands/{command}"),
+            None,
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "GET command {command}: {status} {row}");
+    Ok(row)
+}
+
+/// How many frames carried `command`.
+fn frames_for(ctx: &Ctx, command: &str) -> usize {
+    ctx.seen
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|frame| frame["params"]["commandId"] == command)
+        .count()
+}
+
+/// The periodic retry check, run until `done` holds (the first retry waits
+/// out a one-second backoff; the deadline only bounds a broken run).
+async fn retry_until(ctx: &Ctx, done: impl Fn() -> bool) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !done() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the retry never came"
+        );
+        ctx.hub.test_inbox_retry_tick().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// A Node that refuses the batch's send before recording it (a JSON-RPC
+/// error): the send did not run, so the batch goes back to the queue with
+/// its rows, and the periodic retry delivers it once under the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_refusal_leaves_the_batch_queued_and_a_retry_sends_the_same_id() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-refused").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    *ctx.sends.lock().unwrap() = Sends::RefuseHubOnce;
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 1);
+    let batch = rows[0].0.clone();
+    assert_eq!(frames_for(&ctx, &batch), 1, "refused once");
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["state"], "queued", "{row:#}");
+    assert_eq!(row["forwarded"], false, "{row:#}");
+    let page = ctx.inbox(&seat).await?;
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|fact| fact["batchId"] == batch.as_str()),
+        "the rows still wait in their batch: {page:#}"
+    );
+
+    retry_until(&ctx, || frames_for(&ctx, &batch) == 2).await?;
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["forwarded"], true, "{row:#}");
+    assert_eq!(row["state"], "accepted", "{row:#}");
+    assert_eq!(ctx.batch_rows()?.len(), 1, "the same id, no second batch");
+    // Settled by the Node, nothing more goes out.
+    ctx.settle_command(&seat, &batch).await?;
+    ctx.settle().await?;
+    ctx.hub.test_inbox_retry_tick().await;
+    assert_eq!(frames_for(&ctx, &batch), 2);
+    Ok(())
+}
+
+/// NODE_BUSY: the host's in-flight slots are full, so the Hub refuses the
+/// batch's frame before queuing it. The batch goes back to the queue with its
+/// rows (it is never settled as rejected), and once the host has room a
+/// later drive sends it once, under the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_busy_leaves_the_batch_queued_and_a_later_drive_sends_the_same_id() -> Result<()> {
+    let ctx = Ctx::spawn_with_accept_timeout(60_000).await?;
+    let project = ctx.project("deliver-busy").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    // Fill the host's 32 in-flight slots with owner sends the Node holds.
+    *ctx.sends.lock().unwrap() = Sends::Hold;
+    let mut owners = Vec::new();
+    for n in 0..32 {
+        let http = ctx.http.clone();
+        let url = format!("{}/v1/instances/{worker}/commands", ctx.base());
+        let human = ctx.human.clone();
+        owners.push(tokio::spawn(async move {
+            http.post(url)
+                .bearer_auth(human)
+                .json(&json!({ "operation": "instance.send",
+                               "payload": { "input": { "type": "prompt", "text": format!("owner {n}") } } }))
+                .send()
+                .await
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while ctx.seen.held.lock().unwrap().len() < 32 {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "slots never filled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 1);
+    let batch = rows[0].0.clone();
+    assert_eq!(frames_for(&ctx, &batch), 0, "refused before it was queued");
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["state"], "queued", "not settled as rejected: {row:#}");
+    assert_eq!(row["forwarded"], false, "{row:#}");
+    assert_eq!(rows[0].2, None, "the batch is still open");
+    let carried: Vec<i64> = serde_json::from_str(&rows[0].1)?;
+    let page = ctx.inbox(&seat).await?;
+    assert_eq!(fact_ids(&page), carried);
+
+    // The host has room again.
+    *ctx.sends.lock().unwrap() = Sends::Accept;
+    ctx.seen.release.notify_one();
+    for owner in owners {
+        owner.await??;
+    }
+    ctx.settle().await?;
+    assert_eq!(frames_for(&ctx, &batch), 1, "sent once");
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["forwarded"], true, "{row:#}");
+    assert_eq!(ctx.batch_rows()?.len(), 1, "the same id");
+    let page = ctx.inbox(&seat).await?;
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|fact| fact["batchId"] == batch.as_str())
+    );
+    Ok(())
+}
+
+/// A Node that settles the batch as rejected before dispatch (its queue was
+/// full, or it was interrupted before the driver saw it) attests it never
+/// reached the chapter: the rows go back and form a new batch, under a new
+/// id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_the_node_never_dispatched_hands_its_rows_back() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-not-dispatched").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let first = ctx.batch_rows()?[0].clone();
+    ctx.journal(
+        &seat,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "command", "entityId": first.0,
+            "state": "settled",
+            "entity": { "commandId": first.0, "state": "settled",
+                        "settlement": { "state": "known", "value": {
+                            "outcome": "rejected",
+                            "error": { "message": "instance-queue-full",
+                                       "execution": "not-dispatched" } } } } } }),
+    )
+    .await?;
+    ctx.settle().await?;
+    let rows = ctx.batch_rows()?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].2.as_deref(), Some("rejected"));
+    assert!(rows[0].3.is_some(), "released: {rows:?}");
+    assert_ne!(rows[1].0, first.0, "a new id");
+    assert_eq!(rows[1].1, first.1, "the same rows");
+    assert_eq!(frames_for(&ctx, &rows[1].0), 1);
     Ok(())
 }
 

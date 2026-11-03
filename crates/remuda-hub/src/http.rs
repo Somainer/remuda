@@ -5067,6 +5067,18 @@ pub(crate) async fn forward_if_online(
                     .await?
                     .ok_or(HubError::NotFound);
             }
+            // cb-inbox-deliver: input the Hub wrote itself (a fact batch, a
+            // restart notice) has no caller to retry it. The Node refused it
+            // before recording anything, so it did not run: the row goes back
+            // to the queue and the same id is sent again later, never settled
+            // into a refusal that would strand what it carries.
+            if hub_written_send(&command) {
+                tracing::debug!(
+                    command_id = %command.command_id,
+                    "node refused hub-written input; releasing intent for a same-id retry"
+                );
+                return release_forward_intent(state, &command.command_id).await;
+            }
             fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
         Ok(Some(response)) => {
@@ -5096,6 +5108,19 @@ pub(crate) async fn forward_if_online(
         }
 
         Err(err) => {
+            if let HubError::NodeBusy { .. } = &err
+                && hub_written_send(&command)
+            {
+                // cb-inbox-deliver: NODE_BUSY is refused before the frame is
+                // queued and Hub-written input has no caller to retry it, so
+                // the row goes back to the queue (same id) instead of being
+                // settled into a refusal that would strand what it carries.
+                tracing::debug!(
+                    command_id = %command.command_id,
+                    "node busy for hub-written input; releasing intent for a same-id retry"
+                );
+                return release_forward_intent(state, &command.command_id).await;
+            }
             if let HubError::NodeBusy { .. } = &err {
                 // NODE_BUSY is refused BEFORE the frame is queued, so the Node
                 // never saw this command. Unlike a lost ACK there is nothing to
@@ -5157,6 +5182,14 @@ pub(crate) async fn forward_if_online(
         forward_attempt.complete(row.clone());
     }
     outcome
+}
+
+/// Input the Hub wrote itself (`origin: hub`): a fact batch or a restart
+/// notice. No caller holds its id to retry it, so a refusal that proves it
+/// never ran releases it for a same-id retry rather than settling it.
+pub(crate) fn hub_written_send(command: &CommandRecord) -> bool {
+    command.operation == "instance.send"
+        && command.payload.get("origin").and_then(Value::as_str) == Some("hub")
 }
 
 /// Settle a stop/close the Node cannot honour because it lost the instance.

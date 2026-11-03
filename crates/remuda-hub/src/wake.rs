@@ -200,6 +200,9 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             ON wake_runs(target_instance_id) WHERE state = 'running';
          CREATE INDEX IF NOT EXISTS wake_runs_child
             ON wake_runs(child_instance_id) WHERE child_instance_id IS NOT NULL;
+         -- The `when` scan reads a lineage's inbox rows past a cursor.
+         CREATE INDEX IF NOT EXISTS wake_inbox_facts_lineage
+            ON inbox_facts(subscriber_lineage_id, id);
          CREATE TABLE IF NOT EXISTS wake_outcomes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,

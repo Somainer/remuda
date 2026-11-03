@@ -838,8 +838,9 @@ async fn a_hub_restart_mid_call_rebuilds_without_a_spurious_stall() -> Result<()
 }
 
 /// The screen fallback reads a screen only once the journal has been quiet
-/// for the window; a screen that changes restarts the quiet period; a still
-/// one yields exactly one fact per quiet period.
+/// for the window. The first read is the baseline the screen's quiet counts
+/// from; a screen that changes restarts the quiet period; a still one yields
+/// exactly one fact per quiet period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_screen_fallback_runs_only_after_journal_quiet() -> Result<()> {
     let ctx = Ctx::spawn().await?;
@@ -855,28 +856,76 @@ async fn the_screen_fallback_runs_only_after_journal_quiet() -> Result<()> {
     assert_eq!(ctx.settle_twice(19).await?, 0);
     assert_eq!(ctx.node().reads(), 0, "the journal is not quiet yet");
 
-    // Quiet journal, but the screen moves between reads: progress.
+    // The first read is the baseline: nothing for a full window after it.
     assert_eq!(ctx.settle(21).await?, 0, "the first read only records");
     assert_eq!(ctx.node().reads(), 1);
-    ctx.node()
-        .show(&["$ make", "building 1/40", "building 2/40"]);
-    assert_eq!(ctx.settle(22).await?, 0, "a changed screen is progress");
-    // The quiet period now runs from that change.
     assert_eq!(
         ctx.settle_twice(40).await?,
         0,
+        "inside the baseline's window"
+    );
+    assert_eq!(ctx.node().reads(), 1, "no candidate inside the window");
+
+    // Past it the screen has moved: progress, the quiet period restarts.
+    ctx.node()
+        .show(&["$ make", "building 1/40", "building 2/40"]);
+    assert_eq!(ctx.settle(42).await?, 0, "a changed screen is progress");
+    assert_eq!(ctx.node().reads(), 2);
+    assert_eq!(
+        ctx.settle_twice(61).await?,
+        0,
         "inside the restarted window"
     );
-    let reads = ctx.node().reads();
-    assert_eq!(ctx.settle(43).await?, 1, "still past the window: one fact");
-    assert_eq!(ctx.node().reads(), reads + 1);
-    for minutes in [60, 240] {
+    assert_eq!(ctx.settle(63).await?, 1, "still past the window: one fact");
+    assert_eq!(ctx.node().reads(), 3);
+    for minutes in [80, 240] {
         assert_eq!(ctx.settle_twice(minutes).await?, 0, "same quiet period");
     }
     let facts = ctx.stalls(&token, &seat).await?;
     assert_eq!(facts.len(), 1, "{facts:#?}");
     assert_eq!(facts[0]["payload"]["cause"], "quiet");
     assert_eq!(facts[0]["payload"]["source"], "screen");
+    Ok(())
+}
+
+/// r2 item 3: a screen that repainted moments before the first read of a
+/// quiet period is not stamped stalled at once. The first read is the
+/// baseline (as `observe_one` takes its first observation), so the fact
+/// waits a full window after it, and the quiet period starts at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_screen_read_is_the_baseline() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx
+        .project("stall-baseline", json!({ "stallThresholdMins": 20 }))
+        .await?;
+    let (seat, token) = ctx.coordinator(&project).await?;
+    let child = ctx.child(&seat, &ctx.host, "claude", "shell-pty").await?;
+    ctx.start(&ctx.host, &child).await?;
+    ctx.node().show(&STILL_SCREEN);
+
+    // The journal has been quiet for the window, but the Hub has never seen
+    // this screen: two reads in a row decide nothing.
+    assert_eq!(ctx.settle_twice(30).await?, 0);
+    assert_eq!(
+        ctx.node().reads(),
+        1,
+        "the second tick is inside the window"
+    );
+    assert!(ctx.stalls(&token, &seat).await?.is_empty());
+    assert_eq!(ctx.settle(49).await?, 0);
+    assert_eq!(ctx.settle(51).await?, 1, "a full window after the baseline");
+    let facts = ctx.stalls(&token, &seat).await?;
+    assert_eq!(facts.len(), 1, "{facts:#?}");
+    let since = facts[0]["payload"]["since"].as_str().context("since")?;
+    let since = time::OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339)?;
+    let baseline = time::OffsetDateTime::parse(
+        &minutes_from_now(30),
+        &time::format_description::well_known::Rfc3339,
+    )?;
+    assert!(
+        (since - baseline).abs() < time::Duration::minutes(1),
+        "the quiet period starts at the first read, not at the journal's last row: {since}"
+    );
     Ok(())
 }
 
@@ -970,6 +1019,10 @@ async fn the_screen_classification_decides_the_fact() -> Result<()> {
         assert_eq!(ctx.settle_twice(minutes).await?, 0, "+{minutes}m");
     }
     assert!(ctx.stalls(&token, &seat).await?.is_empty());
+    assert!(
+        ctx.node().reads() >= 3,
+        "the screen was read and classified"
+    );
     Ok(())
 }
 
@@ -991,7 +1044,8 @@ async fn one_dead_host_does_not_delay_another_hosts_sweep() -> Result<()> {
     ctx.start(&ctx.host, &dead_child).await?;
     ctx.start(&live_host, &live_child).await?;
 
-    // The first sweep records the live screen; the dead host's read hangs.
+    // The first sweep records the live screen (the baseline); the dead
+    // host's read hangs.
     let (_, tasks) = ctx
         .hub
         .test_inbox_screen_sweep(&minutes_from_now(21), SWEEP_TIMEOUT)
@@ -1005,11 +1059,11 @@ async fn one_dead_host_does_not_delay_another_hosts_sweep() -> Result<()> {
         }
     }
     let dead = dead.context("a task for the dead host")?;
-    // The second sweep: the live host decides; the dead one is still being
-    // swept, so it gets no second task.
+    // A window after the baseline the live host decides; the dead one is
+    // still being swept, so it gets no second task.
     let (_, tasks) = ctx
         .hub
-        .test_inbox_screen_sweep(&minutes_from_now(22), SWEEP_TIMEOUT)
+        .test_inbox_screen_sweep(&minutes_from_now(42), SWEEP_TIMEOUT)
         .await?;
     assert_eq!(
         tasks
@@ -1035,7 +1089,7 @@ async fn one_dead_host_does_not_delay_another_hosts_sweep() -> Result<()> {
     // An unreadable screen times out into no fact, never an error.
     let (_, tasks) = ctx
         .hub
-        .test_inbox_screen_sweep(&minutes_from_now(23), Duration::from_millis(1))
+        .test_inbox_screen_sweep(&minutes_from_now(43), Duration::from_millis(1))
         .await?;
     for (host, task) in tasks {
         if host == ctx.host {
@@ -1102,17 +1156,18 @@ async fn sweep_logs_carry_categories_never_screen_text() -> Result<()> {
         "DONE 0123456789abcdef0123456789abcdef01234567",
     ]);
     // Both screens read alike, so both classify `done`: no fact yet.
-    assert_eq!(ctx.settle_twice(21).await?, 0);
+    assert_eq!(ctx.settle(21).await?, 0, "the baseline");
+    assert_eq!(ctx.settle(41).await?, 0, "classified done");
     ctx.journal(&ctx.host, &done, entity("exited")).await?;
     ctx.node().show(&["$ deploy", marker]);
-    assert_eq!(ctx.settle_twice(22).await?, 0, "a changed screen restarts");
-    assert_eq!(ctx.settle(43).await?, 1);
+    assert_eq!(ctx.settle(42).await?, 0, "a changed screen restarts");
+    assert_eq!(ctx.settle(63).await?, 1);
     assert_eq!(ctx.stalls(&token, &seat).await?.len(), 1);
     // An unreadable screen: the category only.
     ctx.node().mute();
     let (_, tasks) = ctx
         .hub
-        .test_inbox_screen_sweep(&minutes_from_now(60), Duration::from_millis(1))
+        .test_inbox_screen_sweep(&minutes_from_now(90), Duration::from_millis(1))
         .await?;
     for (_, task) in tasks {
         task.await?;

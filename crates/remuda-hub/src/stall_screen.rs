@@ -13,8 +13,8 @@
 //! * A tool call the journal shows in flight is the tracker's: the tick never
 //!   names such a child, and the verdict re-checks it.
 //! * The screen's last observed change restarts the quiet period. The first
-//!   read in a quiet period only records what the screen shows; a later read
-//!   that finds it unchanged lets `classify_screen` (the classifier
+//!   read in a quiet period is the baseline the screen's quiet counts from; a
+//!   later read that finds it unchanged lets `classify_screen` (the classifier
 //!   `observe_one` uses) decide, measured from the start of the quiet period.
 //! * A Node that has no screen for the instance (`supported: false`) makes it
 //!   a journal carrier for that evaluation: the journal quiet rule records.
@@ -259,9 +259,10 @@ fn verdict_in(
         prior.filter(|(_, at, _)| inbox::parse_at(at).is_some_and(|at| at >= journal_quiet));
     let changed_at = match comparable {
         None => {
-            // The first read of this quiet period: what the screen showed
-            // before it is unknown, so it decides nothing yet.
-            store_read(conn, instance_id, &digest, &read_at, None)?;
+            // The first read of this quiet period is the baseline, as
+            // `observe_one` takes its first observation: what the screen did
+            // before it is unknown, so its quiet is counted from this read.
+            store_read(conn, instance_id, &digest, &read_at, Some(&read_at))?;
             return Ok(0);
         }
         Some((previous, _, _)) if previous != digest => {

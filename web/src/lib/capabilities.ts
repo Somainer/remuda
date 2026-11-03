@@ -158,6 +158,22 @@ export function agentPtyCapabilities(
   return snapshot;
 }
 
+/**
+ * D-062: a claimed external herdr pane. Remuda bridges its TTY and types into
+ * it; it has no transcript, no resume and keeps the model and permission mode
+ * its owner set (the Node's `herdr-claimed` matrix row).
+ */
+export function claimedCapabilities(): CapabilitySnapshot {
+  const snapshot = printCapabilities();
+  snapshot.driverKind = "herdr-claimed";
+  snapshot.binaryVersion = "";
+  for (const name of NAMES) snapshot.capabilities[name] = cap("unsupported", "herdr-claimed");
+  snapshot.capabilities["tty-attach"] = cap("supported", "herdr-claimed");
+  snapshot.capabilities["live-attach"] = cap("supported", "herdr-claimed");
+  snapshot.capabilities.steer = cap("unknown", "herdr-claimed");
+  return snapshot;
+}
+
 export function printCapabilities(): CapabilitySnapshot {
   const capabilities = {} as Record<CapabilityName, Capability>;
   for (const name of NAMES) capabilities[name] = cap("unknown", "unverified");

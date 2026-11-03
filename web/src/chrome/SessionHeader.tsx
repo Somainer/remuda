@@ -58,6 +58,7 @@ export function SessionHeader({
   onView,
   files,
   onStop,
+  stopLabel,
   more,
   spaces,
 }: {
@@ -75,6 +76,8 @@ export function SessionHeader({
   files: { active: boolean; onToggle: () => void } | null;
   /** Null once the session has exited. */
   onStop: (() => void) | null;
+  /** D-062: a claimed herdr pane is released, not stopped. */
+  stopLabel?: { aria: string; title: string };
   /** The ⋯ trigger and its menu. */
   more: ReactNode;
   spaces: SessionHeaderSpaces;
@@ -95,8 +98,8 @@ export function SessionHeader({
     <button
       type="button"
       className={`${ui.iconBtn} ${css.stopBtn}`}
-      aria-label="Stop"
-      title="停止会话"
+      aria-label={stopLabel?.aria ?? "Stop"}
+      title={stopLabel?.title ?? "停止会话"}
       onClick={onStop}
     >
       <Icon icon={Square} />

@@ -35,6 +35,7 @@ import {
   type HomeRow,
 } from "./homeRows";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
+import { HerdrClaimBadge } from "../session/HerdrClaimBadge";
 import { TaskGroups } from "../tasks/TaskList";
 import { useTaskLedger } from "../tasks/taskLedger";
 import { SpacesDrawer } from "../spaces/SpacesMobile";
@@ -693,6 +694,7 @@ function HomeRowView({
               {row.title}
             </span>
             <HarnessGlyph kind={row.kind} />
+            <HerdrClaimBadge instance={row.instance} />
             {row.stateWord ? (
               <span className={css.rowState} data-testid="home-row-state">
                 {row.stateWord}

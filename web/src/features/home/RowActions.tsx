@@ -5,6 +5,7 @@ import { Sheet } from "../../components/Sheet";
 import { clipboardIo } from "../../lib/clipboard";
 import { hubStore } from "../../lib/store";
 import type { Instance } from "../../types/instance";
+import { isClaimed, closeVerb, releaseConfirmText } from "../session/HerdrClaimBadge";
 import { resumeCommand, rowActionKeys, type RowActionKey } from "./rowActions";
 import { useCompactLayout } from "./useMain";
 import css from "./rowActions.module.css";
@@ -187,7 +188,7 @@ export function RowActions({
                 disabled={stale || (key === "interrupt" && !hubStore.canInterrupt)}
                 onClick={() => act(key)}
               >
-                {LABELS[key]}
+                {key === "close" && isClaimed(instance) ? "释放…" : LABELS[key]}
               </button>
             </li>
           ))}
@@ -195,7 +196,7 @@ export function RowActions({
       </Sheet>
       <Modal open={confirming} onClose={() => setConfirming(false)} labelledBy="row-close-title">
         <p id="row-close-title" data-testid="row-close-confirm">
-          关闭会话「{title}」？（主机 {host}）
+          {isClaimed(instance) ? releaseConfirmText(title) : `关闭会话「${title}」？（主机 ${host}）`}
         </p>
         <button type="button" onClick={() => setConfirming(false)}>取消</button>
         <button
@@ -205,10 +206,12 @@ export function RowActions({
           onClick={() => {
             setConfirming(false);
             onClose();
-            void hubStore.close(instance.id).catch(() => hubStore.toast("关闭失败，请重试"));
+            void hubStore
+              .close(instance.id)
+              .catch(() => hubStore.toast(isClaimed(instance) ? "释放失败，请重试" : "关闭失败，请重试"));
           }}
         >
-          关闭
+          {closeVerb(instance, "关闭")}
         </button>
       </Modal>
       <Modal open={renaming} onClose={() => setRenaming(false)} labelledBy="row-rename-title">

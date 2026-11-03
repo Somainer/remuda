@@ -1,7 +1,7 @@
 import type { Command, CommandResult, Page } from "../types/command";
 import { profileRegion } from "./profileFlags";
 import { reportFollowVisibility } from "./followVisibility";
-import type { Host, HostCli, Instance, TuiMode } from "../types/instance";
+import type { HerdrClaim, Host, HostCli, Instance, TuiMode } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
@@ -23,7 +23,7 @@ import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import { coerceUsageRollup } from "../features/session/contextUsage";
 import type { CapabilitySnapshot } from "../types/nativeRef";
 import type { components, paths } from "./api.generated";
-import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
+import { printCapabilities, ptyCapabilities, agentPtyCapabilities, claimedCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
 import {
   mockClose,
@@ -104,6 +104,7 @@ const DRIVERS: Instance["driver"][] = [
   "agy-print",
   "generic-pty",
   "shell-pty",
+  "herdr-claimed",
 ];
 const LIFECYCLES: Instance["lifecycle"][] = [
   "requested",
@@ -230,6 +231,22 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
   };
 }
 
+/** D-062: the claim record, ids only; malformed rows read as no claim. */
+function mapHerdrClaim(raw: unknown): HerdrClaim | null {
+  if (!raw || typeof raw !== "object") return null;
+  const claim = raw as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === "string" ? value : "");
+  if (!text(claim.paneId) || !text(claim.tabId)) return null;
+  return {
+    session: text(claim.session),
+    workspaceId: text(claim.workspaceId),
+    tabId: text(claim.tabId),
+    paneId: text(claim.paneId),
+    agent: text(claim.agent) || null,
+    contact: claim.contact === "lost" ? "lost" : claim.contact === "ok" ? "ok" : null,
+  };
+}
+
 export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
   const id = rec.instanceId as Id;
   const hostId = rec.hostId as Id;
@@ -272,6 +289,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     mode?: string | null;
     promotedAt?: string | null;
     launchedBy?: string | null;
+    herdrClaim?: unknown;
     signalTier?: string | null;
     lastError?: string | null;
     lastTurnError?: { at?: unknown; text?: unknown };
@@ -280,16 +298,19 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     grants?: unknown;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
+  const claimed = driver === "herdr-claimed";
   // Clone EVERY synthesized snapshot: the non-PTY fallback below is a
   // module-level object (HUB_CAPABILITIES), and stamping binaryVersion on it
   // leaked one instance's reported version onto every other non-PTY instance
   // (c-effortui r3 item 12a).
   const capabilities: CapabilitySnapshot = {
-    ...(ptyDriver && kind !== "terminal"
-      ? agentPtyCapabilities(kind, driver)
-      : ptyDriver
-        ? ptyCapabilities(driver)
-        : HUB_CAPABILITIES),
+    ...(claimed
+      ? claimedCapabilities()
+      : ptyDriver && kind !== "terminal"
+        ? agentPtyCapabilities(kind, driver)
+        : ptyDriver
+          ? ptyCapabilities(driver)
+          : HUB_CAPABILITIES),
   };
   // The gate runs ONLY on a REPORTED version. The print matrix's static
   // "2.1.268" is fixture data, not this instance's CLI: blank it for the
@@ -364,6 +385,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     seenSeq: typeof rec.seenSeq === "string" ? (rec.seenSeq as U64) : undefined,
     turnEndSeq: typeof rec.turnEndSeq === "string" ? (rec.turnEndSeq as U64) : undefined,
     launchedBy,
+    herdrClaim: claimed ? mapHerdrClaim(extra.herdrClaim) : null,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
     // D-050 task membership (instances.task_id); additive, absent on
@@ -742,6 +764,8 @@ export type HubApi = {
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
+  /** D-062 `POST /v1/instances/{id}/release`: detach from a claimed herdr pane (it keeps running). */
+  instanceRelease(instanceId: Id): Promise<{ released: boolean }>;
   instanceResume(instanceId: Id, mode?: ResumeMode): Promise<ResumeResult>;
   /** `GET /v1/lineages/{id}`: lineage state and every chapter (D-057). */
   lineageGet(lineageId: Id): Promise<LineageRecord>;
@@ -1245,6 +1269,10 @@ function createMockApi(): HubApi {
     },
     async instanceClose(instanceId) {
       return mockClose(instanceId);
+    },
+    async instanceRelease(instanceId) {
+      await mockClose(instanceId);
+      return { released: true };
     },
     async instanceResume(instanceId, mode = "structured") {
       return mockResume(instanceId, mode);
@@ -1837,6 +1865,13 @@ function createLiveApi(): HubApi {
     },
     async instanceClose(instanceId) {
       return command(instanceId, "instance.close", {});
+    },
+    async instanceRelease(instanceId) {
+      const body = await rest<HubJson<"/v1/instances/{id}/release", "post">>(
+        `/v1/instances/${instanceId}/release`,
+        { method: "POST", body: "{}" },
+      );
+      return { released: body.released };
     },
     async instanceResume(instanceId, mode = "structured") {
       const body = await rest<HubJson<"/v1/instances/{id}/resume", "post">>(

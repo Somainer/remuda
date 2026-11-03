@@ -25,6 +25,8 @@ import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
+import { HerdrClaimBadge, isClaimed, releaseConfirmText } from "../features/session/HerdrClaimBadge";
+import { Modal } from "../components/Modal";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { claudeDefaultTier, contextPercent } from "../features/session/effort";
@@ -308,6 +310,8 @@ function SessionPageBody({
   // that (and on compact) it is a ⋯ item.
   const wide = useWideDesktop();
   const [moreOpen, setMoreOpen] = useState(false);
+  // D-062: releasing a claimed herdr pane confirms first (the pane keeps running).
+  const [releasing, setReleasing] = useState(false);
   // D-040 (3) / D-053: run details is folded by default and its open state is
   // remembered on this device; the ⋯ item is its only trigger.
   const [runDetailsOpen, setRunDetailsOpen] = useState(readRunDetailsOpen);
@@ -844,15 +848,41 @@ function SessionPageBody({
         onStop={
           status === "exited" || mainLineage
             ? null
-            : () => {
-                void hubStore.close(instance.id);
-              }
+            : isClaimed(instance)
+              ? () => setReleasing(true)
+              : () => {
+                  void hubStore.close(instance.id);
+                }
         }
+        stopLabel={isClaimed(instance) ? { aria: "Release", title: "释放（pane 继续运行）" } : undefined}
         more={
           <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
         }
       />
       <MainSessionBar instance={instance} mobile={mobile} />
+      {isClaimed(instance) ? (
+        <div data-testid="session-herdr-claim" style={{ padding: "2px 12px", display: "flex", minWidth: 0 }}>
+          <HerdrClaimBadge instance={instance} testId="session-herdr-claim-badge" />
+        </div>
+      ) : null}
+      <Modal open={releasing} onClose={() => setReleasing(false)} labelledBy="session-release-title">
+        <p id="session-release-title" data-testid="session-release-confirm">
+          {releaseConfirmText(title)}
+        </p>
+        <button type="button" onClick={() => setReleasing(false)}>
+          取消
+        </button>
+        <button
+          type="button"
+          data-testid="session-release-confirm-yes"
+          onClick={() => {
+            setReleasing(false);
+            void hubStore.close(instance.id).catch(() => hubStore.toast("释放失败，请重试"));
+          }}
+        >
+          释放
+        </button>
+      </Modal>
       <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
         {diagnosticRows}
       </RunDetails>

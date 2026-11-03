@@ -32,14 +32,21 @@ async function listNotices(query: string, signal?: AbortSignal): Promise<OwnerNo
   return Array.isArray(page?.items) ? page.items : [];
 }
 
+/**
+ * The most notices one list returns (the Hub's cap). The ④ read asks for all
+ * of them: the default page of 50 would silently hide the oldest waiting
+ * cards behind it.
+ */
+export const NOTICE_LIST_MAX = 200;
+
 /** The notices still waiting for 知道了, newest first. */
 export function listUnackedNotices(signal?: AbortSignal): Promise<OwnerNotice[]> {
-  return listNotices("?unacked=1", signal);
+  return listNotices(`?unacked=1&limit=${NOTICE_LIST_MAX}`, signal);
 }
 
 /** One chapter's notices, acknowledged or not, newest first. */
 export function listChapterNotices(instanceId: string, signal?: AbortSignal): Promise<OwnerNotice[]> {
-  return listNotices(`?instanceId=${encodeURIComponent(instanceId)}`, signal);
+  return listNotices(`?instanceId=${encodeURIComponent(instanceId)}&limit=${NOTICE_LIST_MAX}`, signal);
 }
 
 /** Acknowledge one notice on every device (idempotent). */

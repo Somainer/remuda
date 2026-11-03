@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Observation } from "../../types/observation";
 
+const api = vi.hoisted(() => ({ rest: vi.fn() }));
+vi.mock("../../lib/api", () => ({ rest: api.rest }));
+
 vi.mock("../../lib/store", () => ({
   hubStore: {
     subscribeRefreshHealth: () => () => undefined,
@@ -8,7 +11,14 @@ vi.mock("../../lib/store", () => ({
   },
 }));
 
-import { NoticeStore, noticeVoice, noticesByReply, type OwnerNotice } from "./notices";
+import {
+  NOTICE_LIST_MAX,
+  NoticeStore,
+  listUnackedNotices,
+  noticeVoice,
+  noticesByReply,
+  type OwnerNotice,
+} from "./notices";
 import { T0, T1, T2, notice } from "./queueTestData";
 
 /**
@@ -184,5 +194,16 @@ describe("noticesByReply", () => {
     expect(noticeVoice({ origin: "agent" })).toBe("Main");
     expect(noticeVoice({ origin: "hub" })).toBe("Hub");
     expect(noticeVoice({ origin: "human" })).toBe("备忘");
+  });
+});
+
+describe("listUnackedNotices (r2 item 5)", () => {
+  it("asks for every waiting notice, not the Hub's default page of 50", async () => {
+    const rows = Array.from({ length: 60 }, (_, index) => notice({ noticeId: `ntc_${index}` }));
+    api.rest.mockResolvedValueOnce({ items: rows });
+    const listed = await listUnackedNotices();
+    expect(api.rest).toHaveBeenCalledWith(`/v1/owner/notices?unacked=1&limit=${NOTICE_LIST_MAX}`, {});
+    expect(NOTICE_LIST_MAX).toBe(200);
+    expect(listed).toHaveLength(60);
   });
 });

@@ -4941,15 +4941,26 @@ pub(crate) async fn forward_if_online(
             &command.command_id,
         )
         .await;
-    let rpc = state
-        .nodes
-        .call(
-            &command.host_id,
-            &command.operation,
-            params,
-            Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
-        )
-        .await;
+    #[cfg(any(test, feature = "test-faults"))]
+    let refused_busy = crate::inbox_deliver::test_seams::take_node_busy(&command.command_id);
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let refused_busy = false;
+    let rpc = if refused_busy {
+        // Test seam: the host's in-flight slots are full for this command.
+        Err(HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        })
+    } else {
+        state
+            .nodes
+            .call(
+                &command.host_id,
+                &command.operation,
+                params,
+                Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
+            )
+            .await
+    };
     match rpc {
         Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
             // The Node just told us which driver it really built. Record it
@@ -5087,7 +5098,7 @@ pub(crate) async fn forward_if_online(
                     command_id = %command.command_id,
                     "node refused hub-written input; releasing intent for a same-id retry"
                 );
-                return release_forward_intent(state, &command.command_id).await;
+                return release_hub_written(state, &command).await;
             }
             fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
@@ -5114,6 +5125,9 @@ pub(crate) async fn forward_if_online(
                 command_id = %command.command_id,
                 "node link gone after forward intent; frame never queued; releasing intent"
             );
+            if hub_written_send(&command) {
+                return release_hub_written(state, &command).await;
+            }
             release_forward_intent(state, &command.command_id).await
         }
 
@@ -5129,7 +5143,7 @@ pub(crate) async fn forward_if_online(
                     command_id = %command.command_id,
                     "node busy for hub-written input; releasing intent for a same-id retry"
                 );
-                return release_forward_intent(state, &command.command_id).await;
+                return release_hub_written(state, &command).await;
             }
             if let HubError::NodeBusy { .. } = &err {
                 // NODE_BUSY is refused BEFORE the frame is queued, so the Node
@@ -5192,6 +5206,27 @@ pub(crate) async fn forward_if_online(
         forward_attempt.complete(row.clone());
     }
     outcome
+}
+
+/// Release a Hub-written send whose forward proved it never ran, and arm its
+/// same-id retry. Every path that releases one goes through here (the
+/// driver's forward, the fence acknowledgement's forward of held work, a
+/// restart notice's), so a released row is always re-tried, and its
+/// attempts are capped, whoever forwarded it.
+async fn release_hub_written(
+    state: &AppState,
+    command: &CommandRecord,
+) -> Result<CommandRecord, HubError> {
+    let row = release_forward_intent(state, &command.command_id).await?;
+    if row.state == "queued" && !row.forwarded {
+        crate::inbox_deliver::note_released(state, &row).await;
+        return state
+            .store
+            .get_command(row.command_id.clone())
+            .await?
+            .ok_or(HubError::NotFound);
+    }
+    Ok(row)
 }
 
 /// Input the Hub wrote itself (`origin: hub`): a fact batch or a restart

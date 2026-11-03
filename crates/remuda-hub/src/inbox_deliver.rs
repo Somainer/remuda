@@ -1188,6 +1188,51 @@ pub(crate) fn retry_delay(attempts: u32) -> std::time::Duration {
     RETRY_FIRST.saturating_mul(factor).min(RETRY_MAX)
 }
 
+/// A Hub-written send (a batch or a restart notice) was released back to the
+/// queue after a forward that proved it never ran: arm its same-id retry.
+pub(crate) async fn note_released(state: &AppState, row: &crate::store::CommandRecord) {
+    let (attempts, delay) = state.deliver.note_retry(&row.command_id);
+    tracing::info!(
+        attempts,
+        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        "hub-written input not delivered; retried under the same id"
+    );
+}
+
+/// Test seams of delivery: make the next forwards of one command meet a
+/// full host (NODE_BUSY) without filling its slots.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_seams {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static NODE_BUSY: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    /// The next `times` forwards of `command_id` are refused NODE_BUSY.
+    pub(crate) fn arm_node_busy(command_id: &str, times: usize) {
+        NODE_BUSY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(command_id.to_owned(), times);
+    }
+
+    /// Whether this forward of `command_id` is refused (consumes one).
+    pub(crate) fn take_node_busy(command_id: &str) -> bool {
+        let mut armed = NODE_BUSY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(left) = armed.as_mut().and_then(|map| map.get_mut(command_id)) else {
+            return false;
+        };
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+}
+
 /// Whether a driver pass honours the retry backoff: the periodic tick and
 /// the writer's signal do; boot and an explicit test drive do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1346,17 +1391,11 @@ pub(crate) async fn drive(state: &AppState, pace: Pace) {
                         tracing::debug!("inbox batch waits behind input that goes first");
                     }
                     Ok(row) if row.state == "queued" && !row.forwarded => {
-                        // Back in the queue: the forward proved it never
-                        // reached the chapter (NODE_BUSY, the link gone, a
-                        // refusal before the Node recorded it) or a fence
-                        // holds its host. The same id is tried again after
-                        // the backoff.
-                        let (attempts, delay) = state.deliver.note_retry(&batch.batch_id);
-                        tracing::info!(
-                            attempts,
-                            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                            "inbox batch not delivered; retried under the same id"
-                        );
+                        // Back in the queue: released after a forward that
+                        // proved it never ran (`forward_if_online` armed the
+                        // same-id retry), or held behind its host's fences
+                        // (the acknowledgement forwards it).
+                        tracing::debug!("inbox batch stays queued");
                     }
                     Ok(row) => {
                         state.deliver.clear_retry(&batch.batch_id);

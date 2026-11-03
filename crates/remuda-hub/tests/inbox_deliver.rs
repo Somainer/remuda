@@ -50,8 +50,11 @@ struct Seen {
     /// For each `instance.send` that names a batch: whether the batch row was
     /// already readable when the frame arrived, and its text then.
     rows_at_receipt: Receipts,
-    /// RPC ids whose replies `Sends::Hold` keeps.
+    /// RPC ids whose replies `Sends::Hold` (or `hold_methods`) keeps.
     held: Arc<Mutex<Vec<Value>>>,
+    /// Methods whose replies are kept until `release` (e.g. `lineage.fence`:
+    /// the host's fence stays unacknowledged).
+    hold_methods: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Answers every held call.
     release: Arc<tokio::sync::Notify>,
 }
@@ -136,7 +139,14 @@ async fn connect_node(
     let task = tokio::spawn(async move {
         loop {
             let frame = tokio::select! {
-                frame = recv_json(&mut node) => frame,
+                // No idle timeout: a Node waits as long as the Hub is quiet.
+                frame = node.next() => match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        serde_json::from_str::<Value>(&text).map_err(anyhow::Error::from)
+                    }
+                    Some(Ok(_)) => continue,
+                    None | Some(Err(_)) => Err(anyhow::anyhow!("link closed")),
+                },
                 () = seen.release.notified() => {
                     let held: Vec<Value> = std::mem::take(&mut *seen.held.lock().unwrap());
                     for id in held {
@@ -157,6 +167,10 @@ async fn connect_node(
             };
             let method = method.as_str().unwrap_or("").to_owned();
             seen.frames.lock().unwrap().push(frame.clone());
+            if seen.hold_methods.lock().unwrap().contains(&method) {
+                seen.held.lock().unwrap().push(id);
+                continue;
+            }
             if method == "instance.send" {
                 let command = frame["params"]["commandId"]
                     .as_str()
@@ -1178,6 +1192,78 @@ async fn node_busy_leaves_the_batch_queued_and_a_later_drive_sends_the_same_id()
             .iter()
             .all(|fact| fact["batchId"] == batch.as_str())
     );
+    Ok(())
+}
+
+/// A batch held behind its host's unacknowledged fence is forwarded by the
+/// acknowledgement; when that forward meets NODE_BUSY the batch is released
+/// and its same-id retry is armed there too, so a later drive delivers it
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_held_batch_released_on_the_ack_path_is_retried_once() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("deliver-fence-held").await?;
+    let (seat, token) = ctx.seat(&project).await?;
+    let worker = ctx.worker(&token, &project).await?;
+    let (other, _) = ctx.seat(&ctx.project("deliver-fence-other").await?).await?;
+    // Another lineage's fence reaches the host and stays unacknowledged.
+    ctx.seen
+        .hold_methods
+        .lock()
+        .unwrap()
+        .insert("lineage.fence".to_owned());
+    // The pause's inline fence delivery waits for the acknowledgement.
+    let pausing = {
+        let http = ctx.http.clone();
+        let url = format!("{}/v1/instances/{other}/commands", ctx.base());
+        let human = ctx.human.clone();
+        tokio::spawn(async move {
+            http.post(url)
+                .bearer_auth(human)
+                .json(&json!({ "operation": "instance.close", "payload": {} }))
+                .send()
+                .await
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ctx
+        .seen
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["method"] == "lineage.fence")
+    {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "no fence frame");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    ctx.worker_turn(&worker, 10, "done").await?;
+    ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    let batch = ctx.batch_rows()?[0].0.clone();
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(
+        (row["state"].as_str(), row["forwarded"].as_bool()),
+        (Some("queued"), Some(false)),
+        "held behind the fence: {row:#}"
+    );
+    assert_eq!(frames_for(&ctx, &batch), 0);
+
+    // The acknowledgement forwards the held batch; that forward meets a full
+    // host.
+    ctx.hub.test_arm_node_busy(&batch, 1);
+    ctx.seen.hold_methods.lock().unwrap().clear();
+    ctx.seen.release.notify_one();
+    anyhow::ensure!(pausing.await??.status().is_success(), "the pause");
+    retry_until(&ctx, || frames_for(&ctx, &batch) == 1).await?;
+    let row = command_row(&ctx, &seat, &batch).await?;
+    assert_eq!(row["forwarded"], true, "{row:#}");
+    assert_eq!(ctx.batch_rows()?.len(), 1, "the same id");
+    for _ in 0..3 {
+        ctx.hub.test_inbox_retry_tick().await;
+    }
+    assert_eq!(frames_for(&ctx, &batch), 1, "once");
     Ok(())
 }
 

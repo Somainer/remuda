@@ -1386,6 +1386,14 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test-only: the next `times` forwards of `command_id` are refused
+    /// NODE_BUSY, as when its host's in-flight slots are full.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_node_busy(&self, command_id: &str, times: usize) {
+        crate::inbox_deliver::test_seams::arm_node_busy(command_id, times);
+    }
+
     /// Test-only: one periodic delivery retry check, as the scheduler runs
     /// it (the backoff is honoured).
     #[doc(hidden)]

@@ -188,8 +188,15 @@ async fn dispatch(state: AppState, instance_id: String, kind: AlertKind) {
                     // D-057 §8.5 / OA6: an end push needs process-end
                     // evidence on the durable row (a subagent's exit, or a
                     // non-terminal failure, is no end of this instance).
-                    if !ended_by_evidence(&state, &instance_id).await {
-                        return;
+                    // A failed read fails open (r2 item 3): it never drops
+                    // the end push, it sends it.
+                    match ended_by_evidence(&state, &instance_id).await {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(_) => tracing::warn!(
+                            category = "exited",
+                            "could not read the end evidence; pushing the end anyway"
+                        ),
                     }
                     // C1 pushes wait for the same evidence: the one this end
                     // brings may now be due.
@@ -252,15 +259,53 @@ async fn route_interaction(
 }
 
 /// Whether the instance's durable row carries process-end evidence (§6.2).
-async fn ended_by_evidence(state: &AppState, instance_id: &str) -> bool {
-    let Ok(Some(instance)) = state.store.get_instance_read(instance_id.to_owned()).await else {
-        return false;
+/// A row that is gone carries none; a read error is returned to the caller.
+async fn ended_by_evidence(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<bool, crate::store::StoreError> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_end_evidence_read_failure(instance_id) {
+        return Err(crate::store::StoreError::FaultInjected(
+            "end evidence read".to_owned(),
+        ));
+    }
+    let Some(instance) = state
+        .store
+        .get_instance_read(instance_id.to_owned())
+        .await?
+    else {
+        return Ok(false);
     };
     state
         .store
         .instance_has_process_end_evidence(&instance)
         .await
-        .unwrap_or(false)
+}
+
+/// Test seam (r2 item 3): fail the next end-evidence read for one instance,
+/// consumed once, so parallel tests cannot cross.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_seams {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static END_READ_FAILURES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+    /// Make the next end-evidence read for `instance_id` fail.
+    pub(crate) fn arm_end_evidence_read_failure(instance_id: &str) {
+        END_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(instance_id.to_owned());
+    }
+
+    pub(super) fn take_end_evidence_read_failure(instance_id: &str) -> bool {
+        END_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(instance_id)
+    }
 }
 
 /// What one fanout did.

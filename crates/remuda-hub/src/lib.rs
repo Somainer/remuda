@@ -311,6 +311,17 @@ impl AppState {
     }
 }
 
+/// Test-only seam of the push alerts (ma-push r2 item 3): fail the next
+/// end-evidence read for one instance.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub mod push_test_support {
+    /// Make the next end-evidence read for `instance_id` fail.
+    pub fn arm_end_evidence_read_failure(instance_id: &str) {
+        crate::alerts::test_seams::arm_end_evidence_read_failure(instance_id);
+    }
+}
+
 /// Test-only seams of the inbox (`cb-inbox-facts` r2): inject a failing
 /// inbox hook to prove the write that produced it still commits.
 #[doc(hidden)]

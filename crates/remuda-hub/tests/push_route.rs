@@ -1623,6 +1623,34 @@ async fn end_pushes_need_process_end_evidence() -> Result<()> {
     Ok(())
 }
 
+/// r2 item 3: a store read error while checking the end evidence fails
+/// open: the end push is sent (and logged), never silently dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_end_push_survives_a_failed_evidence_read() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let plain = ctx.child(None).await?;
+    remuda_hub::push_test_support::arm_end_evidence_read_failure(&plain);
+    ctx.node_i().append(
+        &plain,
+        json!({"kind":"lifecycle","lifecycle":"exited","payload":{
+            "type":"native","topic":"session","nativeName":"session",
+            "status":{"state":"known","value":"exited"},"severity":"info",
+            "affectsCompletion":true,"relatedIds":{"exitCode":"0"}}}),
+    )?;
+    let tag = format!("instance:{plain}");
+    let pushes = ctx.wait_pushes(&ctx.phone, &tag, 1).await?;
+    assert_eq!(pushes[0]["title"], "Session exited");
+    assert_eq!(
+        ctx.query_i64(
+            "SELECT COUNT(*) FROM push_log WHERE category = 'exited' AND instance_id = ?1",
+            [&plain],
+        )?,
+        1
+    );
+    Ok(())
+}
+
 /// The push log carries categories, tags and counts, never a body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_push_log_records_categories_and_counts() -> Result<()> {

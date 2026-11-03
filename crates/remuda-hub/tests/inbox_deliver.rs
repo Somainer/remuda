@@ -1169,8 +1169,14 @@ async fn a_node_refusal_leaves_the_batch_queued_and_a_retry_sends_the_same_id() 
     let (seat, token) = ctx.seat(&project).await?;
     let worker = ctx.worker(&token, &project).await?;
     *ctx.sends.lock().unwrap() = Sends::RefuseHubOnce;
+    // Formed with the forward held, then forwarded: whichever drive makes
+    // the first attempt, the retry is armed before its release commits, so
+    // no other drive sends it again before the backoff.
+    ctx.hub.test_hold_inbox_forward(true);
     ctx.worker_turn(&worker, 10, "done").await?;
     ctx.journal(&seat, activity("idle", &at(20))).await?;
+    ctx.settle().await?;
+    ctx.hub.test_hold_inbox_forward(false);
     ctx.settle().await?;
     let rows = ctx.batch_rows()?;
     assert_eq!(rows.len(), 1);
@@ -1255,6 +1261,7 @@ async fn node_busy_leaves_the_batch_queued_and_a_later_drive_sends_the_same_id()
     for owner in owners {
         owner.await??;
     }
+    ctx.hub.test_waive_inbox_backoff();
     ctx.settle().await?;
     assert_eq!(frames_for(&ctx, &batch), 1, "sent once");
     let row = command_row(&ctx, &seat, &batch).await?;
@@ -1361,6 +1368,7 @@ async fn spent_same_id_retries_end_the_batch_and_release_its_rows() -> Result<()
     ctx.hub.test_hold_inbox_forward(false);
     // Each drive (the backoff waived) makes one attempt.
     for _ in 0..10 {
+        ctx.hub.test_waive_inbox_backoff();
         ctx.settle().await?;
     }
     let rows = ctx.batch_rows()?;

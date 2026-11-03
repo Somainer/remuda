@@ -5242,16 +5242,22 @@ async fn release_hub_written(
     state: &AppState,
     command: &CommandRecord,
 ) -> Result<CommandRecord, HubError> {
+    // Armed before the release commits: a drive running meanwhile sees the
+    // backoff, never an unsent row it may forward again at once.
+    let spent = crate::inbox_deliver::arm_retry(state, &command.command_id);
     let row = release_forward_intent(state, &command.command_id).await?;
-    if row.state == "queued" && !row.forwarded {
-        crate::inbox_deliver::note_released(state, &row).await;
-        return state
-            .store
-            .get_command(row.command_id.clone())
-            .await?
-            .ok_or(HubError::NotFound);
+    if row.state != "queued" || row.forwarded {
+        crate::inbox_deliver::disarm_retry(state, &command.command_id);
+        return Ok(row);
     }
-    Ok(row)
+    if spent {
+        crate::inbox_deliver::give_up(state, &command.command_id).await;
+    }
+    state
+        .store
+        .get_command(row.command_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)
 }
 
 /// Input the Hub wrote itself (`origin: hub`): a fact batch or a restart

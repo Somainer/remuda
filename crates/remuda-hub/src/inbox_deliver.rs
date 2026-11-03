@@ -1228,10 +1228,43 @@ pub(crate) fn retry_delay(attempts: u32) -> std::time::Duration {
     RETRY_FIRST.saturating_mul(factor).min(RETRY_MAX)
 }
 
-/// A Hub-written send (a batch or a restart notice) was released back to the
-/// queue after a forward that proved it never ran: arm its same-id retry.
-pub(crate) async fn note_released(state: &AppState, row: &crate::store::CommandRecord) {
-    note_released_id(state, &row.command_id).await;
+/// Arm the next same-id attempt of a Hub-written send before its release
+/// commits, so no drive running meanwhile finds it unsent with no backoff.
+/// Returns whether the attempts are spent ([`give_up`] it once released).
+pub(crate) fn arm_retry(state: &AppState, command_id: &str) -> bool {
+    let (attempts, delay) = state.deliver.note_retry(command_id);
+    if attempts < RETRY_ATTEMPTS {
+        tracing::info!(
+            attempts,
+            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "hub-written input not delivered; retried under the same id"
+        );
+        return false;
+    }
+    true
+}
+
+/// A release that did not happen (the row had already advanced): no retry.
+pub(crate) fn disarm_retry(state: &AppState, command_id: &str) {
+    state.deliver.clear_retry(command_id);
+}
+
+/// End a released Hub-written send whose same-id attempts are spent:
+/// settled `rejected` / `not-delivered` (a batch's rows go back to waiting
+/// through the release trigger); the category is logged once per process.
+pub(crate) async fn give_up(state: &AppState, command_id: &str) {
+    state.deliver.clear_retry(command_id);
+    let id = command_id.to_owned();
+    match state
+        .store
+        .run_named("hub_input_not_delivered", move |conn| {
+            settle_not_delivered(conn, &id)
+        })
+        .await
+    {
+        Ok(_) => report_once("hub-input-retries-exhausted"),
+        Err(err) => tracing::warn!(code = error_code(&err), "could not settle a spent send"),
+    }
 }
 
 /// Same-id attempts at one Hub-written send before it is given up.
@@ -1250,26 +1283,8 @@ pub(crate) const NOT_DELIVERED_REASON: &str = "not-delivered";
 /// `not-delivered` so it ends (a batch's rows go back to waiting through the
 /// release trigger) and log that category once per process.
 pub(crate) async fn note_released_id(state: &AppState, command_id: &str) {
-    let (attempts, delay) = state.deliver.note_retry(command_id);
-    if attempts < RETRY_ATTEMPTS {
-        tracing::info!(
-            attempts,
-            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            "hub-written input not delivered; retried under the same id"
-        );
-        return;
-    }
-    state.deliver.clear_retry(command_id);
-    let id = command_id.to_owned();
-    match state
-        .store
-        .run_named("hub_input_not_delivered", move |conn| {
-            settle_not_delivered(conn, &id)
-        })
-        .await
-    {
-        Ok(_) => report_once("hub-input-retries-exhausted"),
-        Err(err) => tracing::warn!(code = error_code(&err), "could not settle a spent send"),
+    if arm_retry(state, command_id) {
+        give_up(state, command_id).await;
     }
 }
 
@@ -1404,6 +1419,20 @@ impl DeliverState {
             },
         );
         (attempts, delay)
+    }
+
+    /// Test seam: every armed retry is due now.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn waive_backoff(&self) {
+        let now = tokio::time::Instant::now();
+        for retry in self
+            .retry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values_mut()
+        {
+            retry.next = now;
+        }
     }
 
     fn clear_retry(&self, batch_id: &str) {

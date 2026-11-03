@@ -1374,7 +1374,8 @@ impl RunningHub {
 
     /// Test-only: let the inbox delivery settle: one writer job (so every
     /// earlier job's post-job formation has run), then one driver pass (so
-    /// every batch formed by then has been forwarded, or held).
+    /// every batch formed by then has been forwarded, or held). The pass
+    /// honours the retry backoff, as every production pass after boot does.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_settle_inbox(&self) -> anyhow::Result<()> {
@@ -1382,8 +1383,15 @@ impl RunningHub {
             .store
             .run_named("test_inbox_barrier", |_| Ok(()))
             .await?;
-        crate::inbox_deliver::drive(&self.state, crate::inbox_deliver::Pace::Now).await;
+        crate::inbox_deliver::drive(&self.state, crate::inbox_deliver::Pace::Backoff).await;
         Ok(())
+    }
+
+    /// Test-only: every armed same-id retry is due now (its backoff waived).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_waive_inbox_backoff(&self) {
+        self.state.deliver.waive_backoff();
     }
 
     /// Test-only: arm a one-shot park point in the inbox delivery driver

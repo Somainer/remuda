@@ -284,6 +284,17 @@ fn input_for(
     }))
 }
 
+/// D-057 §8.5 (ma-push): whether the input `command_id` delivered to
+/// `instance_id` came from a Human, classified exactly as the ledger does.
+pub(crate) fn input_is_human(
+    conn: &Connection,
+    instance_id: &str,
+    command_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(input_for(conn, instance_id, command_id)?
+        .is_some_and(|input| !input.hub && input.origin == InputOrigin::Human))
+}
+
 /// Fold one appended journal event into the instance's ledger. Runs in the
 /// append transaction; events that say nothing about inputs or turns cost one
 /// JSON inspection and no I/O.

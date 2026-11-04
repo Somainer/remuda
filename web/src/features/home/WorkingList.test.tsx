@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { OwnerGlance, OwnerGlanceRow } from "../../types/generated";
 import type { Instance } from "../../types/instance";
@@ -13,6 +13,8 @@ const hub = {
   connection: "live",
   instances: [] as Instance[],
   glance: null as OwnerGlance | null,
+  glanceAt: null as number | null,
+  glanceFailed: false,
 };
 
 vi.mock("../../lib/store", () => ({
@@ -68,6 +70,11 @@ function renderList() {
 }
 
 describe("WorkingList (home.md ⑥)", () => {
+  // Each case sets its own world; freshness starts clean.
+  beforeEach(() => {
+    hub.glanceAt = null;
+    hub.glanceFailed = false;
+  });
   it("lists the glance's working rows as served, five rows then +N ›", () => {
     hub.instances = [1, 2, 3, 4, 5, 6, 7].map((m) => row(`ins_${m}`, m));
     hub.glance = glanceOf(["ins_7", "ins_6", "ins_5", "ins_4", "ins_3", "ins_2", "ins_1"]);
@@ -84,6 +91,15 @@ describe("WorkingList (home.md ⑥)", () => {
     hub.glance = glanceOf([]);
     renderList();
     expect(screen.getByText("没有在跑的会话")).toBeTruthy();
+  });
+
+  it("greys the list when only the glance failed (frozen rows are not fresh)", () => {
+    hub.instances = [row("ins_a", 1)];
+    hub.glance = glanceOf(["ins_a"], 1);
+    hub.glanceAt = Date.now();
+    hub.glanceFailed = true;
+    renderList();
+    expect(screen.getByTestId("home-working")).toHaveAttribute("data-stale", "1");
   });
 
   it("never says nothing runs under a non-zero count", () => {

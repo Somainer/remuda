@@ -23,6 +23,7 @@ import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
 import { useHomeFreshness } from "../home/freshness";
+import { useOwnerGlancePoll } from "../home/useOwnerGlance";
 import { HubBanner } from "../home/HubBanner";
 import { NoSessions, SkeletonRows } from "../home/HomeStates";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
@@ -91,6 +92,10 @@ export function SessionList({
   // emit on equal payloads, so labels advance on this local tick instead.
   const nowMs = useNowTick();
   const [params, setParams] = useSearchParams();
+  // home-glance-d060 r3 item 6: a compact-width /sessions renders no
+  // PageHeader/① row, but the rows' phrases still read the glance — the
+  // refcounted poll keeps one shared reader alive from here too.
+  useOwnerGlancePoll();
   const conditions = readConditions(params);
   const global = conditions.scope === "all";
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));

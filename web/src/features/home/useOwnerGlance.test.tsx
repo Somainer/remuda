@@ -56,6 +56,11 @@ it("fetches once at mount, then exactly once per cycle, and stops at unmount", a
   expect(ownerGlance).toHaveBeenCalledTimes(4);
   // The whole point: the home poll never falls back to per-row journal reads.
   expect(eventsRead).not.toHaveBeenCalled();
+  // Positive control: the spy is wired to the real API path and can fire.
+  await api.eventsRead({ journalId: "jrn_control", afterSeq: "0", limit: 1 } as never).catch(
+    () => undefined,
+  );
+  expect(eventsRead).toHaveBeenCalledTimes(1);
 });
 
 it("keeps one interval for two mounted readers (a shared poll)", async () => {

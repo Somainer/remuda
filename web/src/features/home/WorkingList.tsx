@@ -4,6 +4,7 @@ import { StateDot } from "../../components/StateDot";
 import { formatListTime } from "../../lib/format";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
+import { HOME_FRESHNESS } from "./freshness";
 import type { Id } from "../../types/wire";
 import { RowActions, ROW_ACTIONS_HOST } from "./RowActions";
 import css from "./workingList.module.css";
@@ -33,7 +34,13 @@ export function WorkingList() {
     byId.has(row.instanceId) ? [{ glance: row, instance: byId.get(row.instanceId)! }] : [],
   );
   const total = glance ? glance.counts.working : null;
-  const stale = hub.connection !== "live";
+  // §8 / r3 item 6: a glance-only failure (the main refresh still healthy)
+  // freezes this list too — grey it rather than show frozen rows as fresh,
+  // exactly like ①'s row. `useNowTick` dates the last good read.
+  const glanceStale =
+    hub.glanceFailed === true ||
+    (hub.glanceAt !== null && nowMs - hub.glanceAt > HOME_FRESHNESS.staleAfterMs);
+  const stale = hub.connection !== "live" || (glance !== null && glanceStale);
   // A menu id whose row left the PAINTED slice has no menu to close it: a
   // later re-rank would otherwise pop it open by itself. (Checking all working
   // rows is not enough — the row can stay working behind 「+N」.)

@@ -57,8 +57,10 @@ vi.mock("../../lib/store", () => ({
     refresh: vi.fn(async () => undefined),
     titleOf: (id: string) => titles[id] ?? id,
     summaryOf: (id: string) => summaries[id] ?? "",
-    // home-glance-d060: the row phrase reads the owner glance's headline.
+    // home-glance-d060: the row phrase reads the owner glance's headline, and
+    // the list mounts the shared glance poll (refcounted).
     glanceHeadlineOf: () => undefined,
+    refreshGlance: () => Promise.resolve(undefined),
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: (id: string) => effortEffectiveState[id] ?? null,

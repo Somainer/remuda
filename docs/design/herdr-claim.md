@@ -101,7 +101,11 @@ Remuda does **not** own the claimed process.
   Node's watcher and TTY bridge and ends the instance with reason `released`.
   It never closes the pane, never kills or signals its process, and never stops
   the herdr server. Release is idempotent: releasing an instance that already
-  ended answers 200 with `released: false`.
+  ended answers 200 with `released: false` — unless its detach was never sent
+  (no release audit on the row): then it queues that detach once and answers
+  `released: true`. A claim whose commit reply is lost (the Node may hold it)
+  is failed on the Hub and its idempotent detach is queued at once, delivered
+  when the host reconnects, so no claim is left that the Hub cannot release.
 - The only things that act on the pane are `instance send` (the prompt
   input), `instance keys` and interrupt, and TTY control/observe from the PWA.
 - A Node shutdown is not a release: the claimed rows stay live and the next

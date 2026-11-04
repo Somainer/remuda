@@ -28,6 +28,8 @@ const SOCKET: &str = "/run/user/herdr/sessions/work/herdr.sock";
 #[derive(Default)]
 struct FakeNode {
     calls: Mutex<Vec<(String, Value)>>,
+    /// D-062 r2 item 4: commit the claim, then lose the reply.
+    drop_claim_reply: std::sync::atomic::AtomicBool,
 }
 
 impl FakeNode {
@@ -89,6 +91,15 @@ impl NodeTransport for FakeNode {
                 .lock()
                 .unwrap()
                 .push((method.clone(), params.clone()));
+            if method == "instance.claim"
+                && self
+                    .drop_claim_reply
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(remuda_hub::HubError::Internal(
+                    "node link dropped before the reply".into(),
+                ));
+            }
             let reply = match method.as_str() {
                 "herdr.discover" => json!({"result": {"sessions": [{
                     "session": "work", "socketPath": SOCKET, "reachable": true,
@@ -1013,6 +1024,97 @@ async fn an_unstamped_pane_write_is_never_forwarded() -> Result<()> {
         "the refused row settles: {}",
         row.state
     );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+// ---- D-062 r2 item 4: a claim the Hub never confirmed is still released ----
+
+#[tokio::test]
+async fn a_claim_whose_commit_reply_is_lost_is_detached() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture
+        .node
+        .drop_claim_reply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    assert!(status >= 400, "{status} {body}");
+    let claimed = fixture.node.params_of("instance.claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the Node received (and may hold) the claim"
+    );
+    let id = claimed[0]["instanceId"].as_str().context("id")?.to_owned();
+    let closes = fixture.node.params_of("instance.close");
+    assert_eq!(
+        closes.len(),
+        1,
+        "the detach is queued for the unconfirmed claim"
+    );
+    assert_eq!(closes[0]["instanceId"], json!(id));
+    assert_eq!(closes[0]["origin"], "human");
+    let audit = fixture.audit(&id).await?;
+    assert!(
+        audit.iter().any(|row| row["action"] == "instance.release"
+            && row["detail"]["reason"] == "claim-commit-unconfirmed"),
+        "{audit:?}"
+    );
+    // Already released: a later release is a no-op.
+    let (status, again) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["released"], false);
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_detaches_an_ended_claim_row_that_was_never_released() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    // The row ended without a release (e.g. failed before this fix).
+    fixture
+        .hub
+        .store()
+        .context("store")?
+        .fail_instance(id.clone(), "herdr-claim-refused".into())
+        .await?;
+    let (status, first) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["released"], true, "{first}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    let (_, second) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(second["released"], false, "{second}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
     fixture.hub.shutdown().await;
     Ok(())
 }

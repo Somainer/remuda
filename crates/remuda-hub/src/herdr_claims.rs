@@ -395,6 +395,15 @@ async fn claim(
                     .fail_instance(record.instance_id.clone(), "herdr-claim-refused".into()),
             )
             .await;
+        // D-062 r2 item 4: the Node may have committed the claim and only the
+        // reply was lost. Queue its idempotent detach (a Node without the
+        // claim refuses it harmlessly), so no claim is left the Hub cannot
+        // release.
+        if let Err(detach) =
+            queue_detach(&state, &device, &record, "claim-commit-unconfirmed").await
+        {
+            tracing::warn!(instance_id = %record.instance_id, %detach, "claim detach not queued");
+        }
         return Err(error);
     }
     let activity = match resolution.agent_status.as_str() {
@@ -463,15 +472,55 @@ async fn release(
     let host_lost = instance.lifecycle == "exited"
         && instance.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER);
     if matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") && !host_lost {
-        return Ok(Json(json!({ "instance": instance, "released": false })));
+        // D-062 r2 item 4: an ended or failed claim row whose detach was never
+        // released (a claim whose commit reply was lost, a row from before
+        // this fix) may still be live on its Node: queue the idempotent
+        // detach once. Otherwise a second release is a no-op.
+        let released =
+            instance.herdr_claim.is_some() && !released_before(&state, &instance_id).await;
+        if released {
+            queue_detach(&state, &device, &instance, "ended-without-release").await?;
+        }
+        let instance = state
+            .store
+            .get_instance(instance_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+        return Ok(Json(json!({ "instance": instance, "released": released })));
     }
-    let mut payload = json!({ "instanceId": instance_id, "origin": "human" });
-    authorize_pane_write(&instance, Some(&device), "instance.close", &mut payload)?;
+    queue_detach(&state, &device, &instance, "released").await?;
+    state
+        .publish_settlement(
+            state
+                .store
+                .settle_instance_exited(instance_id.clone(), "released".into()),
+        )
+        .await
+        .map_err(map_store)?;
+    let instance = state
+        .store
+        .get_instance(instance_id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(json!({ "instance": instance, "released": true })))
+}
+
+/// Queue the Node detach for a claim (an idempotent `instance.close`),
+/// delivered now or when the host reconnects, and audit it as a release.
+/// The release itself never waits on the Node.
+async fn queue_detach(
+    state: &AppState,
+    device: &Device,
+    instance: &InstanceRecord,
+    reason: &str,
+) -> Result<(), HubError> {
+    let mut payload = json!({ "instanceId": instance.instance_id, "origin": "human" });
+    authorize_pane_write(instance, Some(device), "instance.close", &mut payload)?;
     let (command, created) = state
         .store
         .queue_command(
             None,
-            Some(instance_id.clone()),
+            Some(instance.instance_id.clone()),
             instance.host_id.clone(),
             "instance.close".into(),
             payload,
@@ -484,32 +533,35 @@ async fn release(
         .map_err(map_store)?;
     if created {
         let live = state.nodes.kind_of(&instance.host_id).await.is_some();
-        // The detach is delivered when the Node next connects; the release
-        // itself never waits on the Node.
-        if let Err(error) = crate::http::forward_if_online(&state, command, live).await {
-            tracing::warn!(%instance_id, %error, "release not yet delivered to the node");
+        if let Err(error) = crate::http::forward_if_online(state, command, live).await {
+            tracing::warn!(instance_id = %instance.instance_id, %error, "claim detach not yet delivered to the node");
         }
     }
+    audit_release_with(state, device, instance, Some(reason)).await;
+    Ok(())
+}
+
+/// Whether a release (detach) was already audited for this instance.
+async fn released_before(state: &AppState, instance_id: &str) -> bool {
     state
-        .publish_settlement(
-            state
-                .store
-                .settle_instance_exited(instance_id.clone(), "released".into()),
-        )
-        .await
-        .map_err(map_store)?;
-    audit_release(&state, &device, &instance).await;
-    let instance = state
         .store
-        .get_instance(instance_id)
-        .await?
-        .ok_or(HubError::NotFound)?;
-    Ok(Json(json!({ "instance": instance, "released": true })))
+        .audit_for(instance_id.to_owned())
+        .await
+        .is_ok_and(|rows| rows.iter().any(|row| row["action"] == "instance.release"))
 }
 
 /// Audit a release (also a close on a claimed instance through the commands
 /// route). Ids only, never pane content.
 pub(crate) async fn audit_release(state: &AppState, device: &Device, instance: &InstanceRecord) {
+    audit_release_with(state, device, instance, None).await;
+}
+
+async fn audit_release_with(
+    state: &AppState,
+    device: &Device,
+    instance: &InstanceRecord,
+    reason: Option<&str>,
+) {
     let claim = instance.herdr_claim.clone().unwrap_or(Value::Null);
     audit(
         state,
@@ -524,6 +576,7 @@ pub(crate) async fn audit_release(state: &AppState, device: &Device, instance: &
             "tabId": claim.get("tabId"),
             "paneId": claim.get("paneId"),
             "kind": instance.kind,
+            "reason": reason,
         }),
     )
     .await;

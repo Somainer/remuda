@@ -132,3 +132,56 @@ describe('DecisionCard mode="home" (§4.2, §4.3)', () => {
   });
 });
 
+/* ------------------------------------------------------------------ */
+/* §6.4 交给 Main: question and plan cards only, never an approval.    */
+/* ------------------------------------------------------------------ */
+
+describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
+  it("offers 交给 Main on a QUESTION card, without answering it", async () => {
+    const run = vi.fn().mockResolvedValue(undefined);
+    const onRespond = renderCard(
+      interaction({ id: "int_q", instanceId: "ins_a", request: question() }),
+      { handToMain: run },
+    );
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    const item = screen.getByTestId("home-card-hand-main");
+    expect(item).toHaveTextContent("交给 Main");
+    fireEvent.click(item);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0]).toEqual(expect.objectContaining({ id: "int_q" }));
+    // The interaction itself is untouched: no answer POST, still pending.
+    expect(onRespond).not.toHaveBeenCalled();
+    // The card stays on the home with its own controls.
+    expect(screen.getAllByTestId("home-card-chip").length).toBeGreaterThan(0);
+    expect(await screen.findByTestId("home-card-hand-receipt")).toHaveTextContent("已交给 Main");
+  });
+
+  it("offers 交给 Main on a PLAN card", () => {
+    const run = vi.fn().mockResolvedValue(undefined);
+    renderCard(interaction({ id: "int_p", instanceId: "ins_a", kind: "plan-review", request: PLAN }), {
+      handToMain: run,
+    });
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    expect(screen.getByTestId("home-card-hand-main")).toHaveTextContent("交给 Main");
+  });
+
+  it("never offers it on an approval card, even when a handler exists", () => {
+    renderCard(interaction({ id: "int_a", instanceId: "ins_a" }), { handToMain: vi.fn() });
+    expect(screen.queryByTestId("home-card-more")).toBeNull();
+    expect(screen.queryByTestId("home-card-hand-main")).toBeNull();
+  });
+
+  it("hides it when no Main resolves", () => {
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), { handToMain: null });
+    expect(screen.queryByTestId("home-card-more")).toBeNull();
+  });
+
+  it("greys the trigger while the queue is stale (§8)", () => {
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), {
+      handToMain: vi.fn(),
+      stale: true,
+    });
+    expect(screen.getByTestId("home-card-more")).toBeDisabled();
+  });
+});
+

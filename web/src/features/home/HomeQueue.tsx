@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { hubStore, useHub } from "../../lib/store";
+import { hubStore, useHub, useMainEntry } from "../../lib/store";
 import { thisDeviceId } from "../../lib/interactionStatus";
 import { formatListTime } from "../../lib/format";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
@@ -24,6 +24,7 @@ import {
   type Receipt,
 } from "./homeQueue";
 import { noticeStore, noticeVoice, useOwnerNotices } from "./notices";
+import { handToMain, handToMainText } from "./handToMain";
 import css from "./homeQueue.module.css";
 
 /**
@@ -79,7 +80,25 @@ export function HomeQueue({
   );
   // §4.1 kind 4: the unacknowledged owner notices (not counted in N).
   const { notices } = useOwnerNotices();
-  const queue = useMemo(() => deriveHomeQueue(source, notices), [source, notices]);
+  // §4.1 item 1: Main's own pending interactions are pinned, labelled and
+  // counted once — they are the same queue rows, just moved to the front.
+  const main = useMainEntry();
+  const queue = useMemo(() => deriveHomeQueue(source, notices, main), [source, notices, main]);
+  // §6.4: a QUESTION or PLAN card may quote itself to Main. The quote never
+  // answers the interaction, so the card stays pending until a real answer.
+  const handMain = useCallback(
+    async (item: Interaction) => {
+      if (!main) return;
+      const text = handToMainText({
+        item,
+        sessionTitle: hubStore.titleOf(item.instanceId),
+        hostLabel: hubStore.hostName(item.hostId),
+      });
+      const ok = await handToMain(main.instance.id, text);
+      if (!ok) throw new Error("发送失败");
+    },
+    [main],
+  );
   // §5.1: the header N is the count row's N, read from the one derivation.
   const needYou = useMemo(() => glanceCounts(source).needYou, [source]);
 
@@ -310,6 +329,8 @@ export function HomeQueue({
               }
               displayKey={card.type === "task" ? displayKeyOf(tasks, card.task.id) : null}
               projectLabel={card.type === "task" ? projectName(card.task.projectId) ?? null : null}
+              mainAsking={card.type === "interaction" ? card.mainAsking === true : false}
+              handToMain={main ? handMain : null}
               nowMs={nowMs}
               onRespond={respond}
             />
@@ -388,6 +409,8 @@ function QueueCard({
   workspaceLabel,
   displayKey,
   projectLabel,
+  mainAsking,
+  handToMain,
   nowMs,
   onRespond,
 }: {
@@ -401,6 +424,10 @@ function QueueCard({
   workspaceLabel: string;
   displayKey: string | null;
   projectLabel: string | null;
+  /** This interaction is Main's own pending question on its live chapter. */
+  mainAsking: boolean;
+  /** §6.4 交给 Main; null when no Main resolves. */
+  handToMain: ((item: Interaction) => Promise<void>) | null;
   nowMs: number;
   onRespond: (item: Interaction, answer: InteractionAnswer) => Promise<void>;
 }) {
@@ -421,6 +448,7 @@ function QueueCard({
         focused ? 1 : 0,
         hostLabel,
         workspaceLabel,
+        mainAsking ? 1 : 0,
       ]),
       item,
       uiState,
@@ -436,6 +464,8 @@ function QueueCard({
       stale,
       inert,
       screenLines: screenLines ?? [],
+      mainAsking,
+      handToMain,
     };
     return <DecisionCard view={view} mode="home" onRespond={onRespond} home={home} />;
   }

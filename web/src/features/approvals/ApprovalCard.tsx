@@ -1,5 +1,6 @@
 import { memo, useState } from "react";
 import { Link } from "react-router-dom";
+import { Sheet } from "../../components/Sheet";
 import { RootTurnTag } from "../../components/RootTurnTag";
 import { RequestedByNote } from "../../components/RequestedByNote";
 import { StateDot } from "../../components/StateDot";
@@ -49,6 +50,14 @@ export type HomeCardState = {
   inert?: boolean;
   /** The tty card's last screen lines (§4.2 终端提示); empty = request text. */
   screenLines?: readonly string[];
+  /** This card is Main's own pending interaction on its live chapter (§4.1). */
+  mainAsking?: boolean;
+  /**
+   * 交给 Main (home.md §6.4): rendered in the ⋯ menu of QUESTION and PLAN
+   * cards only, and absent when no Main resolves. The handler quotes the
+   * interaction to Main; it never answers it.
+   */
+  handToMain?: ((item: Interaction) => Promise<void>) | null;
 };
 
 /**
@@ -426,11 +435,15 @@ function sameHome(a: HomeCardState | undefined, b: HomeCardState | undefined): b
     && a.stale === b.stale
     && (a.inert ?? false) === (b.inert ?? false)
     && (a.screenLines ?? []).join("\n") === (b.screenLines ?? []).join("\n")
+    && (a.mainAsking ?? false) === (b.mainAsking ?? false)
+    && a.handToMain === b.handToMain
   );
 }
 
 /** The kind label on a home card's first line (home.md §2.1 wireframe). */
-function homeLabel(item: Interaction, kind: HomeCardKind): string {
+function homeLabel(item: Interaction, kind: HomeCardKind, mainAsking = false): string {
+  // §4.1 item 1: Main's own question is pinned first and says so.
+  if (mainAsking) return "Main 在问你";
   if (kind === "approval") {
     return item.request.kind === "approval" ? `需要你授权 · ${item.request.title}` : "需要你授权";
   }
@@ -504,6 +517,13 @@ function HomeDecision({
   const answering = uiState === "answering";
   const paused = uiState === "paused";
   const inert = home.inert === true;
+  // §6.4 交给 Main: only a QUESTION or PLAN card carries it, never an
+  // approval, and it is absent when no Main resolves. A stale read greys the
+  // ⋯ like every other home control (§8).
+  const handMenu = (kind === "question" || kind === "simple-question" || kind === "plan") && home.handToMain != null;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [handState, setHandState] = useState<"idle" | "sending" | "done" | "failed">("idle");
+  const [handError, setHandError] = useState<string | null>(null);
   // §8: a stale queue greys every answer control; answering, paused and the
   // receipt keep them off too. Links stay live — they only navigate.
   const disabled = answering || paused || home.stale || inert || home.receipt !== null || !item.answerable;
@@ -595,13 +615,27 @@ function HomeDecision({
       data-stale={inert ? "1" : undefined}
     >
       <header className={homeCss.head}>
-        <span className={homeCss.label} title={homeLabel(item, kind)}>
-          {homeLabel(item, kind)}
+        <span className={homeCss.label} title={homeLabel(item, kind, home.mainAsking)}>
+          {homeLabel(item, kind, home.mainAsking)}
         </span>
         {where ? (
           <span className={homeCss.where} title={where}>
             {where}
           </span>
+        ) : null}
+        {handMenu ? (
+          <button
+            type="button"
+            className={homeCss.cardMore}
+            data-testid="home-card-more"
+            aria-label="更多操作"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            disabled={home.stale || inert || answering}
+            onClick={() => setMenuOpen(true)}
+          >
+            ⋯
+          </button>
         ) : null}
       </header>
       {kind === "plan" && item.request.kind === "plan-review" ? (
@@ -647,6 +681,56 @@ function HomeDecision({
         <p className={css.planError} role="alert" data-testid="home-card-error">
           {submitError}
         </p>
+      ) : null}
+      {handState === "done" ? (
+        <p className={homeCss.hint} role="status" data-testid="home-card-hand-receipt">
+          已交给 Main
+        </p>
+      ) : null}
+      {handState === "failed" && handError ? (
+        <p className={css.planError} role="alert" data-testid="home-card-hand-error">
+          {handError}
+        </p>
+      ) : null}
+      {handMenu ? (
+        <Sheet
+          open={menuOpen}
+          onClose={() => setMenuOpen(false)}
+          labelledBy={`home-card-menu-title-${item.id}`}
+          testId="home-card-menu"
+          variant={home.placement === "phone" ? "sheet" : "popover"}
+        >
+          <h2 id={`home-card-menu-title-${item.id}`} className={homeCss.menuTitle}>
+            更多
+          </h2>
+          <ul className={homeCss.menu} role="menu">
+            <li>
+              <button
+                type="button"
+                role="menuitem"
+                className={homeCss.menuItem}
+                data-testid="home-card-hand-main"
+                disabled={home.stale || inert || handState === "sending"}
+                onClick={() => {
+                  const run = home.handToMain;
+                  if (!run) return;
+                  setMenuOpen(false);
+                  setHandError(null);
+                  setHandState("sending");
+                  void run(item).then(
+                    () => setHandState("done"),
+                    (reason: unknown) => {
+                      setHandState("failed");
+                      setHandError(reason instanceof Error ? reason.message : String(reason));
+                    },
+                  );
+                }}
+              >
+                {handState === "sending" ? "交给 Main…" : "交给 Main"}
+              </button>
+            </li>
+          </ul>
+        </Sheet>
       ) : null}
     </article>
   );

@@ -11,7 +11,9 @@
 //!    contained so that every process the check starts can be found and
 //!    killed, `setsid`, a double fork and `nohup … &` included. In the order
 //!    tried: a cgroup v2 leaf when the Node's own cgroup is delegated and
-//!    writable (one `cgroup.kill`), and on Linux always a child subreaper
+//!    writable and the outer shell is verified to have joined it (one
+//!    `cgroup.kill`; see [`contain`] for the layout rules), and on Linux
+//!    always a child subreaper
 //!    (`PR_SET_CHILD_SUBREAPER` on the outer shell, so every orphan below it is
 //!    reparented to it; the Node SIGKILLs every live descendant, re-walking
 //!    `/proc` until a walk finds none). On a non-Linux Node only the process
@@ -35,7 +37,10 @@
 //! Logs carry the outcome and exit code only, never the command or its
 //! output.
 
+mod contain;
+
 use crate::{DevNode, NodeError};
+use contain::{CgroupFs, Label, Leaf};
 use remuda_protocol::{
     InstanceId, METHOD_WAKE_CHECK, WAKE_CHECK_ENV_PREFIX, WAKE_CHECK_STDOUT_MAX_BYTES,
     WAKE_CHECK_TIMEOUT_MAX_SECS, WakeCheckOutcome, WakeCheckParams, WakeCheckResult, WorkspaceId,
@@ -263,53 +268,27 @@ pub(crate) const MAX_OVERHEAD: Duration = Duration::from_secs(
 // The Hub sizes its wait from the protocol's bound; the Node stays inside it.
 const _: () = assert!(MAX_OVERHEAD.as_secs() <= remuda_protocol::WAKE_CHECK_NODE_OVERHEAD_SECS);
 
-/// How a check's process tree is contained (cb-wake-check r2), in the order
-/// tried: a cgroup v2 leaf (Linux, when the Node's own cgroup is delegated and
-/// writable), and on Linux always a child subreaper as well; elsewhere only
-/// the process group.
+/// What contained one check: a verified cgroup leaf, or none.
 #[derive(Debug, Default)]
 struct Containment {
-    /// The cgroup v2 leaf the check runs in.
-    leaf: Option<std::path::PathBuf>,
+    /// The cgroup v2 leaf the check's outer shell was verified to have joined.
+    leaf: Option<Leaf>,
 }
 
 impl Containment {
-    fn label(&self) -> &'static str {
+    fn label(&self) -> Label {
         if self.leaf.is_some() {
-            "cgroup+subreaper"
-        } else if cfg!(target_os = "linux") {
-            "subreaper"
+            Label::Cgroup
         } else {
-            "process-group"
+            Label::without_leaf()
         }
     }
 }
 
-/// A fresh cgroup v2 leaf under the Node's own cgroup, when that cgroup is
-/// delegated to the Node (cgroup2 mounted at `/sys/fs/cgroup`, the Node's
-/// directory writable, `cgroup.kill` supported). `None` otherwise.
-#[cfg(target_os = "linux")]
-fn cgroup_leaf() -> Option<std::path::PathBuf> {
-    let root = Path::new("/sys/fs/cgroup");
-    if !root.join("cgroup.controllers").exists() {
-        return None;
-    }
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = own.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let base = root.join(relative.trim_start_matches('/'));
-    let leaf = base.join(format!("remuda-wake-{}", uuid::Uuid::now_v7().simple()));
-    std::fs::create_dir(&leaf).ok()?;
-    if leaf.join("cgroup.kill").exists() {
-        Some(leaf)
-    } else {
-        let _ = std::fs::remove_dir(&leaf);
-        None
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_leaf() -> Option<std::path::PathBuf> {
-    None
+/// A fresh cgroup v2 leaf for one check, when the Node's own cgroup is
+/// delegated to it (see [`CgroupFs::leaf_parent`]); not yet joined.
+fn cgroup_leaf() -> Option<Leaf> {
+    CgroupFs::system()?.create_leaf(&format!("check-{}", uuid::Uuid::now_v7().simple()))
 }
 
 /// The live (not zombie) descendants of `root`, from `/proc/*/stat`.
@@ -363,7 +342,7 @@ fn live_descendants(root: u32) -> Vec<i32> {
 /// process in the leaf goes with it.) Elsewhere: the process group.
 async fn sweep(containment: &Containment, outer: Option<u32>) {
     if let Some(leaf) = &containment.leaf {
-        let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
+        let _ = std::fs::write(leaf.dir.join("cgroup.kill"), "1");
     }
     #[cfg(not(target_os = "linux"))]
     kill_group(outer);
@@ -397,7 +376,7 @@ async fn sweep(containment: &Containment, outer: Option<u32>) {
 fn remove_leaf(containment: &Containment) {
     if let Some(leaf) = &containment.leaf {
         for _ in 0..100 {
-            if std::fs::remove_dir(leaf).is_ok() {
+            if std::fs::remove_dir(&leaf.dir).is_ok() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -429,9 +408,7 @@ pub(crate) async fn run_check(
             return CheckRun::without_output(WakeCheckOutcome::Unavailable, "could not start sh");
         }
     }
-    let containment = Containment {
-        leaf: cgroup_leaf(),
-    };
+    let leaf = cgroup_leaf();
     let mut sh = shell(cwd, env);
     sh.args(["-c", OUTER, "sh", command])
         .stdin(Stdio::piped())
@@ -439,21 +416,28 @@ pub(crate) async fn run_check(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     remuda_unix::ContainOnExec {
-        cgroup: containment
-            .leaf
-            .as_ref()
-            .map(|leaf| leaf.join("cgroup.procs")),
+        cgroup: leaf.as_ref().map(|leaf| leaf.dir.join("cgroup.procs")),
         subreaper: true,
     }
     .install(sh.as_std_mut());
     let mut child = match sh.spawn() {
         Ok(child) => child,
         Err(_) => {
-            remove_leaf(&containment);
+            remove_leaf(&Containment { leaf });
             return CheckRun::without_output(WakeCheckOutcome::Unavailable, "could not start sh");
         }
     };
     let outer = child.id();
+    // r3: the label is what happened, not what was tried. The pre-exec join
+    // can fail (EBUSY, EACCES, a short write) without failing the spawn, so
+    // the leaf is kept only when the outer shell is verified to be in it.
+    let containment = Containment {
+        leaf: leaf.and_then(|leaf| {
+            let member =
+                outer.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok());
+            contain::confirm(leaf, member.as_deref())
+        }),
+    };
     let release = child.stdin.take();
     let reader = child
         .stdout
@@ -491,7 +475,7 @@ pub(crate) async fn run_check(
     let stdout_truncated = cut || truncated;
     tracing::debug!(
         category = "wake-check",
-        containment = containment.label(),
+        containment = containment.label().as_str(),
         "check contained"
     );
     let exit_code = match waited {

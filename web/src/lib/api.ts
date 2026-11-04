@@ -352,6 +352,11 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
       typeof rec.parentInstanceId === "string" && rec.parentInstanceId
         ? { instanceId: rec.parentInstanceId as Id, runId: null, commandId: null }
         : null,
+    // r4 item 2: a parent alone is not "dispatched" (a resume names the resumed
+    // session as its parent). These two let `dispatchedChild` tell them apart.
+    ...(rec.creatorOrigin ? { creatorOrigin: rec.creatorOrigin } : {}),
+    resumedFrom:
+      typeof rec.resumedFrom === "string" && rec.resumedFrom ? (rec.resumedFrom as Id) : null,
     journalId: rec.journalId as Id,
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },

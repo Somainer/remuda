@@ -1710,6 +1710,18 @@
               "null"
             ]
           },
+          "creatorOrigin": {
+            "description": "Origin of the device that created the chain ROOT (home.md §5.3): `human`, `bot`, `agent` or `hub`, or the upgrade backfill's `legacy`. A resume or continuation inherits its predecessor's stamp, so `agent` means dispatched by an Agent and a parent alone does not. Absent only on an unclassified pre-upgrade row.",
+            "enum": [
+              "human",
+              "bot",
+              "agent",
+              "hub",
+              "legacy"
+            ],
+            "readOnly": true,
+            "type": "string"
+          },
           "chapterCause": {
             "description": "D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance.",
             "readOnly": true,

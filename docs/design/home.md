@@ -221,7 +221,7 @@
 | c | `L ∈ {exited, failed, closing}` | 7 exited |
 | d | `A ∈ {working, draining}` | 3 working |
 | e | `A = idle`，`unseen=true`，并且没有 `lastTurnError`，即最近一个结束的根回合是成功的（§7）。失败的回合不进这一档，而是在队列里出一张回合失败卡（§4.5） | 2 done-unseen |
-| f | `A = idle`，并且满足以下任一条：至少有一个子实例（子实例的 `parentInstanceId` 指向它）落在第 1、3 或 5 档；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | 4 awaiting-wake |
+| f | `A = idle`，并且满足以下任一条：至少有一个 Agent 派出的子实例（`parentInstanceId` 指向它，且按 §5.3 是「派出」而不是恢复）落在第 1、3 或 5 档；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | 4 awaiting-wake |
 | g | `A = idle` | 6 idle |
 | h | 其余情形，也就是活着但 `A` 未知 | 3 working |
 
@@ -368,11 +368,13 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
   3. 时间完全相同按 id 升序取第一个，所以结果不依赖读取顺序。
 
   因此 Main 暂停（关闭一条续跑血缘的章节 = 无继任的 fence，会给章节写上 `fenced_at`）时，它的血缘照样解析得出来，它派出去还在跑的 worker 仍计入 ① 和 ⑥。
-- **owner 亲手开的会话（hand-opened）**：**一条规则**——会话本身或其恢复/续跑链的**根**（该链第 1 章）是一个**真根**（没有 `parentInstanceId`、没有 `resumedFrom`，`lineage_id` 为空或等于自身），并且这个真根是 owner 自己的 **Human 设备**创建的。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体；升级前的旧行由打开数据库时的幂等回填补齐：有 Agent 派发审计行或 `spec.parentInstanceId` 的判为 `agent`；血缘 `origin_spec_ref.seatedOrigin` 是 Human 的判为 `human`；剩下的、没有创建者证据的真根判为 `legacy`，按 hand-opened 对待。链的其余章节（`resumedFrom`，以及同一血缘 `generation > 1` 的续跑章节，第 2 章、第 3 章……）跟随根进入范围；续跑继任行自身也继承并写入根的 `creator_origin`。由此：
+- **owner 亲手开的会话（hand-opened）**：**一条规则**——会话本身或其恢复/续跑链的**根**（该链第 1 章）是一个**真根**（没有 `parentInstanceId`、没有 `resumedFrom`，`lineage_id` 为空或等于自身），并且这个真根是 owner 自己的 **Human 设备**创建的。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体。**继任行不重新盖戳**：D-026 恢复、续跑继任章节都从前一章继承 `creator_origin`，所以这个字段始终是**链根创建者**的来源，不是按下「恢复」的那台设备。升级前的旧行由打开数据库时的幂等回填补齐：没有 `resumedFrom` 的根里，有 Agent 派发审计行或 `spec.parentInstanceId` 的判为 `agent`；血缘 `origin_spec_ref.seatedOrigin` 是 Human 的判为 `human`；剩下的、没有创建者证据的真根判为 `legacy`，按 hand-opened 对待；带 `resumedFrom` 的继任行逐级继承前一章的戳（D-026 恢复把被恢复的会话同时写成 `parentInstanceId`，所以「有 parent」不能当作「Agent 派出」）。链的其余章节（`resumedFrom`，以及同一血缘 `generation > 1` 的续跑章节，第 2 章、第 3 章……）跟随根进入范围。由此：
   - **Bot 创建的根不算**（包括 owner 后来用 Human 设备重新拉起的 Bot 会话——它的链根仍是 Bot 会话，不是一个真根）；
   - 监督进程重启的 worker、自动续跑的继任章节不算——它们的链根是 Agent 派发的 worker；
   - 没有创建戳、也没有可回填证据的行不算。
 - **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘（子会话带的是 `parentInstanceId`，不是恢复/续跑链）。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
+
+**「子会话」= Agent 派出的会话。** 桌面看板不列子会话、① 的档位点按会把它们列出来、§3.1 f 的 awaiting-wake 只看它们，三处用同一个判定（客户端 `dispatchedChild`）：有 `parentInstanceId`，并且 `creatorOrigin = agent`。没有创建戳的旧 Hub 行退回「有 `parentInstanceId` 且没有 `resumedFrom`」。所以 owner 恢复的会话仍是看板上的普通行，即使它的 `parentInstanceId` 指向被恢复的那一章；Agent 派出的 worker 被恢复之后，继承的戳仍是 `agent`，仍算子会话。
 
 **各段计数。** 计数分两种范围，**`needYou` 不分范围**：
 - `needYou`（§5.1 N）= **所有** owner 能看到的 `state=pending` 且截止时间未过的交互数 A（与 ④ 的标题、OS 角标同一来源：`/v1/interactions` 合并页），加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计；去重覆盖整个 fleet）。只有 `waiting`/`working` 的**行**按上面的 owner 范围收窄。§5.1 要求 ①、④ 标题和角标是同一个定义，所以三者同数；一条落在私有血缘上的待办会计入 ① 和 ④，但不会出现在 glance 的行里。

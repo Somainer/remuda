@@ -292,3 +292,105 @@ it("maps parentInstanceId and filters the rank-tap board through mapInstance", a
     vi.stubGlobal("fetch", realFetch);
   }
 });
+
+/**
+ * [r4 item 2] "Child" means DISPATCHED by an Agent, not "has a parent". A
+ * D-026 resume writes `parentInstanceId` = the resumed session, so the
+ * Hub's real shapes go through mapInstance here: the resumed conversation
+ * stays on the board; a dispatched worker (and its own scoped respawn) is
+ * hidden there and shown under the rank tap.
+ */
+it("keeps a resumed session on the board and folds only the dispatched worker", async () => {
+  const host = {
+    ...mockDb.hosts[0],
+    id: "host-wire",
+    workspaces: [{ workspaceId: "wsp-wire", hostId: "host-wire", root: "/home/dev/ws" }],
+  };
+  const wire = (instanceId: string, extra: Record<string, unknown>) => ({
+    instanceId,
+    hostId: "host-wire",
+    workspaceId: "wsp-wire",
+    kind: "claude",
+    driver: "shell-pty",
+    lifecycle: "running",
+    activity: "working",
+    connectivity: "connected",
+    createdAt: "2026-10-30T09:00:00Z",
+    updatedAt: "2026-10-30T10:00:00Z",
+    title: instanceId,
+    journalId: `obj_${instanceId}`,
+    durableSeq: "1",
+    exit: { state: "not-applicable" },
+    parentInstanceId: null,
+    ...extra,
+  });
+  const records = [
+    wire("ins_root", { lifecycle: "exited", activity: "idle", creatorOrigin: "human" }),
+    // The owner pressed Resume (http.rs resume_instance).
+    wire("ins_resumed", {
+      parentInstanceId: "ins_root",
+      resumedFrom: "ins_root",
+      creatorOrigin: "human",
+    }),
+    // The resumed conversation dispatched a worker…
+    wire("ins_worker", { parentInstanceId: "ins_resumed", creatorOrigin: "agent" }),
+    // …and that worker's scoped respawn carries resumedFrom too.
+    wire("ins_worker_2", {
+      parentInstanceId: "ins_resumed",
+      resumedFrom: "ins_worker",
+      creatorOrigin: "agent",
+    }),
+  ];
+  const realFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+    const url = String(input);
+    if (/\/v1\/instances(\?|$)/.test(url)) {
+      return Response.json({ items: records, nextCursor: null });
+    }
+    return Response.json({});
+  });
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(glance({ working: 3 }));
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+
+  const cardIds = () =>
+    screen
+      .getAllByTestId("board-card")
+      .map((card) => card.getAttribute("data-instance-id"))
+      .sort();
+  try {
+    await hubStore.bootstrap();
+    await hubStore.refresh();
+    await hubStore.refreshGlance();
+    const mapped = hubStore.getSnapshot().instances;
+    const resumed = mapped.find((row) => row.id === "ins_resumed");
+    expect(resumed?.parent?.instanceId).toBe("ins_root");
+    expect(resumed?.resumedFrom).toBe("ins_root");
+    expect(resumed?.creatorOrigin).toBe("human");
+    expect(mapped.find((row) => row.id === "ins_worker")?.creatorOrigin).toBe("agent");
+
+    render(
+      <MemoryRouter initialEntries={["/sessions?scope=all"]}>
+        <SessionsPage />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("session-list");
+    // Unfiltered: the resumed conversation is a plain row; the workers are not.
+    expect(cardIds()).toEqual(["ins_resumed", "ins_root"]);
+    // The ● tap shows every working row the count spans, workers included.
+    await userEvent.click(await screen.findByTestId("glance-working"));
+    await waitFor(() =>
+      expect(cardIds()).toEqual(["ins_resumed", "ins_worker", "ins_worker_2"]),
+    );
+  } finally {
+    vi.stubGlobal("fetch", realFetch);
+  }
+});

@@ -8428,19 +8428,28 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     )?;
     // home-glance-d060 §5.3: backfill the creator stamp for rows written
     // before the column existed (or before a create route stamped it), from
-    // durable evidence only. Order matters:
-    //   1. an Agent creator wins — a recorded dispatch audit row, or a
-    //      non-null spec parentInstanceId (the Hub stamps the creator
-    //      instance at every Agent create);
+    // durable evidence only. The stamp is the origin of the chain ROOT's
+    // creator (a successor inherits it), so the rules split roots from
+    // successors. Every rule fills only NULLs, in this order:
+    //   1. a ROOT (no `resumedFrom`) with an Agent creator — a recorded
+    //      dispatch audit row, or a non-null spec `parentInstanceId` (the Hub
+    //      stamps the creator instance at every Agent create) — is `agent`.
+    //      A successor never matches: a D-026 resume's parentInstanceId is the
+    //      session it resumed, not a dispatching Agent;
     //   2. a Human seat — the lineage's origin_spec_ref named a Human
-    //      `seatedOrigin` (D-057 OA5), so its chapters are the owner's;
-    //   3. whatever remains is a TRUE root (no parent, no resumedFrom), which
-    //      predates the stamp: `legacy`, accepted as hand-opened by the seed.
-    // The first statement wins per row; the later ones see no NULL left for a
-    // row they would reclassify. Idempotent: after a backfill no rule matches.
+    //      `seatedOrigin` (D-057 OA5; only a Human may set the restart policy
+    //      that makes one), so every chapter of it is the owner's: `human`;
+    //   3. a remaining TRUE root (no parent, no `resumedFrom`) predates the
+    //      stamp: `legacy`, accepted as hand-opened by the seed;
+    //   4. a SUCCESSOR (`resumedFrom` set: a D-026 resume, a continuation
+    //      chapter, a worker respawn) inherits its predecessor's stamp, chain
+    //      by chain until no row changes — each pass fills at least one row,
+    //      so the loop ends.
+    // Idempotent: once a row is stamped no rule touches it again.
     conn.execute_batch(
         "UPDATE instances SET creator_origin = 'agent'
            WHERE creator_origin IS NULL
+             AND json_extract(spec_json, '$.resumedFrom') IS NULL
              AND (json_extract(spec_json, '$.parentInstanceId') IS NOT NULL
                   OR EXISTS (SELECT 1 FROM audit_log a
                               WHERE a.action = 'instance.dispatch'
@@ -8456,6 +8465,23 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
              AND json_extract(spec_json, '$.parentInstanceId') IS NULL
              AND json_extract(spec_json, '$.resumedFrom') IS NULL;",
     )?;
+    loop {
+        let inherited = conn.execute(
+            "UPDATE instances
+                SET creator_origin = (
+                    SELECT p.creator_origin FROM instances p
+                     WHERE p.id = json_extract(instances.spec_json, '$.resumedFrom'))
+              WHERE creator_origin IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM instances p
+                     WHERE p.id = json_extract(instances.spec_json, '$.resumedFrom')
+                       AND p.creator_origin IS NOT NULL)",
+            [],
+        )?;
+        if inherited == 0 {
+            break;
+        }
+    }
     // D-060 (cb-memory-inject): the lineage memory revision, the chapter's
     // start record and the per-command change line.
     crate::memory::ensure_inject_columns(&conn)?;

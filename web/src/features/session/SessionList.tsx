@@ -27,6 +27,7 @@ import { useOwnerGlancePoll } from "../home/useOwnerGlance";
 import { HubBanner } from "../home/HubBanner";
 import { NoSessions, SkeletonRows } from "../home/HomeStates";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
+import { dispatchedChild } from "../../lib/dispatched";
 import {
   applyFilters,
   availableConditions,
@@ -101,15 +102,16 @@ export function SessionList({
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
   const allowed = availableConditions(scope);
 
-  // home.md §5.2/§5.3: the unfiltered board lists top-level sessions only
-  // (children are never plain desktop rows). The ① rank tap, however, filters
-  // by the SAME rank the owner glance counted, and that count spans the
-  // owner's whole world — children included (⑥ lists them too) — so a
-  // rank-filtered board INCLUDES child sessions. The count and the tapped rows
-  // therefore always agree.
+  // home.md §5.2/§5.3: the unfiltered board hides the sessions an Agent
+  // dispatched (they are never plain desktop rows). A resume is NOT one: it
+  // names the resumed session as its parent but stays on the board
+  // (`dispatchedChild`). The ① rank tap, however, filters by the SAME rank the
+  // owner glance counted, and that count spans the owner's whole world —
+  // dispatched workers included (⑥ lists them too) — so a rank-filtered board
+  // INCLUDES them. The count and the tapped rows therefore always agree.
   const rankFiltered = conditions.rank.length > 0;
   const source = (global ? hub.instances : (instances ?? hub.instances)).filter(
-    (instance) => rankFiltered || instance.parent == null,
+    (instance) => rankFiltered || !dispatchedChild(instance),
   );
 
   // Children that are still running lift their idle parent into awaiting-wake.

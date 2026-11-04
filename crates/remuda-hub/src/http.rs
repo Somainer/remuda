@@ -2268,9 +2268,17 @@ pub async fn resume_instance(
             operation: "instance.resume",
             idempotency_key: Some(idempotency_key),
             delegation: crate::store::InstanceDelegation {
-                // home-glance-d060: a resume of a hand-opened session keeps
-                // that session in the owner's world (§5.3).
-                creator_origin: Some(crate::agent_scope::origin_wire(&device).to_string()),
+                // home-glance-d060 (home.md §5.3): a resume is a successor in
+                // the resumed session's chain, so it inherits the chain ROOT's
+                // creator stamp (the predecessor carries it) — never the
+                // operator's who pressed Resume. That keeps "dispatched by an
+                // Agent" true for a resumed worker and false for a resumed
+                // conversation. A predecessor with no stamp (an unclassified
+                // pre-upgrade row) falls back to the caller's.
+                creator_origin: parent
+                    .creator_origin
+                    .clone()
+                    .or_else(|| Some(crate::agent_scope::origin_wire(&device).to_string())),
                 ..Default::default()
             },
             // Operator-only resume route (D-026); worker respawn uses the

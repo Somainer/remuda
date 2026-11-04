@@ -1431,6 +1431,24 @@ mod tests {
                 "ins.old_child",
                 json!({ "parentInstanceId": "ins.old_root" }),
             ),
+            // Pre-upgrade D-026 resumes: the Hub wrote `parentInstanceId`
+            // AND `resumedFrom` as the resumed session (http.rs resume). A
+            // parent here is NOT an Agent creator, so they inherit instead.
+            (
+                "ins.old_root.resumed",
+                json!({ "parentInstanceId": "ins.old_root",
+                        "resumedFrom": "ins.old_root" }),
+            ),
+            (
+                "ins.old_root.resumed.again",
+                json!({ "parentInstanceId": "ins.old_root.resumed",
+                        "resumedFrom": "ins.old_root.resumed" }),
+            ),
+            (
+                "ins.old_child.resumed",
+                json!({ "parentInstanceId": "ins.old_child",
+                        "resumedFrom": "ins.old_child" }),
+            ),
         ];
         for (id, spec) in seeds {
             store
@@ -1479,6 +1497,32 @@ mod tests {
             Some("agent"),
             "a parented row was Agent-created"
         );
+        let origin_of = |id: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .get_instance(id.into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .creator_origin
+            }
+        };
+        assert_eq!(
+            origin_of("ins.old_root.resumed").await.as_deref(),
+            Some("legacy"),
+            "a resumed conversation inherits its root's stamp, not `agent`"
+        );
+        assert_eq!(
+            origin_of("ins.old_root.resumed.again").await.as_deref(),
+            Some("legacy"),
+            "chain by chain, to the root"
+        );
+        assert_eq!(
+            origin_of("ins.old_child.resumed").await.as_deref(),
+            Some("agent"),
+            "a resumed worker is still the Agent's"
+        );
 
         let now = OffsetDateTime::now_utc();
         let day_start = crate::config::rfc3339(local_day_start(now, 0));
@@ -1490,6 +1534,10 @@ mod tests {
         let scope: std::collections::BTreeSet<&str> =
             snapshot.scope.iter().map(String::as_str).collect();
         assert!(scope.contains("ins.old_root"), "the upgraded hand root");
+        assert!(
+            scope.contains("ins.old_root.resumed.again"),
+            "its twice-resumed conversation"
+        );
         assert!(!scope.contains("ins.old_child"), "its dispatched child");
         store.close().await;
     }

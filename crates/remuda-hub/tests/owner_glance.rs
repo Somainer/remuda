@@ -499,6 +499,107 @@ async fn a_paused_main_keeps_its_working_subtree_in_the_glance() -> Result<()> {
     Ok(())
 }
 
+/// [r4 item 2] A parent means "dispatched by an Agent", never "resumed". A
+/// D-026 resume writes `parentInstanceId` = the resumed session (http.rs), so
+/// the successor's creator stamp is the chain root's — not "has a parent" and
+/// not the operator who pressed Resume. A resumed conversation stays the
+/// owner's (`human`, in the glance); a resumed worker stays its Agent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_inherits_the_chain_roots_creator_stamp() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("glance-resume-origin").await?;
+    let coordinator = ctx
+        .create_session(
+            &ctx.human,
+            json!({ "role": "project-coordinator", "projectId": project,
+                    "prompt": "coordinate", "driver": "claude-pty" }),
+        )
+        .await?;
+    let coordinator_token = ctx.agent_token(&coordinator).await?;
+    let conversation = ctx
+        .create_session(
+            &ctx.human,
+            json!({ "role": "worker", "projectId": project, "prompt": "talk",
+                    "driver": "claude-pty" }),
+        )
+        .await?;
+    let worker = ctx
+        .create_session(
+            &coordinator_token,
+            json!({ "role": "worker", "projectId": project, "prompt": "work",
+                    "driver": "claude-pty" }),
+        )
+        .await?;
+    let mut resumed = Vec::new();
+    for (index, id) in [&conversation, &worker].into_iter().enumerate() {
+        ctx.journal(
+            id,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "native", "topic": "session", "nativeName": "session",
+                "nativeId": { "state": "known",
+                              "value": format!("01993ab0-0000-7000-8000-00000000000{index}") },
+                "status": { "state": "known", "value": "started" },
+                "relatedIds": {}, "dataRef": null, "severity": "info",
+                "affectsCompletion": false } }),
+        )
+        .await?;
+        ctx.journal(
+            id,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "entity", "state": "exited", "reasonCode": "native-exit" } }),
+        )
+        .await?;
+        // The OWNER presses Resume on both.
+        let body = ctx
+            .post(
+                &ctx.human,
+                &format!("/v1/instances/{id}/resume"),
+                json!({ "mode": "structured" }),
+            )
+            .await?;
+        let successor = &body["instance"];
+        assert_eq!(successor["resumedFrom"], json!(id), "{body}");
+        assert_eq!(
+            successor["parentInstanceId"],
+            json!(id),
+            "the D-026 shape names the resumed session as parent: {body}"
+        );
+        resumed.push(
+            successor["instanceId"]
+                .as_str()
+                .context("successor id")?
+                .to_string(),
+        );
+    }
+    let (status, view) = ctx
+        .get(&ctx.human, &format!("/v1/instances/{}", resumed[0]))
+        .await?;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(
+        view["creatorOrigin"], "human",
+        "a resumed conversation is still the owner's: {view}"
+    );
+    let (status, view) = ctx
+        .get(&ctx.human, &format!("/v1/instances/{}", resumed[1]))
+        .await?;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(
+        view["creatorOrigin"], "agent",
+        "a resumed worker is still its Agent's, though a human pressed Resume: {view}"
+    );
+
+    ctx.activity(&resumed[0], "working").await?;
+    let (status, glance) = ctx.get(&ctx.human, "/v1/owner/glance").await?;
+    assert_eq!(status, 200, "{glance}");
+    let listed = glance["working"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["instanceId"].as_str() == Some(resumed[0].as_str()));
+    assert!(listed, "the resumed conversation is in ⑥: {glance}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_the_owners_own_human_device_may_read_the_glance() -> Result<()> {
     let ctx = Ctx::spawn().await?;

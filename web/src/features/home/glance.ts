@@ -4,6 +4,7 @@ import type { Task } from "../../types/generated";
 import { resolveMain } from "../../lib/store";
 import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { liveChildParents, rank } from "../mobile/homeRows";
+import { dispatchedChild } from "../../lib/dispatched";
 
 /**
  * The ① count row (home.md §5.2). Everything here is pure so the phone head,
@@ -28,11 +29,10 @@ export type GlanceSource = {
 };
 
 /**
- * Top-level sessions only. `/sessions` lists these (SessionList drops
- * `parent != null`, and its caption says 「子 agent 不在此列」), so its ① count
- * must use the same set; `/m`'s ledger includes children and counts them.
+ * The rows the unfiltered `/sessions` board lists: every session except the
+ * ones an Agent dispatched (`dispatchedChild`); a resume stays on the board.
  */
-export const TOP_LEVEL_WORKING = (instance: Instance): boolean => instance.parent == null;
+export const TOP_LEVEL_WORKING = (instance: Instance): boolean => !dispatchedChild(instance);
 
 export type GlanceCounts = {
   /** §5.1 N = A (interactions really waiting on the owner) + B (owner-blocked tasks with no such interaction). */

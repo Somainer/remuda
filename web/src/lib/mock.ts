@@ -1266,6 +1266,11 @@ export function mockResume(instanceId: Id, mode: ResumeMode = "structured"): Res
     driver === "claude-print" ? printCapabilities() : mockAgentPtyCaps(parent.kind, driver);
   child.nativeRef = { ...parent.nativeRef };
   child.parent = { instanceId, runId: id("run_"), commandId: id("cmd_") };
+  // The Hub's shape: the resumed session is both parent and `resumedFrom`, and
+  // the creator stamp is the chain root's (r4 item 2) — a resume is not a
+  // dispatched child.
+  child.resumedFrom = instanceId;
+  child.creatorOrigin = parent.creatorOrigin ?? "human";
   child.activeRunIds = [];
   child.updatedAt = now();
   instances.unshift(child);

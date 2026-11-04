@@ -2807,6 +2807,11 @@ export interface components {
             readonly chapterCause?: string | null;
             connectivity: string;
             createdAt?: string;
+            /**
+             * @description Origin of the device that created the chain ROOT (home.md §5.3): `human`, `bot`, `agent` or `hub`, or the upgrade backfill's `legacy`. A resume or continuation inherits its predecessor's stamp, so `agent` means dispatched by an Agent and a parent alone does not. Absent only on an unclassified pre-upgrade row.
+             * @enum {string}
+             */
+            readonly creatorOrigin?: "human" | "bot" | "agent" | "hub" | "legacy";
             cwd?: string | null;
             delegation?: string | null;
             driver: string;

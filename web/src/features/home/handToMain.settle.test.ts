@@ -28,11 +28,18 @@ function fakeStore(options: {
     return options.sendResult ?? true;
   });
   const reconcileSend = vi.fn(async () => options.reconcile ?? "unknown");
+  let subscribers = 0;
+  let announce: () => void = () => undefined;
+  const subscribed = new Promise<void>((resolve) => {
+    announce = resolve;
+  });
   const store: HandOffStore = {
     send,
     bubbles: () => bubbles,
     subscribe: (listener) => {
       listeners.add(listener);
+      subscribers += 1;
+      announce();
       return () => listeners.delete(listener);
     },
     reconcileSend,
@@ -41,6 +48,9 @@ function fakeStore(options: {
     store,
     send,
     reconcileSend,
+    /** Resolves once the hand-off has subscribed to the store. */
+    subscribed,
+    subscriberCount: () => subscribers,
     replace(next: LocalBubble) {
       bubbles = bubbles.map((row) => (row.clientRequestId === next.clientRequestId ? next : row));
       emit();
@@ -114,6 +124,10 @@ describe("交给 Main settles the command before reporting it", () => {
     const first = bubble({ state: "queued", outboxState: "pending" });
     const fake = fakeStore({ push: () => first });
     const pending = handToMain(fake.store, "ins_main", "quote", 1000);
+    // The event lands only AFTER the hand-off subscribed: this exercises the
+    // wait/re-check branch, not the immediate one.
+    await fake.subscribed;
+    expect(fake.subscriberCount()).toBe(1);
     fake.replace({ ...first, state: "accepted", outboxState: "sent" });
     await expect(pending).resolves.toMatchObject({ kind: "accepted" });
   });

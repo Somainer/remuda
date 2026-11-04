@@ -7,20 +7,30 @@
 //!    even under `-n`). A syntax error is reported as `syntax` and nothing
 //!    executes;
 //! 2. runs it under an outer `sh` ([`OUTER`]) in the lineage's workspace
-//!    (and cwd) on this host, under the mandatory timeout. The outer shell is
-//!    contained so that every process the check starts can be found and
-//!    killed, `setsid`, a double fork and `nohup … &` included. In the order
-//!    tried: a cgroup v2 leaf when the Node's own cgroup is delegated and
-//!    writable and the outer shell is verified to have joined it (one
-//!    `cgroup.kill`; see [`contain`] for the layout rules), and on Linux
-//!    always a child subreaper
-//!    (`PR_SET_CHILD_SUBREAPER` on the outer shell, so every orphan below it is
-//!    reparented to it; the Node SIGKILLs every live descendant, re-walking
-//!    `/proc` until a walk finds none). On a non-Linux Node only the process
-//!    group is killed, and a check that leaves it can outlive the report.
-//!    The sweep runs on the timeout and after the check exits: a check
-//!    decides, it does not start services, and on Linux no process it
-//!    started outlives the report;
+//!    (and cwd) on this host, under the mandatory timeout, and when it ends
+//!    (its exit or the timeout) kills what it started before the report.
+//!    Containment is cleanup, not a security boundary: a check runs with the
+//!    authority of whoever was admitted to run it (main-agent.md §11.2), so
+//!    a process that outlives it gains nothing that check did not have. What
+//!    applies, recorded on the run as its `containment` label (see
+//!    [`contain`]):
+//!    * `cgroup`: the outer shell was verified to be in a cgroup v2 leaf
+//!      (the Node's own cgroup delegated and writable). `cgroup.kill` ends
+//!      every process of the check, whatever it did;
+//!    * `subreaper` (Linux otherwise): the outer shell is a child subreaper
+//!      (`PR_SET_CHILD_SUBREAPER`), so every orphan below it, `setsid`, a
+//!      double fork and `nohup … &` included, is reparented to it. Until two
+//!      consecutive walks of `/proc` find nothing, the Node SIGKILLs every
+//!      live descendant of it and every process of this user carrying the
+//!      check's marker (`REMUDA_WAKE_RUN=<runId>.<nonce>` in its
+//!      environment); then the recorded process group, then, once the outer
+//!      shell is reaped, the group and the marked processes again.
+//!      **Residual limit:** a check that deliberately kills its supervisor
+//!      (the outer shell, `kill -9 $PPID`) AND detaches a process that also
+//!      leaves the process group and clears its environment (`env -i setsid
+//!      …`) is out of every reach, and can outlive the report;
+//!    * `process-group` (other Unix): only the outer shell's process group
+//!      is killed; a check that leaves its group can outlive the report.
 //! 3. keeps at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] of stdout (the rest is
 //!    read and dropped, so the check never blocks on a full pipe) and never
 //!    reads stderr: the report carries only an exit summary.
@@ -383,6 +393,55 @@ fn owned_by(proc_dir: &Path, uid: u32) -> bool {
     std::fs::metadata(proc_dir).is_ok_and(|meta| meta.uid() == uid)
 }
 
+/// The environment variable that marks every process of one check.
+const MARKER_VAR: &str = "REMUDA_WAKE_RUN";
+
+/// This user's live processes (other than the Node) whose environment holds
+/// `REMUDA_WAKE_RUN=<marker>`: a check's processes, however they detached,
+/// unless they cleared their own environment.
+#[cfg(target_os = "linux")]
+fn live_marked(marker: &str) -> Vec<i32> {
+    let uid = nix::unistd::getuid().as_raw();
+    let own = i32::try_from(std::process::id()).unwrap_or(-1);
+    let needle = format!("{MARKER_VAR}={marker}").into_bytes();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == own || !owned_by(&entry.path(), uid) {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        if !environ
+            .split(|byte| *byte == 0)
+            .any(|var| var == needle.as_slice())
+        {
+            continue;
+        }
+        let zombie = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+            })
+            .unwrap_or(true);
+        if !zombie {
+            found.push(pid);
+        }
+    }
+    found
+}
+
 /// The pids in a cgroup leaf.
 fn leaf_members(containment: &Containment) -> Vec<i32> {
     containment
@@ -472,7 +531,7 @@ impl Sweep {
 /// orphan, so none is out of its reach). The outer shell itself is left alive
 /// for its release: were it killed first, its orphans would go to init, out
 /// of the walk's reach. Elsewhere: the process group.
-async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>) {
+async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>, marker: &str) {
     if let Some(leaf) = &containment.leaf {
         let _ = std::fs::write(leaf.dir.join("cgroup.kill"), "1");
     }
@@ -484,6 +543,7 @@ async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>)
         sweep
             .until_stable(|| {
                 let mut live = leaf_members(containment);
+                live.extend(live_marked(marker));
                 if let Some(outer) = outer {
                     live.retain(|pid| *pid != outer);
                     live.extend(live_descendants(outer.unsigned_abs()));
@@ -493,20 +553,26 @@ async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>)
             .await;
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (sweep, containment);
+    let _ = (sweep, containment, marker);
 }
 
 /// After the outer shell is reaped: one more sweep, so anything reparented
 /// in its exit window is killed before the report. The outer shell's process
 /// group (its pid) is walked: a group's id stays reserved while any member
 /// lives, and only this user's processes are taken.
-async fn sweep_after_reap(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>) {
+async fn sweep_after_reap(
+    sweep: &mut Sweep,
+    containment: &Containment,
+    outer: Option<u32>,
+    marker: &str,
+) {
     #[cfg(target_os = "linux")]
     {
         let group = outer.and_then(|pid| i32::try_from(pid).ok());
         sweep
             .until_stable(|| {
                 let mut live = leaf_members(containment);
+                live.extend(live_marked(marker));
                 if let Some(group) = group {
                     live.extend(live_group_members(group));
                 }
@@ -515,7 +581,7 @@ async fn sweep_after_reap(sweep: &mut Sweep, containment: &Containment, outer: O
             .await;
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (sweep, containment, outer);
+    let _ = (sweep, containment, outer, marker);
 }
 
 /// Remove a cgroup leaf once nothing is left in it.
@@ -540,8 +606,14 @@ pub(crate) async fn run_check(
     cwd: &Path,
     env: &BTreeMap<String, String>,
     timeout: Duration,
+    marker: &str,
 ) -> CheckRun {
     use tokio::io::AsyncBufReadExt;
+    // r3: every process of the check inherits the marker unless it clears its
+    // own environment; the sweeps find detached ones by it.
+    let mut env = env.clone();
+    env.insert(MARKER_VAR.to_owned(), marker.to_owned());
+    let env = &env;
     match parses(command, cwd, env).await {
         Ok(true) => {}
         Ok(false) => {
@@ -601,16 +673,18 @@ pub(crate) async fn run_check(
     };
     let waited = tokio::time::timeout(timeout, reported).await;
     let mut swept = Sweep::new();
-    sweep(&mut swept, &containment, outer).await;
-    // Released, the outer shell exits; it is killed if it does not.
+    sweep(&mut swept, &containment, outer, marker).await;
+    // Released, the outer shell exits, and its whole recorded process group
+    // goes with it (r3: on Linux too); the shell is killed if it lingers.
     drop(release);
+    kill_group(outer);
     if tokio::time::timeout(OUTER_EXIT_GRACE, child.wait())
         .await
         .is_err()
     {
         let _ = child.kill().await;
     }
-    sweep_after_reap(&mut swept, &containment, outer).await;
+    sweep_after_reap(&mut swept, &containment, outer, marker).await;
     remove_leaf(&containment);
     let (stdout, cut) = match reader {
         Some(reader) => match tokio::time::timeout(STDOUT_GRACE, reader).await {
@@ -694,11 +768,14 @@ impl DevNode {
         let run = match place {
             Some((_, cwd)) => {
                 let env = check_env(&node_env(), &request.env);
+                // Unique per call, even were the Hub to ask twice for a run.
+                let marker = format!("{}.{}", request.run_id, uuid::Uuid::now_v7().simple());
                 run_check(
                     &request.command,
                     &cwd,
                     &env,
                     Duration::from_secs(request.timeout_secs),
+                    &marker,
                 )
                 .await
             }
@@ -736,7 +813,8 @@ mod tests {
     }
 
     async fn run(dir: &Path, command: &str, secs: u64) -> CheckRun {
-        run_check(command, dir, &env(), Duration::from_secs(secs)).await
+        let marker = format!("test.{}", uuid::Uuid::now_v7().simple());
+        run_check(command, dir, &env(), Duration::from_secs(secs), &marker).await
     }
 
     /// Whether `pid` is still a live (not zombie) process.
@@ -979,6 +1057,25 @@ mod tests {
         let left = survivors(dir.path());
         reap_survivors(dir.path());
         assert!(left.is_empty(), "{checked:?} left {left:?}");
+    }
+
+    /// r3: a detached process orphaned by a check that killed its
+    /// supervisor is in no tree and no group the Node knows; it carries the
+    /// check's marker, and the marker sweep kills it.
+    #[tokio::test]
+    async fn the_marker_sweep_kills_what_a_supervisor_killer_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = run(
+            dir.path(),
+            "setsid sleep 600 & echo $! > f; (setsid sh -c 'sleep 600 &') ; kill -9 $PPID; sleep 600",
+            30,
+        )
+        .await;
+        let left = survivors(dir.path());
+        reap_survivors(dir.path());
+        assert!(left.is_empty(), "{checked:?} left {left:?}");
+        // The marker only matches its own check's processes.
+        assert!(live_marked("never-issued").is_empty());
     }
 
     /// r3: a fork in flight when the check exits (the setsid child has not

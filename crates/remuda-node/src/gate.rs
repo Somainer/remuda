@@ -77,6 +77,8 @@ pub fn is_long_gate_method(method: &str) -> bool {
 #[must_use]
 pub fn is_long_carrier_method(method: &str) -> bool {
     is_long_gate_method(method)
+        // A wake-up check runs for up to its timeout (an hour at most).
+        || crate::wake_check::is_wake_check_method(method)
         || crate::worker::is_worker_method(method)
         || method == "instance.close"
         || crate::worktree::is_worktree_method(method)

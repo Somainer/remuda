@@ -363,11 +363,11 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 **范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义：
 
 - **Main 子树**：`address-owner` 持有者血缘的当前章节（没有现行章节时取最近一版）所在的 `lineage_id` 及以此起点的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。
-- **owner 亲手开的会话（hand-opened）**：由 **owner 自己的 Human 设备**创建的会话。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体。判定看会话本身或其恢复链的**根**：根是 Human 创建的根会话，或该血缘的第一章 / `spec.resumedFrom` 起点是这样一个根，才算 hand-opened。因此：
-  - Bot 创建的根会话不算（除非将来的文档另行规定）；
-  - 监督进程重启的 worker、自动续跑的继任章节不算——它们的血缘根是 Agent 派发的 worker；
-  - 没有创建戳的行不算（升级前的旧行、`ensure_instance` 造出的占位行）。
-- **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
+- **owner 亲手开的会话（hand-opened）**：**一条规则**——会话本身或其恢复/续跑链的**根**（该链第 1 章）是一个**真根**（没有 `parentInstanceId`、没有 `resumedFrom`，`lineage_id` 为空或等于自身），并且这个真根是 owner 自己的 **Human 设备**创建的。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体；升级前的旧行由打开数据库时的幂等回填补齐：有 Agent 派发审计行或 `spec.parentInstanceId` 的判为 `agent`；血缘 `origin_spec_ref.seatedOrigin` 是 Human 的判为 `human`；剩下的、没有创建者证据的真根判为 `legacy`，按 hand-opened 对待。链的其余章节（`resumedFrom`，以及同一血缘 `generation > 1` 的续跑章节，第 2 章、第 3 章……）跟随根进入范围；续跑继任行自身也继承并写入根的 `creator_origin`。由此：
+  - **Bot 创建的根不算**（包括 owner 后来用 Human 设备重新拉起的 Bot 会话——它的链根仍是 Bot 会话，不是一个真根）；
+  - 监督进程重启的 worker、自动续跑的继任章节不算——它们的链根是 Agent 派发的 worker；
+  - 没有创建戳、也没有可回填证据的行不算。
+- **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘（子会话带的是 `parentInstanceId`，不是恢复/续跑链）。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
 
 **各段计数。** 计数分两种范围，**`needYou` 不分范围**：
 - `needYou`（§5.1 N）= **所有** owner 能看到的 `state=pending` 且截止时间未过的交互数 A（与 ④ 的标题、OS 角标同一来源：`/v1/interactions` 合并页），加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计；去重覆盖整个 fleet）。只有 `waiting`/`working` 的**行**按上面的 owner 范围收窄。§5.1 要求 ①、④ 标题和角标是同一个定义，所以三者同数；一条落在私有血缘上的待办会计入 ① 和 ④，但不会出现在 glance 的行里。

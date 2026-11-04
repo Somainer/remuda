@@ -451,6 +451,7 @@ pub mod store_test_support {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         })
     }
 
@@ -481,6 +482,7 @@ pub mod store_test_support {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         }
     }
 

@@ -262,26 +262,41 @@ impl Store {
                 .ok();
             let main_lineage = main.as_ref().map(|(lineage, _)| lineage.clone());
             // §5.3 scope: Main's lineage subtree, plus the sessions the owner
-            // opened by hand. A hand-opened session is one with no Agent
-            // creator — the Hub stamps the creator instance as
-            // `spec.parentInstanceId`, so a root has none — or an
-            // operator-only resume (`spec.resumedFrom`; an Agent may never
-            // resume). The subtree is walked from Main's lineage chapters; a
-            // hand-opened session is in scope by itself, never through its own
-            // dispatched children (those are that session's private lineage).
+            // opened by hand. "Hand-opened" is defined from the Hub-stamped
+            // creator (`instances.creator_origin`, written from the
+            // authenticated device at create): the instance — or the ROOT of
+            // its resume/continuation chain — was created by a Human device.
+            // That excludes, by construction: Bot-created roots (creator
+            // `bot`), supervisor respawns and auto-continued successors whose
+            // lineage root is an Agent-dispatched worker, and rows with no
+            // stamp at all (pre-upgrade rows, `ensure_instance` phantoms). A
+            // hand-opened session never drags in the children it dispatched.
             let mut scope_stmt = tx.prepare(
-                "WITH RECURSIVE main_scope(id) AS (
-                     SELECT id FROM instances WHERE COALESCE(lineage_id, id) = ?1
-                     UNION
-                     SELECT i.id FROM instances i
-                       JOIN main_scope s
-                         ON json_extract(i.spec_json, '$.parentInstanceId') = s.id
-                 )
+                "WITH RECURSIVE
+                     main_scope(id) AS (
+                         SELECT id FROM instances WHERE COALESCE(lineage_id, id) = ?1
+                         UNION
+                         SELECT i.id FROM instances i
+                           JOIN main_scope s
+                             ON json_extract(i.spec_json, '$.parentInstanceId') = s.id
+                     ),
+                     hand(id) AS (
+                         -- A root the owner's own device created.
+                         SELECT id FROM instances
+                          WHERE creator_origin = 'human'
+                            AND json_extract(spec_json, '$.parentInstanceId') IS NULL
+                         UNION
+                         -- A continuation chapter of a hand-opened lineage.
+                         SELECT i.id FROM instances i
+                           JOIN hand h ON i.lineage_id = h.id AND i.generation > 1
+                         UNION
+                         -- A plain D-026 resume of a hand-opened session.
+                         SELECT i.id FROM instances i
+                           JOIN hand h ON json_extract(i.spec_json, '$.resumedFrom') = h.id
+                     )
                  SELECT id FROM main_scope
                  UNION
-                 SELECT id FROM instances
-                  WHERE json_extract(spec_json, '$.parentInstanceId') IS NULL
-                     OR json_extract(spec_json, '$.resumedFrom') IS NOT NULL",
+                 SELECT id FROM hand",
             )?;
             let scope: Vec<String> = scope_stmt
                 .query_map(params![main_lineage], |row| row.get::<_, String>(0))?
@@ -1006,6 +1021,21 @@ mod tests {
                 .ensure_instance(host.clone(), id.clone())
                 .await
                 .unwrap();
+            // A hand-opened root (§5.3): the owner glance lists only rows the
+            // Hub stamped as Human-created.
+            store
+                .run_named("seed_working", {
+                    let id = id.clone();
+                    move |conn| {
+                        conn.execute(
+                            "UPDATE instances SET creator_origin = 'human' WHERE id = ?1",
+                            params![id],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
             store
                 .append_journal(
                     host.clone(),
@@ -1087,6 +1117,105 @@ mod tests {
         let (kind, question) = crate::digest::interaction_question(&pending.record);
         assert_eq!(kind, "approval");
         assert_eq!(question, "echo e2e");
+    }
+
+    /// §5.3: hand-opened is defined from the Hub-stamped creator — the row (or
+    /// the ROOT of its resume/continuation chain) was created by a Human
+    /// device. Bot roots, agent-lineage successors and stamp-less rows are out.
+    #[tokio::test]
+    async fn hand_opened_follows_the_root_creator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, host) = crate::store_test_support::open_with_host(dir.path(), "glance-hand")
+            .await
+            .unwrap();
+        let seeds: Vec<(&str, Option<&str>, Value, &str, i64)> = vec![
+            (
+                "ins.human_root",
+                Some("human"),
+                json!({}),
+                "ins.human_root",
+                1,
+            ),
+            ("ins.bot_root", Some("bot"), json!({}), "ins.bot_root", 1),
+            (
+                "ins.human_root.child",
+                Some("agent"),
+                json!({ "parentInstanceId": "ins.human_root" }),
+                "ins.human_root.child",
+                1,
+            ),
+            (
+                "ins.human_root.resumed",
+                Some("human"),
+                json!({ "parentInstanceId": "ins.human_root",
+                        "resumedFrom": "ins.human_root" }),
+                "ins.human_root.resumed",
+                1,
+            ),
+            ("ins.phantom", None, json!({}), "ins.phantom", 1),
+            (
+                "ins.worker_root",
+                Some("agent"),
+                json!({}),
+                "ins.worker_root",
+                1,
+            ),
+            (
+                // supervisor respawn / auto-continued successor of an
+                // Agent-dispatched worker: stamped Human by the seating, but
+                // its lineage root is an Agent-created worker.
+                "ins.worker_root.successor",
+                Some("human"),
+                json!({ "parentInstanceId": "ins.worker_root",
+                        "resumedFrom": "ins.worker_root" }),
+                "ins.worker_root",
+                2,
+            ),
+        ];
+        for (id, creator, spec, lineage, generation) in seeds {
+            store
+                .ensure_instance(host.clone(), id.to_string())
+                .await
+                .unwrap();
+            store
+                .run_named("seed_hand", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET creator_origin = ?2, spec_json = ?3,
+                                lineage_id = ?4, generation = ?5
+                          WHERE id = ?1",
+                        params![id, creator, spec.to_string(), lineage, generation],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let now = OffsetDateTime::now_utc();
+        let day_start = crate::config::rfc3339(local_day_start(now, 0));
+        let now_str = crate::config::rfc3339(now);
+        let snapshot = store
+            .owner_glance_snapshot(day_start, now_str)
+            .await
+            .unwrap();
+        let scope: std::collections::BTreeSet<&str> =
+            snapshot.scope.iter().map(String::as_str).collect();
+        assert!(scope.contains("ins.human_root"), "a Human-created root");
+        assert!(
+            scope.contains("ins.human_root.resumed"),
+            "a resume whose root is hand-opened"
+        );
+        assert!(!scope.contains("ins.bot_root"), "a Bot-created root");
+        assert!(
+            !scope.contains("ins.human_root.child"),
+            "a hand-opened session's dispatched child is its private lineage"
+        );
+        assert!(!scope.contains("ins.phantom"), "a stamp-less row");
+        assert!(
+            !scope.contains("ins.worker_root.successor"),
+            "a successor whose root is an Agent-created worker"
+        );
+        store.close().await;
     }
 
     /// §5.3 今日完成: the same instant is yesterday for one offset and today

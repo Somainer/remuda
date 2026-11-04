@@ -1720,6 +1720,7 @@ async fn respawn_scoped(
         restart: None,
         seated_by: None,
         auto_continue: old.auto_continue,
+        creator_origin: Some(crate::agent_scope::origin_wire(device).to_string()),
     };
     let (respawn_initiator, respawn_device_id) = initiator_and_device(state, device).await?;
     let (instance, _command) = crate::placement::spawn_on_host(
@@ -1903,6 +1904,7 @@ async fn relaunch_instance(
         restart: None,
         seated_by: None,
         auto_continue: previous_auto_continue,
+        creator_origin: Some(crate::agent_scope::origin_wire(&device).to_string()),
     };
     // D-057 §7.1: a respawn the Hub authors on the caller's behalf carries
     // that caller's initiator and device id.

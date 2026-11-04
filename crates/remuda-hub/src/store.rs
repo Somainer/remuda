@@ -1175,6 +1175,13 @@ pub struct InstanceDelegation {
     /// cb-usage-resume (§11.6): continue once after a subscription usage
     /// limit resets.
     pub auto_continue: bool,
+    /// home-glance-d060 (home.md §5.3): the authenticated origin of the device
+    /// that CREATED this row — the wire `InputOrigin` (`human` / `bot` /
+    /// `agent` / `hub`). The owner glance's "hand-opened" rule reads it; rows
+    /// written without it (pre-upgrade rows, `ensure_instance` phantoms,
+    /// lineage successors) hold `None` and are never hand-opened on their own
+    /// (a successor still joins through its lineage's first chapter).
+    pub creator_origin: Option<String>,
 }
 
 /// Who seated a continuity lineage (D-057 §6.3.1, OA5): the authenticating
@@ -1201,6 +1208,7 @@ impl Default for InstanceDelegation {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         }
     }
 }
@@ -1874,6 +1882,7 @@ fn continuation_resume_tx(
             .and_then(|value| serde_json::from_value(value).ok()),
         seated_by: None,
         auto_continue: current.auto_continue,
+        creator_origin: None,
     };
     // The predecessor is fenced inside this same transaction, so the copied
     // seat grants do not collide with it.
@@ -5307,11 +5316,11 @@ impl Store {
                      title, journal_id, durable_seq, spec_json, created_at, updated_at,
                      role, scope_json, grants_json, task_id,
                      lineage_id, generation, chapter_cause, fenced_at, restart_json,
-                     auto_continue)
+                     auto_continue, creator_origin)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                          ?7, ?8, 0, ?9, ?10, ?10,
                          ?11, ?12, ?13, ?14,
-                         ?1, 1, NULL, NULL, ?15, ?16)",
+                         ?1, 1, NULL, NULL, ?15, ?16, ?17)",
                 params![
                     instance_id,
                     host_id,
@@ -5329,6 +5338,7 @@ impl Store {
                     delegation.task_id,
                     restart_json,
                     delegation.auto_continue,
+                    delegation.creator_origin,
                 ],
             )?;
             // D-057 §5: a lineage row exists for every continuity instance —
@@ -8292,11 +8302,14 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
     // home-glance-d060: `turn_end_at` (the local-day 今日完成 stamp, written in
-    // the same transaction as `turn_end_seq`) is added UNCONDITIONALLY, like
-    // `ended_at`. It first appeared after the seen rung (5) was already at the
-    // top of an existing database: a rung-only migration would never run
-    // there, and every settled-turn append would fail with "no such column".
+    // the same transaction as `turn_end_seq`) and `creator_origin` (the
+    // Hub-stamped origin of the device that created the instance, home.md
+    // §5.3's hand-opened rule) are added UNCONDITIONALLY, like `ended_at`.
+    // Both first appeared after the seen rung (5) was already at the top of an
+    // existing database: a rung-only migration would never run there, and
+    // every settled-turn append would fail with "no such column".
     ensure_column(&conn, "instances", "turn_end_at", "TEXT")?;
+    ensure_column(&conn, "instances", "creator_origin", "TEXT")?;
     // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
     // backfills run ONCE per schema PRAGMA marker, not on every Store::open
     // for every evidence-less terminal row (that set only grows). This is the

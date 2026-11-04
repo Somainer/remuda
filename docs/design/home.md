@@ -360,14 +360,17 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - 当日完成数；
 - 每个会话一句确定性的 headline，取自 D-060 的 worker digest 字段，不由 Hub 调模型生成。
 
-**范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义，不新增来源：
+**范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义：
 
 - **Main 子树**：`address-owner` 持有者血缘的当前章节（没有现行章节时取最近一版）所在的 `lineage_id` 及以此起点的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。
-- **owner 亲手开的会话（hand-opened）**：没有 Agent 创建者的会话。Hub 在创建时把创建者实例写进 `spec.parentInstanceId`，所以「没有 `parentInstanceId`」就是 Human/Bot/操作员直接开的根会话；D-026 恢复由操作员发起（`require_operator`），恢复出来的会话带 `spec.resumedFrom`，也算 hand-opened。
+- **owner 亲手开的会话（hand-opened）**：由 **owner 自己的 Human 设备**创建的会话。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体。判定看会话本身或其恢复链的**根**：根是 Human 创建的根会话，或该血缘的第一章 / `spec.resumedFrom` 起点是这样一个根，才算 hand-opened。因此：
+  - Bot 创建的根会话不算（除非将来的文档另行规定）；
+  - 监督进程重启的 worker、自动续跑的继任章节不算——它们的血缘根是 Agent 派发的 worker；
+  - 没有创建戳的行不算（升级前的旧行、`ensure_instance` 造出的占位行）。
 - **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
 
-**各段计数。** 与首页推导同口径，由 Hub 在范围上算：
-- `needYou`（§5.1 N）= 范围内 `state=pending` 且截止时间未过的交互数 A，加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计）；
+**各段计数。** 计数分两种范围，**`needYou` 不分范围**：
+- `needYou`（§5.1 N）= **所有** owner 能看到的 `state=pending` 且截止时间未过的交互数 A（与 ④ 的标题、OS 角标同一来源：`/v1/interactions` 合并页），加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计；去重覆盖整个 fleet）。只有 `waiting`/`working` 的**行**按上面的 owner 范围收窄。§5.1 要求 ①、④ 标题和角标是同一个定义，所以三者同数；一条落在私有血缘上的待办会计入 ① 和 ④，但不会出现在 glance 的行里。
 - `doneUnseen`（§5.2 ◉）= 范围内按 §3.1 排在第 2 档（idle、owner 未看、最近回合未失败）的会话数；Main 血缘内只有 `resolveMain` 指向的现行章节计入（§7）；
 - `working`（§5.2 ●）= 范围内按 §3.1 排在第 3 档（live 且 activity 为 working/draining，或 activity 未分类）的会话数，子会话也计；
 - `doneToday`（§5.2 今日完成）= 范围内「最近一次结算的根回合结束时间」（`instances.turn_end_at`，与 ◉ 的 `turn_end_seq` 同一事务写入）落在 owner 本地日内的会话数。选根回合而不选任务，因为任务行没有完成时间戳。客户端用 `tzOffsetMinutes`（`-Date().getTimezoneOffset()`，UTC 以东分钟数，服务端夹到 ±14 h）告诉 Hub 本地日从哪开始。

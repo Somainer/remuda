@@ -191,7 +191,7 @@ export function SessionList({
     .filter((instance) => uiMode(instance) === "tty-attachable")
     .map((instance) => instance.id)
     .join(",");
-  // Stable key for the rows actually rendered; drives the phrase/screen poll.
+  // Stable key for the tty rows actually rendered; drives the screen poll.
   const rowKey = filtered.map((instance) => instance.id).join(",");
 
   // Switching Space drops host/workspace conditions that the new fixed scope
@@ -323,7 +323,6 @@ export function SessionList({
   useEffect(() => {
     if (variant !== "full") return;
     const ttyIds = ptyKey ? (ptyKey.split(",") as Id[]) : [];
-    const rowIds = rowKey ? (rowKey.split(",") as Id[]) : [];
     const onList = location.pathname === "/sessions";
     const visible = visibleRows.current;
     // Caller order is list order; lift on-screen rows ahead of the 4-slot
@@ -332,7 +331,9 @@ export function SessionList({
       [...ids].sort((a, b) => Number(visible.has(b)) - Number(visible.has(a)));
     const tick = () => {
       if (onList && ttyIds.length) hubStore.refreshScreens(visibleFirst(ttyIds));
-      void hubStore.hydrateRowSummaries(rowIds);
+      // home-glance-d060 §5.3: the row phrase is the owner glance's one
+      // deterministic headline; the per-row journal read is gone (the poll's
+      // single /v1/owner/glance carries every headline).
     };
     tick();
     const timer = window.setInterval(tick, 2500);
@@ -773,7 +774,14 @@ export function SessionList({
               const worktree = workspace?.worktreeLabel ?? workspace?.label;
               const branch = workspace?.branch;
               const slot = slotById.get(instance.id) ?? 0;
-              const step = nextStep(instance, pending ?? null, screen, hubStore.summaryOf(instance.id));
+              // home-glance-d060: the body's phrase is the owner glance's one
+              // headline; a followed session's own summary is the fallback.
+              const step = nextStep(
+                instance,
+                pending ?? null,
+                screen,
+                hubStore.glanceHeadlineOf(instance.id) ?? hubStore.summaryOf(instance.id),
+              );
               const exit = exitLabel(instance);
               const sheetOpen = actionFor === instance.id;
               const stale = staleIds.has(instance.id);

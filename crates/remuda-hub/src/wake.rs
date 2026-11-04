@@ -7,14 +7,16 @@
 //!
 //! * **Rows (§11.1).** `wake_ups`: the lineage, a name unique in it (so an add
 //!   under the same name is idempotent), the trigger (`at`, `every`, `when`),
-//!   the reserved `check` (always NULL: the check is `cb-wake-check`'s), the
-//!   mode, the declared `notify`, the state, the next fire time, the missed
-//!   count and the creator. `wake_runs`: the wake-up, the scheduled time, the
-//!   state, start and end, the check's exit code (NULL), the inbox fact and
-//!   batch that carried it, a fresh run's child, and the occurrences missed
-//!   before it. Idempotent DDL, so `scripts/hub-backup.sh` carries them whole.
+//!   the optional check with its admission (cb-wake-check, below), the mode,
+//!   the declared `notify`, the state, the next fire time, the missed count,
+//!   the creator and the last real run. `wake_runs`: the wake-up, the
+//!   scheduled time, the state, start and end, the run's check (what it ran,
+//!   where, its state, exit code, summary and bounded stdout), the inbox fact
+//!   and batch that carried it, a fresh run's child, and the occurrences
+//!   missed before it. Idempotent DDL, so `scripts/hub-backup.sh` carries
+//!   them whole.
 //! * **The run state machine.** `queued` → `running` → `success`, `failed`
-//!   (or `skipped`, reserved for the check). A persistent run is `queued`
+//!   or `skipped` (its check exited 2). A persistent run is `queued`
 //!   while its `wake-due` fact waits in the inbox, `running` from the moment
 //!   its batch's forward intent is marked until the turn that batch started
 //!   ends; a fresh run is `running` from the moment the Hub starts creating
@@ -52,6 +54,18 @@
 //!   same admission (grants, scope, OA1, D-017) as any other, on the
 //!   chapter's host with the one-turn `claude-print` carrier. Its facts reach
 //!   the lineage through the parent edge like any child's.
+//! * **Checks (cb-wake-check, main-agent.md §11.2, §11.9).** A wake-up may
+//!   carry a shell command one Node runs before each run, under a mandatory
+//!   timeout. It is bounded and secret-linted at add time, placed on a host
+//!   in the lineage's scope where the lineage has a workspace, and admitted
+//!   on the OA1 axis (the owner's own add; an Agent on its own host while it
+//!   runs with its permission control off; otherwise the owner's one-shot
+//!   approval). A run waits for its check (`pending` while the host is
+//!   offline or the Node never received the call), is claimed `running`
+//!   before the Node is asked (`wake.check`), and routes by the answer: exit
+//!   0 runs it with the check's stdout as its quoted summary, exit 2 skips
+//!   it, anything else fails it with a `wake-failed` fact. The Node's report
+//!   is queued in `wake_check_reports` and applied with retried writes.
 //! * **Health.** `/healthz` reports the last tick and the delivery age, and
 //!   answers 503 once no tick has completed for [`STALE_AFTER_TICKS`] tick
 //!   periods.

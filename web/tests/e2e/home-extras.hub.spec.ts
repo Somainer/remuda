@@ -12,9 +12,8 @@ import { login } from "./hub-auth";
  *    and a tap fills the draft without sending;
  *  - 交给 Main: a worker's QUESTION card offers it in its ⋯ menu, the quote
  *    reaches Main's journal, and the interaction stays pending;
- *  - ②: the host strip renders for the seat's host (★ itself is unit-covered:
- *    the fake node registers ONE host, so the strip collapses to its summary
- *    and paints no chip at all).
+ *  - ②: ★ rides Main's host chip even in the all-online collapsed strip (the
+ *    fake node registers one host), and the spec checks the chip's host id.
  *
  * It seats the Hub's one address-owner Main, so it runs only on request:
  * HUB_E2E_MAIN_UI=1 (the same gate main-ui.hub.spec.ts uses). No millisecond
@@ -218,7 +217,7 @@ test.describe("home-main-extras", () => {
   test("/m 390: ⑩ line, sheet cancel, chips on focus, and 交给 Main", async ({ browser }) => {
     const { context, page } = await phonePage(browser);
     try {
-      const mainId = await seatMain(page, "hextras-main phone");
+      const mainId = await seatMain(page, "hextras-main phone hqueue-chips");
       const hostId = await fakeHost(page);
       const lineageId = await lineageOf(page, mainId);
       const wakeName = `hextras-${Date.now().toString(36)}`;
@@ -285,8 +284,8 @@ test.describe("home-main-extras", () => {
       await expect(chip).toContainText("谁在等我");
       await chip.click();
       await expect(input).toHaveValue("谁在等我");
-      // A second tap fills nothing new: the draft only keeps what was typed.
-      await expect(page.getByTestId("main-card-reply")).not.toContainText("echo: 谁在等我");
+      // The tap only filled the draft. Whether it sent is proved at the
+      // end from the recorded command POSTs (a page-level listener).
 
       // §6.4 交给 Main: a worker question quotes itself to Main, stays pending.
       const worker = await parkQuestion(page);
@@ -295,7 +294,10 @@ test.describe("home-main-extras", () => {
       // Main's own pending approval is pinned first and labelled.
       const pinned = page.locator('[data-testid="home-queue-card"][data-main-asking="1"]');
       await expect(pinned.first()).toContainText("Main 在问你");
-      // r2: Main never gets its own pinned question back.
+      // Main's seat was created with the `hqueue-chips` sentinel, so its own
+      // pending interaction is a QUESTION — the kind that would carry the ⋯.
+      // r2/r3: it must not, so this absence is the mainAsking fence's.
+      await expect(pinned.first()).toHaveAttribute("data-home-kind", "simple-question");
       await expect(pinned.first().getByTestId("home-card-more")).toHaveCount(0);
       const askCard = card(page, worker.interactionId);
       await expect(askCard).toBeVisible({ timeout: 20_000 });

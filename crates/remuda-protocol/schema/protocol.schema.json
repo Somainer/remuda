@@ -7770,6 +7770,11 @@
           "const": "context-threshold",
           "description": "Wire value `context-threshold`.",
           "type": "string"
+        },
+        {
+          "const": "wake-failed",
+          "description": "Wire value `wake-failed`.",
+          "type": "string"
         }
       ]
     },
@@ -22194,7 +22199,15 @@
       "description": "`POST /v1/lineages/{id}/wake-ups`.",
       "properties": {
         "check": {
-          "description": "Reserved for the optional check (main-agent.md §11.2); until it is\nbuilt, a request carrying one is refused with 422, code\n`WAKE_UNSUPPORTED`, reason `check-unsupported`."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeCheckRequest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The optional check (main-agent.md §11.2): a shell command a Node runs\nbefore each run. Admitted on the OA1 axis: an Agent adds one without\nthe owner's approval only on its own host while it runs with its\nharness's permission control off."
         },
         "mode": {
           "anyOf": [
@@ -22272,6 +22285,250 @@
         }
       },
       "type": "object"
+    },
+    "WakeCheck": {
+      "description": "A stored wake-up's check, and how it was admitted.",
+      "properties": {
+        "admission": {
+          "$ref": "#/$defs/WakeCheckAdmission",
+          "description": "`owner` (the owner added it), `own-host-bypass` (an Agent on its own\nhost, running with its harness's permission control off) or\n`approved` (the owner's one-shot approval)."
+        },
+        "approvalId": {
+          "description": "The approval that admitted it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "The shell command.",
+          "type": "string"
+        },
+        "hostId": {
+          "description": "The Node it runs on, fixed when it was added.",
+          "type": "string"
+        },
+        "timeoutSecs": {
+          "description": "The timeout in seconds.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command",
+        "hostId",
+        "timeoutSecs",
+        "admission"
+      ],
+      "type": "object"
+    },
+    "WakeCheckAdmission": {
+      "description": "WakeCheckAdmission wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "owner",
+          "description": "Wire value `owner`.",
+          "type": "string"
+        },
+        {
+          "const": "own-host-bypass",
+          "description": "Wire value `own-host-bypass`.",
+          "type": "string"
+        },
+        {
+          "const": "approved",
+          "description": "Wire value `approved`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeCheckOutcome": {
+      "description": "WakeCheckOutcome wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "exited",
+          "description": "Wire value `exited`.",
+          "type": "string"
+        },
+        {
+          "const": "timed-out",
+          "description": "Wire value `timed-out`.",
+          "type": "string"
+        },
+        {
+          "const": "syntax",
+          "description": "Wire value `syntax`.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Wire value `unavailable`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WakeCheckParams": {
+      "description": "`wake.check` params (Hub→Node).",
+      "properties": {
+        "command": {
+          "description": "The shell command (`sh -c`).",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "The directory inside that workspace (the lineage's cwd on that host).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Variables about the run, each named with [`WAKE_CHECK_ENV_PREFIX`];\nthe Node drops any other name.",
+          "type": "object"
+        },
+        "runId": {
+          "description": "The run the check decides.",
+          "type": "string"
+        },
+        "timeoutSecs": {
+          "description": "The timeout in seconds; the Node refuses 0 and anything over\n[`WAKE_CHECK_TIMEOUT_MAX_SECS`].",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspaceId": {
+          "description": "The workspace it runs in (the lineage's on that host); the Node's\nfirst workspace when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "command",
+        "timeoutSecs",
+        "env"
+      ],
+      "type": "object"
+    },
+    "WakeCheckRequest": {
+      "additionalProperties": false,
+      "description": "`check` on an add. Every field is optional on the wire so that a missing\none is refused with the Hub's own 400, not a body-parse error.",
+      "properties": {
+        "command": {
+          "description": "The shell command (`sh -c`), at most\n[`WAKE_CHECK_COMMAND_MAX_CHARS`] characters; required.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostId": {
+          "description": "The Node it runs on, a host in the lineage's scope. An Agent may omit\nit for its own host; the owner names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeoutSecs": {
+          "description": "The timeout in seconds,\n[`WAKE_CHECK_TIMEOUT_MIN_SECS`]..=[`WAKE_CHECK_TIMEOUT_MAX_SECS`];\nrequired, there is no default.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WakeCheckResult": {
+      "description": "`wake.check` result.",
+      "properties": {
+        "exitCode": {
+          "description": "The exit code, when it exited with one.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/WakeCheckOutcome",
+          "description": "`exited`, `timed-out` (the process group was killed), `syntax`\n(`sh -n` refused it; nothing ran) or `unavailable` (it could not\nstart)."
+        },
+        "runId": {
+          "description": "The run, echoed.",
+          "type": "string"
+        },
+        "signal": {
+          "description": "The signal that ended it, when one did.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stdout": {
+          "default": "",
+          "description": "Its stdout, at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] bytes (lossy\nUTF-8). Stderr is never kept.",
+          "type": "string"
+        },
+        "stdoutTruncated": {
+          "default": false,
+          "description": "The stdout was longer and was cut.",
+          "type": "boolean"
+        },
+        "summary": {
+          "description": "How it exited, in a few words; never its stderr.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId",
+        "outcome",
+        "stdout",
+        "stdoutTruncated",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "WakeCheckState": {
+      "description": "WakeCheckState wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Wire value `pending`.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Wire value `running`.",
+          "type": "string"
+        },
+        {
+          "const": "passed",
+          "description": "Wire value `passed`.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "Wire value `skipped`.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Wire value `failed`.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "Wire value `interrupted`.",
+          "type": "string"
+        }
+      ]
     },
     "WakeCreator": {
       "description": "Who added a wake-up.",
@@ -22406,8 +22663,19 @@
             "null"
           ]
         },
+        "check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeRunCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The run's check, when the wake-up has one."
+        },
         "checkExit": {
-          "description": "The optional check's exit code (main-agent.md §11.2); null until the\ncheck exists.",
+          "description": "The check's exit code (main-agent.md §11.2); null without a check,\nbefore it exits, and when it timed out, was refused by `sh -n` or\ncould not start.",
           "format": "int64",
           "type": [
             "integer",
@@ -22437,7 +22705,7 @@
           ]
         },
         "failureKind": {
-          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`.",
+          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`, `check-exit`, `check-timeout`, `check-syntax`,\n`check-unavailable`.",
           "type": [
             "string",
             "null"
@@ -22499,6 +22767,42 @@
         "state",
         "checkExit",
         "missedBefore"
+      ],
+      "type": "object"
+    },
+    "WakeRunCheck": {
+      "description": "One run's check.",
+      "properties": {
+        "hostId": {
+          "description": "The Node it ran on.",
+          "type": "string"
+        },
+        "output": {
+          "description": "Its stdout, at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] bytes. Untrusted\ndata.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputTruncated": {
+          "description": "The stdout was longer and was cut.",
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/WakeCheckState",
+          "description": "`pending` (waiting for its host), `running`, `passed` (exit 0),\n`skipped` (exit 2), `failed`, or `interrupted` (the Hub or the Node\nrestarted while it ran; never run again)."
+        },
+        "summary": {
+          "description": "How it exited, in a few words (`exit 1`, `timed out after 30 s`,\n`syntax error`); never its stderr.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "hostId"
       ],
       "type": "object"
     },
@@ -22588,7 +22892,15 @@
       "description": "One wake-up row.",
       "properties": {
         "check": {
-          "description": "Reserved for the optional check (main-agent.md §11.2); always absent."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The optional check (main-agent.md §11.2)."
         },
         "createdAt": {
           "description": "When it was added (UTC RFC3339).",
@@ -22600,6 +22912,13 @@
         },
         "lastFiredAt": {
           "description": "When its latest run fired.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastRunAt": {
+          "description": "When its latest real run fired: one without a check, or whose check\npassed. A skipped or failed check leaves it as it was.",
           "type": [
             "string",
             "null"

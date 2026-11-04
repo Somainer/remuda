@@ -10,10 +10,17 @@
 //!
 //! The text of a wake-up is the lineage's own words (or the owner's, for one
 //! the owner added); it is quoted to the lineage as a JSON string.
+//!
+//! A wake-up may carry a `check` (cb-wake-check, main-agent.md §11.2): a
+//! shell command one named Node runs, with a mandatory timeout, before each
+//! run. Exit 0 lets the run happen with the check's bounded stdout as its
+//! summary, exit 2 skips the run, anything else (the timeout included) fails
+//! it. The Hub asks the Node with [`METHOD_WAKE_CHECK`].
 
 use crate::{InboxFactKind, InputOrigin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Characters a wake-up name may hold (from `[A-Za-z0-9._:-]`, not starting
 /// with `wak_`: `rm` takes a name or an id in the URL).
@@ -29,6 +36,20 @@ pub const WAKE_MAX_SECS: i64 = 31_536_000;
 pub const WAKE_MAX_PER_LINEAGE: usize = 64;
 /// Runs `GET /v1/lineages/{id}/wake-ups` lists, newest first.
 pub const WAKE_RUNS_LISTED: usize = 50;
+/// Characters a check's command may hold.
+pub const WAKE_CHECK_COMMAND_MAX_CHARS: usize = 2000;
+/// Shortest check timeout, in seconds.
+pub const WAKE_CHECK_TIMEOUT_MIN_SECS: i64 = 1;
+/// Longest check timeout, in seconds (one hour).
+pub const WAKE_CHECK_TIMEOUT_MAX_SECS: i64 = 3600;
+/// Bytes of a check's stdout the Node keeps; the rest is read and dropped.
+pub const WAKE_CHECK_STDOUT_MAX_BYTES: usize = 4096;
+/// The prefix of every environment variable the Hub may pass to a check.
+pub const WAKE_CHECK_ENV_PREFIX: &str = "REMUDA_WAKE_";
+
+/// Hub→Node: run one wake-up check (`sh -n`, then the command under its
+/// timeout) and report how it exited.
+pub const METHOD_WAKE_CHECK: &str = "wake.check";
 
 wire_enum!(WakeMode, "8.4", {
     Persistent => "persistent",
@@ -103,6 +124,71 @@ impl WakeUpState {
             .find(|state| state.as_str() == raw)
     }
 }
+
+wire_enum!(WakeCheckAdmission, "8.4", {
+    Owner => "owner",
+    OwnHostBypass => "own-host-bypass",
+    Approved => "approved",
+});
+
+impl WakeCheckAdmission {
+    /// Wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::OwnHostBypass => "own-host-bypass",
+            Self::Approved => "approved",
+        }
+    }
+}
+
+wire_enum!(WakeCheckState, "8.4", {
+    Pending => "pending",
+    Running => "running",
+    Passed => "passed",
+    Skipped => "skipped",
+    Failed => "failed",
+    Interrupted => "interrupted",
+});
+
+impl WakeCheckState {
+    /// Every state, in declaration order.
+    pub const ALL: [WakeCheckState; 6] = [
+        Self::Pending,
+        Self::Running,
+        Self::Passed,
+        Self::Skipped,
+        Self::Failed,
+        Self::Interrupted,
+    ];
+
+    /// Wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Passed => "passed",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// Parse a wire spelling.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == raw)
+    }
+}
+
+wire_enum!(WakeCheckOutcome, "8.4", {
+    Exited => "exited",
+    TimedOut => "timed-out",
+    Syntax => "syntax",
+    Unavailable => "unavailable",
+});
 
 wire_enum!(WakeRunState, "8.4", {
     Queued => "queued",
@@ -224,16 +310,79 @@ pub struct WakeAddRequest {
     pub text: String,
     /// When it fires.
     pub trigger: WakeTrigger,
-    /// Reserved for the optional check (main-agent.md §11.2); until it is
-    /// built, a request carrying one is refused with 422, code
-    /// `WAKE_UNSUPPORTED`, reason `check-unsupported`.
+    /// The optional check (main-agent.md §11.2): a shell command a Node runs
+    /// before each run. Admitted on the OA1 axis: an Agent adds one without
+    /// the owner's approval only on its own host while it runs with its
+    /// harness's permission control off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check: Option<serde_json::Value>,
+    pub check: Option<WakeCheckRequest>,
     /// `persistent` (default) or `fresh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<WakeMode>,
     /// Which runs notify the owner; required, the Hub never picks.
     pub notify: WakeNotify,
+}
+
+/// `check` on an add. Every field is optional on the wire so that a missing
+/// one is refused with the Hub's own 400, not a body-parse error.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WakeCheckRequest {
+    /// The shell command (`sh -c`), at most
+    /// [`WAKE_CHECK_COMMAND_MAX_CHARS`] characters; required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The Node it runs on, a host in the lineage's scope. An Agent may omit
+    /// it for its own host; the owner names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// The timeout in seconds,
+    /// [`WAKE_CHECK_TIMEOUT_MIN_SECS`]..=[`WAKE_CHECK_TIMEOUT_MAX_SECS`];
+    /// required, there is no default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<i64>,
+}
+
+/// A stored wake-up's check, and how it was admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeCheck {
+    /// The shell command.
+    pub command: String,
+    /// The Node it runs on, fixed when it was added.
+    pub host_id: String,
+    /// The timeout in seconds.
+    pub timeout_secs: i64,
+    /// `owner` (the owner added it), `own-host-bypass` (an Agent on its own
+    /// host, running with its harness's permission control off) or
+    /// `approved` (the owner's one-shot approval).
+    pub admission: WakeCheckAdmission,
+    /// The approval that admitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+}
+
+/// One run's check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeRunCheck {
+    /// `pending` (waiting for its host), `running`, `passed` (exit 0),
+    /// `skipped` (exit 2), `failed`, or `interrupted` (the Hub or the Node
+    /// restarted while it ran; never run again).
+    pub state: WakeCheckState,
+    /// The Node it ran on.
+    pub host_id: String,
+    /// How it exited, in a few words (`exit 1`, `timed out after 30 s`,
+    /// `syntax error`); never its stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Its stdout, at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] bytes. Untrusted
+    /// data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The stdout was longer and was cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
 }
 
 /// Who added a wake-up.
@@ -261,9 +410,9 @@ pub struct WakeUp {
     pub text: String,
     /// When it fires (an `at` carries its resolved time).
     pub trigger: WakeTrigger,
-    /// Reserved for the optional check (main-agent.md §11.2); always absent.
+    /// The optional check (main-agent.md §11.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check: Option<serde_json::Value>,
+    pub check: Option<WakeCheck>,
     /// Delivery mode.
     pub mode: WakeMode,
     /// The declared notify policy.
@@ -285,6 +434,10 @@ pub struct WakeUp {
     /// When its latest run fired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fired_at: Option<String>,
+    /// When its latest real run fired: one without a check, or whose check
+    /// passed. A skipped or failed check leaves it as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
     /// Who added it.
     pub creator: WakeCreator,
 }
@@ -318,9 +471,13 @@ pub struct WakeRun {
     /// When it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
-    /// The optional check's exit code (main-agent.md §11.2); null until the
-    /// check exists.
+    /// The check's exit code (main-agent.md §11.2); null without a check,
+    /// before it exits, and when it timed out, was refused by `sh -n` or
+    /// could not start.
     pub check_exit: Option<i64>,
+    /// The run's check, when the wake-up has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<WakeRunCheck>,
     /// The `wake-due` inbox row it was delivered as (persistent mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fact_id: Option<i64>,
@@ -336,7 +493,8 @@ pub struct WakeRun {
     pub missed_before: i64,
     /// Why it failed: `not-received`, `not-delivered`, `delivery`,
     /// `turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,
-    /// `child-ended`.
+    /// `child-ended`, `check-exit`, `check-timeout`, `check-syntax`,
+    /// `check-unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<String>,
 }
@@ -371,6 +529,57 @@ pub struct WakeRemoved {
     pub wake_id: String,
     /// Its name.
     pub name: String,
+}
+
+/// `wake.check` params (Hub→Node).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeCheckParams {
+    /// The run the check decides.
+    pub run_id: String,
+    /// The shell command (`sh -c`).
+    pub command: String,
+    /// The timeout in seconds; the Node refuses 0 and anything over
+    /// [`WAKE_CHECK_TIMEOUT_MAX_SECS`].
+    pub timeout_secs: u64,
+    /// The workspace it runs in (the lineage's on that host); the Node's
+    /// first workspace when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// The directory inside that workspace (the lineage's cwd on that host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Variables about the run, each named with [`WAKE_CHECK_ENV_PREFIX`];
+    /// the Node drops any other name.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// `wake.check` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeCheckResult {
+    /// The run, echoed.
+    pub run_id: String,
+    /// `exited`, `timed-out` (the process group was killed), `syntax`
+    /// (`sh -n` refused it; nothing ran) or `unavailable` (it could not
+    /// start).
+    pub outcome: WakeCheckOutcome,
+    /// The exit code, when it exited with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The signal that ended it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Its stdout, at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] bytes (lossy
+    /// UTF-8). Stderr is never kept.
+    #[serde(default)]
+    pub stdout: String,
+    /// The stdout was longer and was cut.
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    /// How it exited, in a few words; never its stderr.
+    pub summary: String,
 }
 
 #[cfg(test)]
@@ -423,6 +632,38 @@ mod tests {
     }
 
     #[test]
+    fn a_check_request_takes_only_its_three_fields() {
+        let add: WakeAddRequest = serde_json::from_value(json!({
+            "text": "t", "trigger": {"kind": "every", "everySecs": 180}, "notify": "failure",
+            "check": {"command": "test -s queue", "hostId": "hst_1", "timeoutSecs": 30}
+        }))
+        .unwrap();
+        assert_eq!(
+            add.check,
+            Some(WakeCheckRequest {
+                command: Some("test -s queue".into()),
+                host_id: Some("hst_1".into()),
+                timeout_secs: Some(30),
+            })
+        );
+        // A missing timeout still parses: the Hub refuses it with its own 400.
+        let bare: WakeAddRequest = serde_json::from_value(json!({
+            "text": "t", "trigger": {"kind": "at", "afterSecs": 60}, "notify": "never",
+            "check": {"command": "true"}
+        }))
+        .unwrap();
+        assert_eq!(bare.check.unwrap().timeout_secs, None);
+        assert!(
+            serde_json::from_value::<WakeAddRequest>(json!({
+                "text": "t", "trigger": {"kind": "at", "afterSecs": 60}, "notify": "never",
+                "check": {"command": "true", "timeoutSecs": 5, "admission": "owner"}
+            }))
+            .is_err(),
+            "the admission is the Hub's to record"
+        );
+    }
+
+    #[test]
     fn states_round_trip_their_wire_spelling() {
         for state in WakeRunState::ALL {
             assert_eq!(WakeRunState::parse(state.as_str()), Some(state));
@@ -431,5 +672,13 @@ mod tests {
         assert_eq!(WakeMode::parse("fresh"), Some(WakeMode::Fresh));
         assert_eq!(WakeNotify::parse("always"), Some(WakeNotify::Always));
         assert_eq!(WakeUpState::parse("done"), Some(WakeUpState::Done));
+        for state in WakeCheckState::ALL {
+            assert_eq!(WakeCheckState::parse(state.as_str()), Some(state));
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(state.as_str()));
+        }
+        assert_eq!(
+            serde_json::to_value(WakeCheckOutcome::TimedOut).unwrap(),
+            json!("timed-out")
+        );
     }
 }

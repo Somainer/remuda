@@ -72,10 +72,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use remuda_protocol::{
-    InboxFactKind, InputOrigin, WAKE_EVERY_MIN_SECS, WAKE_MAX_PER_LINEAGE, WAKE_MAX_SECS,
+    InboxFactKind, InputOrigin, WAKE_CHECK_COMMAND_MAX_CHARS, WAKE_CHECK_TIMEOUT_MAX_SECS,
+    WAKE_CHECK_TIMEOUT_MIN_SECS, WAKE_EVERY_MIN_SECS, WAKE_MAX_PER_LINEAGE, WAKE_MAX_SECS,
     WAKE_NAME_MAX_CHARS, WAKE_RUNS_LISTED, WAKE_TEXT_MAX_CHARS, WakeAddRequest, WakeAddResult,
-    WakeAt, WakeCreator, WakeEvery, WakeList, WakeMode, WakeNotify, WakeRemoved, WakeRun,
-    WakeRunState, WakeTrigger, WakeUp, WakeUpState,
+    WakeAt, WakeCheck, WakeCheckAdmission, WakeCheckRequest, WakeCheckState, WakeCreator,
+    WakeEvery, WakeList, WakeMode, WakeNotify, WakeRemoved, WakeRun, WakeRunCheck, WakeRunState,
+    WakeTrigger, WakeUp, WakeUpState,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -104,6 +106,11 @@ const OUTCOME_BATCHES: usize = 8;
 const FRESH_PER_DRIVE: i64 = 16;
 /// The carrier a fresh-mode child runs on: one turn, then the process ends.
 pub(crate) const FRESH_DRIVER: &str = "claude-print";
+/// Checks one drive claims at most.
+const CHECKS_PER_DRIVE: i64 = 16;
+/// How much longer than a check's own timeout the Hub waits for its Node's
+/// answer: the `sh -n` precheck, the group kill and the reply.
+const CHECK_RPC_MARGIN_SECS: u64 = 30;
 
 /// The failure kinds a run can end with; each latches its own owner notice.
 pub(crate) mod failure {
@@ -125,6 +132,15 @@ pub(crate) mod failure {
     pub(crate) const CHILD_FAILED: &str = "child-failed";
     /// The fresh child ended before finishing a turn.
     pub(crate) const CHILD_ENDED: &str = "child-ended";
+    /// The check exited with a code other than 0 or 2, or a signal ended it.
+    pub(crate) const CHECK_EXIT: &str = "check-exit";
+    /// The check ran into its timeout; its process group was killed.
+    pub(crate) const CHECK_TIMEOUT: &str = "check-timeout";
+    /// `sh -n` refused the check: nothing ran.
+    pub(crate) const CHECK_SYNTAX: &str = "check-syntax";
+    /// The check could not start on its Node (the Node refused the call, its
+    /// working directory is unusable, or the stored check is unreadable).
+    pub(crate) const CHECK_UNAVAILABLE: &str = "check-unavailable";
 }
 
 // ── tables ─────────────────────────────────────────────────────────────────
@@ -216,6 +232,25 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT
          );",
+    )?;
+    // cb-wake-check (§11.2): the wake-up's last real run, and each run's
+    // check: what it runs, where, its state, and how it exited.
+    use crate::store::ensure_column;
+    ensure_column(conn, "wake_ups", "last_run_at", "TEXT")?;
+    ensure_column(conn, "wake_runs", "check_json", "TEXT")?;
+    ensure_column(conn, "wake_runs", "check_state", "TEXT")?;
+    ensure_column(conn, "wake_runs", "check_host_id", "TEXT")?;
+    ensure_column(conn, "wake_runs", "check_summary", "TEXT")?;
+    ensure_column(conn, "wake_runs", "check_output", "TEXT")?;
+    ensure_column(
+        conn,
+        "wake_runs",
+        "check_output_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS wake_runs_check
+            ON wake_runs(check_state) WHERE check_state IN ('pending', 'running');",
     )?;
     conn.execute_batch(concat!(
         "-- The batch that carries a queued run's fact.
@@ -339,6 +374,10 @@ pub(crate) struct WakeState {
     health: Arc<Mutex<Health>>,
     /// Fresh drives are serialized; the durable claim is the real guard.
     fresh: Arc<tokio::sync::Mutex<()>>,
+    /// Checks waiting for their Node's answer, and a signal when one is
+    /// settled (a test waits for none to be left).
+    checks_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    check_settled: Arc<tokio::sync::Notify>,
     /// Test seam: while set, the scheduler's ticks are skipped.
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) hold_tick: Arc<std::sync::atomic::AtomicBool>,
@@ -360,6 +399,21 @@ impl WakeState {
             .unwrap_or_else(|poison| poison.into_inner());
         health.last_tick = Some(OffsetDateTime::now_utc());
         health.oldest_waiting = oldest_waiting;
+    }
+
+    /// Test seam: wait until no check is waiting for its Node's answer.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn checks_settled(&self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let settled = self.check_settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if self.checks_in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            settled.await;
+        }
     }
 
     /// Test seam: pretend the last tick completed `secs` ago.
@@ -462,7 +516,11 @@ impl IntoResponse for WakeError {
                              {WAKE_TEXT_MAX_CHARS} \
                              characters, one trigger (at a time or afterSecs within a year; \
                              every {WAKE_EVERY_MIN_SECS}..={WAKE_MAX_SECS} seconds; when a \
-                             fact kind) and notify never, failure or always"
+                             fact kind), notify never, failure or always, and for a check a \
+                             command of at most {WAKE_CHECK_COMMAND_MAX_CHARS} characters, \
+                             timeoutSecs {WAKE_CHECK_TIMEOUT_MIN_SECS}..=\
+                             {WAKE_CHECK_TIMEOUT_MAX_SECS} (required) and hostId (required \
+                             for the owner)"
                         ),
                     ),
                 )
@@ -525,8 +583,68 @@ pub(crate) struct CheckedAdd {
     pub(crate) every_secs: Option<i64>,
     pub(crate) mode: WakeMode,
     pub(crate) notify: WakeNotify,
+    /// The optional check, bounded; its host is resolved by the route.
+    pub(crate) check: Option<CheckedCheck>,
     /// The request as sent, canonical: what a repeat must match.
     pub(crate) request_json: String,
+}
+
+/// A bounded check, before its host is resolved and its admission decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedCheck {
+    pub(crate) command: String,
+    /// `None`: an Agent's own host (the owner must name one).
+    pub(crate) host_id: Option<String>,
+    pub(crate) timeout_secs: i64,
+}
+
+/// Bound a check: a command of at most [`WAKE_CHECK_COMMAND_MAX_CHARS`]
+/// characters, a host id, and the mandatory timeout (no default: a hung
+/// check would stall the wake-up for good).
+fn check_check(check: &WakeCheckRequest) -> Result<CheckedCheck, WakeError> {
+    let command = check.command.as_deref().map(str::trim).unwrap_or("");
+    if command.is_empty() {
+        return Err(WakeError::BadRequest(
+            "check.command is required: the shell command the check runs".into(),
+        ));
+    }
+    let chars = command.chars().count();
+    if chars > WAKE_CHECK_COMMAND_MAX_CHARS {
+        return Err(WakeError::BadRequest(format!(
+            "check.command is {chars} characters; at most {WAKE_CHECK_COMMAND_MAX_CHARS}"
+        )));
+    }
+    if command.contains('\0') {
+        return Err(WakeError::BadRequest(
+            "check.command must not contain a NUL character".into(),
+        ));
+    }
+    let Some(timeout_secs) = check.timeout_secs else {
+        return Err(WakeError::BadRequest(format!(
+            "check.timeoutSecs is required: there is no default, a hung check would stall the \
+             wake-up; give {WAKE_CHECK_TIMEOUT_MIN_SECS}..={WAKE_CHECK_TIMEOUT_MAX_SECS} seconds"
+        )));
+    };
+    if !(WAKE_CHECK_TIMEOUT_MIN_SECS..=WAKE_CHECK_TIMEOUT_MAX_SECS).contains(&timeout_secs) {
+        return Err(WakeError::BadRequest(format!(
+            "check.timeoutSecs must be between {WAKE_CHECK_TIMEOUT_MIN_SECS} and \
+             {WAKE_CHECK_TIMEOUT_MAX_SECS}"
+        )));
+    }
+    let host_id = match check.host_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(host) if plain_token(host, 96) => Some(host.to_owned()),
+        Some(_) => {
+            return Err(WakeError::BadRequest(
+                "check.hostId must be a host id".into(),
+            ));
+        }
+    };
+    Ok(CheckedCheck {
+        command: command.to_owned(),
+        host_id,
+        timeout_secs,
+    })
 }
 
 /// A wake-up name: a path segment (`rm` takes it in the URL) that cannot
@@ -575,18 +693,19 @@ pub(crate) fn check_add(
     for (field, text) in [
         ("name", request.name.as_deref()),
         ("text", Some(&request.text)),
+        (
+            "check.command",
+            request
+                .check
+                .as_ref()
+                .and_then(|check| check.command.as_deref()),
+        ),
     ] {
         if let Some(rule) = text.and_then(crate::secret_lint::first_secret) {
             return Err(WakeError::SecretRejected { field, rule });
         }
     }
-    if request.check.as_ref().is_some_and(|check| !check.is_null()) {
-        return Err(WakeError::Unsupported {
-            reason: "check-unsupported",
-            message: "a wake-up check is not supported yet (main-agent.md §11.2); nothing \
-                      was stored",
-        });
-    }
+    let check = request.check.as_ref().map(check_check).transpose()?;
     let name = match request.name.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(name) if wake_name(name) => Some(name.to_owned()),
@@ -659,10 +778,13 @@ pub(crate) fn check_add(
         }
         WakeTrigger::When(when) => {
             match when.fact_kind {
-                InboxFactKind::WakeDue => {
-                    return Err(WakeError::BadRequest(
-                        "a wake-up cannot fire on wake-due facts".into(),
-                    ));
+                // A wake-up's own runs record these: firing on them could
+                // keep a wake-up waking itself.
+                InboxFactKind::WakeDue | InboxFactKind::WakeFailed => {
+                    return Err(WakeError::BadRequest(format!(
+                        "a wake-up cannot fire on {} facts",
+                        when.fact_kind.as_str()
+                    )));
                 }
                 InboxFactKind::ContextThreshold => {
                     return Err(WakeError::Unsupported {
@@ -684,13 +806,21 @@ pub(crate) fn check_add(
         }
     };
     let mode = request.mode.unwrap_or(WakeMode::Persistent);
-    let request_json = json!({
+    let mut request_json = json!({
         "text": text,
         "trigger": request.trigger,
         "mode": mode,
         "notify": request.notify,
-    })
-    .to_string();
+    });
+    // A different command (or host, or timeout) under the same name is a
+    // different wake-up: changing a check needs a new add, never an edit.
+    if let Some(check) = &check {
+        request_json["check"] = json!({
+            "command": check.command,
+            "hostId": check.host_id,
+            "timeoutSecs": check.timeout_secs,
+        });
+    }
     Ok(CheckedAdd {
         name,
         text: text.to_owned(),
@@ -699,7 +829,8 @@ pub(crate) fn check_add(
         every_secs,
         mode,
         notify: request.notify,
-        request_json,
+        check,
+        request_json: request_json.to_string(),
     })
 }
 
@@ -707,7 +838,7 @@ pub(crate) fn check_add(
 
 const WAKE_COLUMNS: &str = "wake_id, lineage_id, name, text, trigger_json, check_json, mode, \
      notify, state, next_fire_at, missed_count, created_at, updated_at, last_fired_at, \
-     creator_origin, creator_instance_id";
+     creator_origin, creator_instance_id, last_run_at";
 
 fn wake_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeUp> {
     let trigger: String = row.get(4)?;
@@ -734,6 +865,7 @@ fn wake_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeUp> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         last_fired_at: row.get(13)?,
+        last_run_at: row.get(16)?,
         creator: WakeCreator {
             origin: if creator == "human" {
                 InputOrigin::Human
@@ -747,12 +879,25 @@ fn wake_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeUp> {
 
 const RUN_COLUMNS: &str = "run_id, wake_id, lineage_id, name, mode, scheduled_at, fired_at, \
      state, started_at, ended_at, check_exit, fact_id, batch_id, child_instance_id, \
-     missed_before, failure_kind";
+     missed_before, failure_kind, check_state, check_host_id, check_summary, check_output, \
+     check_output_truncated";
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeRun> {
     let mode: String = row.get(4)?;
     let state: String = row.get(7)?;
+    let check_state: Option<String> = row.get(16)?;
+    let check = match check_state {
+        Some(check_state) => Some(WakeRunCheck {
+            state: WakeCheckState::parse(&check_state).unwrap_or(WakeCheckState::Failed),
+            host_id: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+            summary: row.get(18)?,
+            output: row.get(19)?,
+            output_truncated: row.get::<_, i64>(20)? != 0,
+        }),
+        None => None,
+    };
     Ok(WakeRun {
+        check,
         run_id: row.get(0)?,
         wake_id: row.get(1)?,
         lineage_id: row.get(2)?,
@@ -801,6 +946,109 @@ pub(crate) struct WakeCaller {
     pub(crate) authority: CallerAuthority,
     /// The credential the call authenticated as, for the audit row.
     pub(crate) device_id: String,
+    /// The caller as it acts (a Human token narrowed to a chapter is that
+    /// chapter's Agent): what a check's admission is decided on.
+    pub(crate) device: crate::store::Device,
+}
+
+/// Whether `host_id` is a Node in the lineage's scope: an enrolled host the
+/// lineage's current chapter may place work on (its delegation scope, as
+/// host facts read it, §10.3).
+pub(crate) fn host_in_scope(
+    conn: &Connection,
+    lineage_id: &str,
+    host_id: &str,
+) -> Result<bool, StoreError> {
+    let enrolled: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hosts WHERE id = ?1)",
+        params![host_id],
+        |row| row.get(0),
+    )?;
+    if !enrolled {
+        return Ok(false);
+    }
+    let scope: Option<Option<String>> = conn
+        .query_row(
+            "SELECT scope_json FROM instances
+              WHERE id = COALESCE((SELECT current_instance_id FROM lineages
+                                    WHERE lineage_id = ?1), ?1)",
+            params![lineage_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(scope) = scope else {
+        return Ok(false);
+    };
+    let scope = scope
+        .and_then(|raw| serde_json::from_str::<remuda_protocol::InstanceScope>(&raw).ok())
+        .unwrap_or_default();
+    Ok(scope.allows_host(host_id))
+}
+
+/// What the route reads before it decides a check's admission.
+#[derive(Debug)]
+struct CheckProbe {
+    /// The same add under the same name is already stored: nothing will be
+    /// added, so nothing is admitted.
+    repeat: bool,
+    /// A different wake-up holds the name: the add is refused anyway, so the
+    /// owner is not paged for it.
+    taken: bool,
+    /// The host the check runs on, or why it cannot.
+    host: Result<String, CheckHostRefusal>,
+    /// The Agent caller's own host.
+    caller_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckHostRefusal {
+    /// The owner did not name the host.
+    Required,
+    /// Not a Node in the lineage's scope.
+    OutOfScope,
+}
+
+fn probe_check(
+    conn: &Connection,
+    lineage_id: &str,
+    chapter: Option<&str>,
+    requested: Option<&str>,
+    name: Option<&str>,
+    request_json: &str,
+) -> Result<CheckProbe, StoreError> {
+    let stored: Option<String> = match name {
+        Some(name) => conn
+            .query_row(
+                "SELECT request_json FROM wake_ups WHERE lineage_id = ?1 AND name = ?2",
+                params![lineage_id, name],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let repeat = stored.as_deref() == Some(request_json);
+    let taken = stored.is_some() && !repeat;
+    let caller_host: Option<String> = match chapter {
+        Some(chapter) => conn
+            .query_row(
+                "SELECT host_id FROM instances WHERE id = ?1",
+                params![chapter],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let host = match requested.map(str::to_owned).or_else(|| caller_host.clone()) {
+        None => Err(CheckHostRefusal::Required),
+        Some(host) if host_in_scope(conn, lineage_id, &host)? => Ok(host),
+        Some(_) => Err(CheckHostRefusal::OutOfScope),
+    };
+    Ok(CheckProbe {
+        repeat,
+        taken,
+        host,
+        caller_host,
+    })
 }
 
 /// What an add did, or why the lineage cannot take it.
@@ -812,13 +1060,21 @@ pub(crate) enum Added {
     Limit,
     NotReceived,
     NoLineage,
+    /// The check's host left the lineage's scope.
+    OutOfScope,
+    /// A check reached the writer unadmitted: only an exact repeat may, and
+    /// the stored wake-up it repeated is gone.
+    NeedsAdmission,
 }
 
-/// One add, in one writer transaction.
+/// One add, in one writer transaction. `admitted` is the check's resolved
+/// host and admission; `None` with a check only for an exact repeat, which
+/// adds nothing.
 pub(crate) fn add(
     conn: &mut Connection,
     caller: &WakeCaller,
     checked: &CheckedAdd,
+    admitted: Option<&WakeCheck>,
 ) -> Result<Added, StoreError> {
     let tx = immediate_tx(conn)?;
     // D-057 §7.3: a fenced, superseded or paused chapter writes nothing.
@@ -844,6 +1100,16 @@ pub(crate) fn add(
             });
         }
     }
+    let check_json = match (&checked.check, admitted) {
+        (None, _) => None,
+        (Some(_), None) => return Ok(Added::NeedsAdmission),
+        (Some(_), Some(check)) => {
+            if !host_in_scope(&tx, lineage, &check.host_id)? {
+                return Ok(Added::OutOfScope);
+            }
+            Some(serde_json::to_string(check)?)
+        }
+    };
     // §11.1: a wake-up is delivered through the inbox (and a fresh child's
     // facts come back through it), so the lineage must receive facts.
     if !crate::inbox::receives_any(&tx, lineage)? {
@@ -887,7 +1153,7 @@ pub(crate) fn add(
             (wake_id, lineage_id, name, text, trigger_kind, trigger_json, every_secs, check_json,
              mode, notify, state, next_fire_at, missed_count, when_cursor, request_json,
              creator_origin, creator_instance_id, creator_device_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, 'active', ?10, 0, ?11, ?12,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?17, ?8, ?9, 'active', ?10, 0, ?11, ?12,
                  ?13, ?14, ?15, ?16, ?16)",
         params![
             wake_id,
@@ -906,10 +1172,12 @@ pub(crate) fn add(
             creator_instance,
             caller.device_id,
             now,
+            check_json,
         ],
     )?;
-    // The audit row names who added what kind of wake-up; the name and the
-    // text stay in the row.
+    // The audit row names who added what kind of wake-up, and how its check
+    // was admitted (the decision is recorded); the name, the text and the
+    // command stay in the row.
     tx.execute(
         "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at, initiator_json)
          VALUES (?1, 'wake.add', ?2, ?3, ?4, ?5)",
@@ -922,6 +1190,12 @@ pub(crate) fn add(
                 "mode": checked.mode.as_str(),
                 "notify": checked.notify.as_str(),
                 "origin": creator_origin,
+                "check": admitted.map(|check| json!({
+                    "hostId": check.host_id,
+                    "timeoutSecs": check.timeout_secs,
+                    "admission": check.admission.as_str(),
+                    "approvalId": check.approval_id,
+                })),
             })
             .to_string(),
             now,
@@ -1061,6 +1335,7 @@ async fn wake_caller(
                 lineage_id: own,
                 authority: CallerAuthority::for_device(state, &device).await?,
                 device_id: authenticated.id,
+                device,
             })
         }
         InputOrigin::Human => {
@@ -1075,9 +1350,141 @@ async fn wake_caller(
                 lineage_id: lineage,
                 authority: CallerAuthority::internal(),
                 device_id: authenticated.id,
+                device,
             })
         }
         _ => Err(not_the_lineage()),
+    }
+}
+
+/// §11.2: a check is a shell command that does not pass through the
+/// harness's own permission control, so it is admitted on the OA1 axis.
+///
+/// * The owner (a Human device) adding one is the owner's own act: admitted,
+///   on the host the owner names.
+/// * An Agent adds one without approval only when it runs on the Agent's own
+///   host and the Agent itself runs with its harness's permission control
+///   off (OA1's "never beyond the creator").
+/// * Any other check (another host, or an Agent that keeps its control on)
+///   needs the owner's D-017 one-shot approval of this exact check, before
+///   anything is stored. An approved retry of the same check passes; a
+///   changed command, host or timeout is a new request.
+///
+/// `None` when the same add under the same name is already stored: nothing
+/// is added, so nothing is admitted.
+async fn admit_check(
+    state: &AppState,
+    headers: &HeaderMap,
+    caller: &WakeCaller,
+    checked: &CheckedAdd,
+    check: &CheckedCheck,
+) -> Result<Option<WakeCheck>, WakeError> {
+    let probe = state
+        .store
+        .read("wake_check_probe", {
+            let lineage = caller.lineage_id.clone();
+            let chapter = (caller.origin == InputOrigin::Agent)
+                .then(|| caller.device.instance_id.clone())
+                .flatten();
+            // The owner names the host (the owner's device has no chapter,
+            // so nothing defaults it): the Hub never picks one for the owner.
+            // An Agent's omitted host is its own.
+            let requested = check.host_id.clone();
+            let name = checked.name.clone();
+            let request_json = checked.request_json.clone();
+            move |conn| {
+                probe_check(
+                    conn,
+                    &lineage,
+                    chapter.as_deref(),
+                    requested.as_deref(),
+                    name.as_deref(),
+                    &request_json,
+                )
+            }
+        })
+        .await
+        .map_err(map_store)?;
+    if probe.repeat {
+        return Ok(None);
+    }
+    if probe.taken {
+        return Err(name_taken());
+    }
+    let host_id = match probe.host {
+        Ok(host) => host,
+        Err(CheckHostRefusal::Required) => {
+            return Err(WakeError::BadRequest(
+                "check.hostId is required when the owner adds a check: name the Node it runs \
+                 on"
+                .into(),
+            ));
+        }
+        // A host outside the lineage's scope is refused before anyone is
+        // paged.
+        Err(CheckHostRefusal::OutOfScope) => return Err(HubError::out_of_scope().into()),
+    };
+    let (admission, approval_id) = match caller.origin {
+        InputOrigin::Human => (WakeCheckAdmission::Owner, None),
+        _ => {
+            let own_host = probe.caller_host.as_deref() == Some(host_id.as_str());
+            let creator =
+                crate::agent_scope::creator_permission_mode(state, &caller.device).await?;
+            let control_off = remuda_protocol::creator_permission::is_control_off(creator);
+            if own_host && control_off {
+                (WakeCheckAdmission::OwnHostBypass, None)
+            } else {
+                let mut why = Vec::new();
+                if !own_host {
+                    why.push("another-host");
+                }
+                if !control_off {
+                    why.push("creator-keeps-permission-control-on");
+                }
+                // The exact check the owner approves: a changed command,
+                // host or timeout is a new request (a new add, never an
+                // edit).
+                let request = json!({
+                    "operation": "wake.check",
+                    "lineageId": caller.lineage_id,
+                    "name": checked.name,
+                    "hostId": host_id,
+                    "command": check.command,
+                    "timeoutSecs": check.timeout_secs,
+                    "why": why,
+                });
+                crate::agent_scope::require_approval(state, headers, &caller.device, request)
+                    .await?;
+                let approval_id = headers
+                    .get("x-remuda-approval-id")
+                    .and_then(|raw| raw.to_str().ok())
+                    .map(str::to_owned);
+                (WakeCheckAdmission::Approved, approval_id)
+            }
+        }
+    };
+    tracing::info!(
+        category = "wake",
+        outcome = "check-admitted",
+        admission = admission.as_str()
+    );
+    Ok(Some(WakeCheck {
+        command: check.command.clone(),
+        host_id,
+        timeout_secs: check.timeout_secs,
+        admission,
+        approval_id,
+    }))
+}
+
+/// 409 for a name the lineage already holds with a different wake-up (a
+/// changed check included: changing it needs a new add, never an edit).
+fn name_taken() -> WakeError {
+    WakeError::Conflict {
+        reason: "wake-name-taken",
+        message: "the lineage already has a different wake-up under this name".into(),
+        hint: "remove it first (remuda wake rm <name>) or add under another name; a check \
+               is changed by a new add, never an edit",
     }
 }
 
@@ -1089,24 +1496,22 @@ async fn add_route(
 ) -> Result<Response, WakeError> {
     let caller = wake_caller(&state, &headers, id).await?;
     let checked = check_add(&request, OffsetDateTime::now_utc())?;
+    let admitted = match &checked.check {
+        Some(check) => admit_check(&state, &headers, &caller, &checked, check).await?,
+        None => None,
+    };
     let added = state
         .store
         .run_named("wake_add", {
             let caller = caller.clone();
-            move |conn| add(conn, &caller, &checked)
+            move |conn| add(conn, &caller, &checked, admitted.as_ref())
         })
         .await
         .map_err(map_store)?;
     let (status, wake_up, created) = match added {
         Added::Created(wake) => (StatusCode::CREATED, wake, true),
         Added::Existing(wake) => (StatusCode::OK, wake, false),
-        Added::NameTaken => {
-            return Err(WakeError::Conflict {
-                reason: "wake-name-taken",
-                message: "the lineage already has a different wake-up under this name".into(),
-                hint: "remove it first (remuda wake rm <name>) or add under another name",
-            });
-        }
+        Added::NameTaken => return Err(name_taken()),
         Added::Limit => {
             return Err(WakeError::Conflict {
                 reason: "wake-limit",
@@ -1125,6 +1530,14 @@ async fn add_route(
             });
         }
         Added::NoLineage => return Err(HubError::NotFound.into()),
+        Added::OutOfScope => return Err(HubError::out_of_scope().into()),
+        Added::NeedsAdmission => {
+            return Err(WakeError::Conflict {
+                reason: "wake-changed",
+                message: "the wake-up this add repeated was removed meanwhile".into(),
+                hint: "add it again; its check is admitted afresh",
+            });
+        }
     };
     tracing::info!(
         category = "wake",
@@ -1239,6 +1652,8 @@ pub(crate) struct TickOutcome {
     pub(crate) missed: i64,
     /// A fresh run waits for its child.
     pub(crate) fresh_due: bool,
+    /// A run waits for its check.
+    pub(crate) check_due: bool,
     /// When the oldest run still waiting for delivery fired.
     pub(crate) oldest_waiting: Option<OffsetDateTime>,
 }
@@ -1259,10 +1674,12 @@ struct Wake {
     missed_count: i64,
     when_cursor: i64,
     creator_origin: String,
+    check_json: Option<String>,
 }
 
 const TICK_COLUMNS: &str = "wake_id, lineage_id, name, text, trigger_kind, trigger_json, \
-     every_secs, mode, notify, next_fire_at, missed_count, when_cursor, creator_origin";
+     every_secs, mode, notify, next_fire_at, missed_count, when_cursor, creator_origin, \
+     check_json";
 
 fn tick_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wake> {
     Ok(Wake {
@@ -1279,6 +1696,7 @@ fn tick_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wake> {
         missed_count: row.get(10)?,
         when_cursor: row.get(11)?,
         creator_origin: row.get(12)?,
+        check_json: row.get(13)?,
     })
 }
 
@@ -1330,6 +1748,18 @@ fn fire(
         );
         return Ok(());
     }
+    // §11.2: a run of a wake-up with a check waits for that check; a stored
+    // check this build cannot read never lets a run through unchecked.
+    let check: Option<WakeCheck> = match wake.check_json.as_deref() {
+        None => None,
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(check) => Some(check),
+            Err(_) => {
+                crate::inbox::report_once("wake-check-unreadable");
+                return Ok(());
+            }
+        },
+    };
     let missed = wake
         .missed_count
         .saturating_add(occurrence.due.saturating_sub(1))
@@ -1356,8 +1786,8 @@ fn fire(
     conn.execute(
         "INSERT INTO wake_runs
             (run_id, wake_id, lineage_id, name, mode, notify, detail_json, scheduled_at,
-             fired_at, state, missed_before)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10)",
+             fired_at, state, missed_before, check_json, check_state, check_host_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13)",
         params![
             run_id,
             wake.wake_id,
@@ -1369,54 +1799,94 @@ fn fire(
             occurrence.scheduled_at,
             now,
             missed,
+            check.as_ref().map(|check| json!({
+                "command": check.command,
+                "hostId": check.host_id,
+                "timeoutSecs": check.timeout_secs,
+            })
+            .to_string()),
+            check.as_ref().map(|_| WakeCheckState::Pending.as_str()),
+            check.as_ref().map(|check| check.host_id.as_str()),
         ],
     )?;
+    // A run without a check is a real run from the moment it fires; one with
+    // a check becomes one only when its check passes (§11.2: a skipped run
+    // never refreshes the last real run).
     conn.execute(
-        "UPDATE wake_ups SET missed_count = 0, last_fired_at = ?2, updated_at = ?2
+        "UPDATE wake_ups SET missed_count = 0, last_fired_at = ?2, updated_at = ?2,
+                last_run_at = CASE WHEN ?3 THEN ?2 ELSE last_run_at END
           WHERE wake_id = ?1",
-        params![wake.wake_id, now],
+        params![wake.wake_id, now, check.is_none()],
     )?;
     outcome.fired += 1;
-    if wake.mode == WakeMode::Fresh.as_str() {
-        outcome.fresh_due = true;
+    if check.is_some() {
+        outcome.check_due = true;
     } else {
-        // §11.1: delivered through the inbox, so it waits for the idle point
-        // like any fact. Each run is its own fact (its id is the key and the
-        // cap subject), so the occurrence cap never folds two runs together.
-        let recorded = crate::inbox::record(
+        deliver(
             conn,
+            &run_id,
             &wake.lineage_id,
-            crate::inbox::Fact {
-                kind: InboxFactKind::WakeDue,
-                subject_instance_id: None,
-                key_subject: run_id.clone(),
-                cap_subject: run_id.clone(),
-                run: 0,
-                run_in_key: false,
-                entered_at: now.to_owned(),
-                project_id: None,
-                payload: detail,
-            },
+            &wake.mode,
+            detail,
+            now,
+            outcome,
         )?;
-        match recorded {
-            crate::inbox::Outcome::Recorded(fact_id) => {
-                conn.execute(
-                    "UPDATE wake_runs SET fact_id = ?2 WHERE run_id = ?1",
-                    params![run_id, fact_id],
-                )?;
-            }
-            // Muted since the add, or the lineage no longer receives facts:
-            // the run cannot be delivered.
-            _ => queue_outcome(conn, &run_id, false, Some(failure::NOT_RECEIVED), now)?,
-        }
     }
     tracing::info!(
         category = "wake",
         outcome = "fired",
         trigger = wake.trigger_kind.as_str(),
         mode = wake.mode.as_str(),
+        check = check.is_some(),
         missed
     );
+    Ok(())
+}
+
+/// Hand a run that may happen to its mode: a fresh run waits for its child;
+/// a persistent run becomes its `wake-due` fact.
+fn deliver(
+    conn: &Connection,
+    run_id: &str,
+    lineage_id: &str,
+    mode: &str,
+    detail: Value,
+    now: &str,
+    outcome: &mut TickOutcome,
+) -> Result<(), StoreError> {
+    if mode == WakeMode::Fresh.as_str() {
+        outcome.fresh_due = true;
+        return Ok(());
+    }
+    // §11.1: delivered through the inbox, so it waits for the idle point
+    // like any fact. Each run is its own fact (its id is the key and the
+    // cap subject), so the occurrence cap never folds two runs together.
+    let recorded = crate::inbox::record(
+        conn,
+        lineage_id,
+        crate::inbox::Fact {
+            kind: InboxFactKind::WakeDue,
+            subject_instance_id: None,
+            key_subject: run_id.to_owned(),
+            cap_subject: run_id.to_owned(),
+            run: 0,
+            run_in_key: false,
+            entered_at: now.to_owned(),
+            project_id: None,
+            payload: detail,
+        },
+    )?;
+    match recorded {
+        crate::inbox::Outcome::Recorded(fact_id) => {
+            conn.execute(
+                "UPDATE wake_runs SET fact_id = ?2 WHERE run_id = ?1",
+                params![run_id, fact_id],
+            )?;
+        }
+        // Muted since the add, or the lineage no longer receives facts:
+        // the run cannot be delivered.
+        _ => queue_outcome(conn, run_id, "failed", Some(failure::NOT_RECEIVED), now)?,
+    }
     Ok(())
 }
 
@@ -1619,15 +2089,19 @@ pub(crate) fn tick(conn: &mut Connection, now: OffsetDateTime) -> Result<TickOut
     let tx = immediate_tx(conn)?;
     due_scheduled(&tx, now, &now_s, &mut outcome)?;
     due_conditions(&tx, &now_s, &mut outcome)?;
-    let (oldest, fresh): (Option<String>, bool) = tx.query_row(
+    let (oldest, fresh, check): (Option<String>, bool, bool) = tx.query_row(
         "SELECT (SELECT MIN(fired_at) FROM wake_runs WHERE state = 'queued'),
-                EXISTS (SELECT 1 FROM wake_runs WHERE state = 'queued' AND mode = 'fresh')",
+                EXISTS (SELECT 1 FROM wake_runs WHERE state = 'queued' AND mode = 'fresh'
+                           AND (check_state IS NULL OR check_state = 'passed')),
+                EXISTS (SELECT 1 FROM wake_runs WHERE state = 'queued'
+                           AND check_state = 'pending')",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     tx.commit()?;
     outcome.oldest_waiting = oldest.as_deref().and_then(crate::inbox::parse_at);
     outcome.fresh_due |= fresh;
+    outcome.check_due |= check;
     Ok(outcome)
 }
 
@@ -1662,6 +2136,9 @@ pub(crate) async fn run_tick(state: &AppState) {
                     "wake tick"
                 );
             }
+            if outcome.check_due {
+                drive_checks(state).await;
+            }
             if outcome.fresh_due {
                 drive_fresh(state).await;
             }
@@ -1676,18 +2153,19 @@ pub(crate) async fn run_tick(state: &AppState) {
 
 // ── results ────────────────────────────────────────────────────────────────
 
-/// Queue the result of `run_id` in the caller's transaction.
+/// Queue the result of `run_id` in the caller's transaction: `success`,
+/// `failed` (with its kind) or `skipped` (its check exited 2).
 fn queue_outcome(
     conn: &Connection,
     run_id: &str,
-    success: bool,
+    outcome: &str,
     kind: Option<&str>,
     at: &str,
 ) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO wake_outcomes (run_id, outcome, failure_kind, observed_at)
          VALUES (?1, ?2, ?3, ?4)",
-        params![run_id, if success { "success" } else { "failed" }, kind, at],
+        params![run_id, outcome, kind, at],
     )?;
     Ok(())
 }
@@ -1697,7 +2175,7 @@ fn queue_outcome(
 struct QueuedOutcome {
     id: i64,
     run_id: String,
-    success: bool,
+    outcome: String,
     kind: Option<String>,
     at: String,
     attempts: i64,
@@ -1783,7 +2261,7 @@ fn drain_batch(
             Ok(QueuedOutcome {
                 id: row.get(0)?,
                 run_id: row.get(1)?,
-                success: row.get::<_, String>(2)? == "success",
+                outcome: row.get(2)?,
                 kind: row.get(3)?,
                 at: row.get(4)?,
                 attempts: row.get(5)?,
@@ -1873,18 +2351,22 @@ fn apply(conn: &Connection, row: &QueuedOutcome, notify: bool) -> Result<(), Sto
     if !matches!(run.state.as_str(), "queued" | "running") {
         return Ok(());
     }
-    let state = if row.success { "success" } else { "failed" };
-    let kind = if row.success {
-        None
-    } else {
-        Some(row.kind.as_deref().unwrap_or(failure::DELIVERY))
+    let (state, kind) = match row.outcome.as_str() {
+        "success" => ("success", None),
+        "skipped" => ("skipped", None),
+        _ => (
+            "failed",
+            Some(row.kind.as_deref().unwrap_or(failure::DELIVERY)),
+        ),
     };
     conn.execute(
         "UPDATE wake_runs SET state = ?2, ended_at = ?3, failure_kind = ?4
           WHERE run_id = ?1 AND state IN ('queued', 'running')",
         params![row.run_id, state, row.at, kind],
     )?;
-    let notified = if notify {
+    // A skipped run did not happen: it notifies nothing under any policy
+    // and neither sets nor clears a failure latch.
+    let notified = if notify && state != "skipped" {
         notify_run(conn, &row.run_id, &run, kind)?
     } else {
         false
@@ -1948,6 +2430,10 @@ fn failure_text(kind: &str) -> &'static str {
         failure::FRESH_REFUSED => "its fresh session could not be created",
         failure::CHILD_FAILED => "its fresh session's turn ended in an error",
         failure::CHILD_ENDED => "its fresh session ended before finishing a turn",
+        failure::CHECK_EXIT => "its check exited with an error",
+        failure::CHECK_TIMEOUT => "its check ran into its timeout and was killed",
+        failure::CHECK_SYNTAX => "its check is not valid shell; nothing ran",
+        failure::CHECK_UNAVAILABLE => "its check could not start on its Node",
         _ => "it did not finish",
     }
 }
@@ -2030,8 +2516,12 @@ fn notify_run(
 /// wake-up's next occurrence is computed from the schedule as usual.
 pub(crate) fn boot(conn: &mut Connection) {
     drain_outcomes(conn, OffsetDateTime::now_utc());
+    // A check in flight is interrupted with its run: its Node's answer, if
+    // one ever comes, goes to a link that no longer exists.
     match conn.execute(
-        "UPDATE wake_runs SET state = 'interrupted', ended_at = ?1
+        "UPDATE wake_runs SET state = 'interrupted', ended_at = ?1,
+                check_state = CASE WHEN check_state = 'running' THEN 'interrupted'
+                                   ELSE check_state END
           WHERE state = 'running'
             AND run_id NOT IN (SELECT run_id FROM wake_outcomes)",
         params![now_rfc3339()],
@@ -2130,6 +2620,505 @@ pub(crate) fn fold_turn_end(
     Ok(())
 }
 
+// ── checks (§11.2) ─────────────────────────────────────────────────────────
+
+/// A run's check as its run row keeps it (the wake-up may be removed while
+/// the run waits; the run still checks what it was fired with).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCheckSpec {
+    command: String,
+    host_id: String,
+    timeout_secs: i64,
+}
+
+/// A check claimed for its Node.
+#[derive(Debug, Clone)]
+struct CheckClaim {
+    run_id: String,
+    host_id: String,
+    timeout_secs: u64,
+    params: remuda_protocol::WakeCheckParams,
+}
+
+/// What came back from the Node.
+#[derive(Debug, Clone)]
+enum CheckReport {
+    /// The Node ran it (or refused to start it) and said how it went.
+    Done(remuda_protocol::WakeCheckResult),
+    /// The Node answered the call with an error: it did not run.
+    Refused,
+    /// The host was not connected when the call was made: it provably never
+    /// reached the Node.
+    NotSent,
+    /// The link went away (or stayed silent) while the check may have been
+    /// running: whether it ran is unknown.
+    Lost,
+}
+
+/// The workspace and directory a check runs in: the lineage's on that host.
+/// The current chapter's own workspace and cwd when it lives there (a seat
+/// placed by its project may record no workspace); else the workspace its
+/// project has on that host (its primary member first); else none (the
+/// Node's first workspace).
+fn check_place(
+    conn: &Connection,
+    lineage_id: &str,
+    host_id: &str,
+) -> Result<(Option<String>, Option<String>), StoreError> {
+    let chapter: Option<(String, Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT host_id, workspace_id, spec_json, scope_json FROM instances
+              WHERE id = COALESCE((SELECT current_instance_id FROM lineages
+                                    WHERE lineage_id = ?1), ?1)",
+            params![lineage_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((chapter_host, workspace_id, spec, scope)) = chapter else {
+        return Ok((None, None));
+    };
+    let spec: Value = serde_json::from_str(&spec).unwrap_or(Value::Null);
+    let text = |field: &str| {
+        spec.get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    };
+    if chapter_host == host_id
+        && let Some(workspace) = workspace_id.or_else(|| text("workspaceId"))
+    {
+        return Ok((Some(workspace), text("cwd")));
+    }
+    let project = scope
+        .and_then(|raw| serde_json::from_str::<remuda_protocol::InstanceScope>(&raw).ok())
+        .and_then(|scope| scope.single_project_id().map(|id| id.as_id().to_string()))
+        .or_else(|| text("projectId"));
+    let Some(project) = project else {
+        return Ok((None, None));
+    };
+    let workspace: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(m.value, '$.workspaceId')
+               FROM projects p, json_each(p.doc_json, '$.members') m
+              WHERE p.id = ?1 AND json_extract(m.value, '$.hostId') = ?2
+              ORDER BY json_extract(m.value, '$.role') = 'primary' DESC
+              LIMIT 1",
+            params![project, host_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok((workspace, None))
+}
+
+/// Claim the check of `run_id` when its host is online: the run turns
+/// `running` (and its check `running`) in this transaction, before the
+/// Node is asked, so a Hub that stops mid-check finds it running at boot
+/// and interrupts it rather than asking again. `Ok(None)`: not pending, or
+/// held for a later tick (its host is offline). A stored check this build
+/// cannot read fails the run here.
+fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>, StoreError> {
+    let tx = immediate_tx(conn)?;
+    #[allow(clippy::type_complexity)]
+    let run: Option<(String, String, String, String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT wake_id, lineage_id, name, scheduled_at, fired_at, check_json
+               FROM wake_runs
+              WHERE run_id = ?1 AND state = 'queued' AND check_state = 'pending'",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((wake_id, lineage_id, name, scheduled_at, fired_at, spec)) = run else {
+        return Ok(None);
+    };
+    let now = now_rfc3339();
+    let spec = spec
+        .and_then(|raw| serde_json::from_str::<RunCheckSpec>(&raw).ok())
+        .filter(|spec| {
+            (WAKE_CHECK_TIMEOUT_MIN_SECS..=WAKE_CHECK_TIMEOUT_MAX_SECS).contains(&spec.timeout_secs)
+        });
+    let Some(spec) = spec else {
+        crate::inbox::report_once("wake-check-unreadable");
+        tx.execute(
+            "UPDATE wake_runs SET check_state = 'failed', check_summary = 'unreadable'
+              WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        queue_outcome(
+            &tx,
+            run_id,
+            "failed",
+            Some(failure::CHECK_UNAVAILABLE),
+            &now,
+        )?;
+        tx.commit()?;
+        return Ok(None);
+    };
+    let online: bool = tx
+        .query_row(
+            "SELECT state = 'online' FROM hosts WHERE id = ?1",
+            params![spec.host_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !online {
+        return Ok(None);
+    }
+    let (workspace_id, cwd) = check_place(&tx, &lineage_id, &spec.host_id)?;
+    let last_run_at: Option<String> = tx
+        .query_row(
+            "SELECT last_run_at FROM wake_ups WHERE wake_id = ?1",
+            params![wake_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let claimed = tx.execute(
+        "UPDATE wake_runs SET state = 'running', check_state = 'running', started_at = ?2
+          WHERE run_id = ?1 AND state = 'queued' AND check_state = 'pending'",
+        params![run_id, now],
+    )?;
+    if claimed == 0 {
+        return Ok(None);
+    }
+    tx.commit()?;
+    // What a check may read about its run (§11.2: "time since the last real
+    // run" is the reason a skip must not refresh `lastRunAt`).
+    let mut env = std::collections::BTreeMap::new();
+    for (key, value) in [
+        ("REMUDA_WAKE_ID", Some(wake_id)),
+        ("REMUDA_WAKE_NAME", Some(name)),
+        ("REMUDA_WAKE_RUN_ID", Some(run_id.to_owned())),
+        ("REMUDA_WAKE_LINEAGE_ID", Some(lineage_id)),
+        ("REMUDA_WAKE_SCHEDULED_AT", Some(scheduled_at)),
+        ("REMUDA_WAKE_FIRED_AT", Some(fired_at)),
+        ("REMUDA_WAKE_LAST_RUN_AT", last_run_at),
+    ] {
+        if let Some(value) = value {
+            env.insert(key.to_owned(), value);
+        }
+    }
+    let timeout_secs = u64::try_from(spec.timeout_secs).unwrap_or(1);
+    Ok(Some(CheckClaim {
+        run_id: run_id.to_owned(),
+        host_id: spec.host_id,
+        timeout_secs,
+        params: remuda_protocol::WakeCheckParams {
+            run_id: run_id.to_owned(),
+            command: spec.command,
+            timeout_secs,
+            workspace_id,
+            cwd,
+            env,
+        },
+    }))
+}
+
+/// Ask the Node to run every check that is due and whose host is online.
+/// Each check is its own task, so a long check never holds the tick; the
+/// durable claim keeps two drives from asking twice.
+pub(crate) async fn drive_checks(state: &AppState) {
+    let runs = state
+        .store
+        .read("wake_checks_due", |conn| {
+            Ok(conn
+                .prepare_cached(
+                    "SELECT run_id FROM wake_runs WHERE state = 'queued' AND check_state = 'pending'
+                      ORDER BY fired_at, run_id LIMIT ?1",
+                )?
+                .query_map(params![CHECKS_PER_DRIVE], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await;
+    let runs = match runs {
+        Ok(runs) => runs,
+        Err(err) => {
+            tracing::error!(
+                category = "wake",
+                code = crate::inbox::error_code(&err),
+                "due checks could not be read"
+            );
+            return;
+        }
+    };
+    for run_id in runs {
+        let claimed = state
+            .store
+            .run_named("wake_check_claim", move |conn| claim_check(conn, &run_id))
+            .await;
+        match claimed {
+            Ok(Some(claim)) => {
+                state
+                    .wake
+                    .checks_in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let state = state.clone();
+                tokio::spawn(async move {
+                    run_check(&state, claim).await;
+                    state
+                        .wake
+                        .checks_in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    state.wake.check_settled.notify_waiters();
+                });
+            }
+            Ok(None) => {}
+            Err(err) => tracing::error!(
+                category = "wake",
+                code = crate::inbox::error_code(&err),
+                "check claim failed"
+            ),
+        }
+    }
+}
+
+/// One claimed check: the Node call, then its settlement.
+async fn run_check(state: &AppState, claim: CheckClaim) {
+    let params = match serde_json::to_value(&claim.params) {
+        Ok(params) => params,
+        Err(_) => return,
+    };
+    let answer = state
+        .nodes
+        .call(
+            &claim.host_id,
+            remuda_protocol::METHOD_WAKE_CHECK,
+            params,
+            std::time::Duration::from_secs(
+                claim.timeout_secs.saturating_add(CHECK_RPC_MARGIN_SECS),
+            ),
+        )
+        .await;
+    let report = match answer {
+        Ok(Some(frame)) => match frame.get("result") {
+            Some(result) => serde_json::from_value(result.clone())
+                .map_or(CheckReport::Refused, CheckReport::Done),
+            None => CheckReport::Refused,
+        },
+        Ok(None) => CheckReport::NotSent,
+        Err(_) => CheckReport::Lost,
+    };
+    let run_id = claim.run_id;
+    let settled = state
+        .store
+        .run_named("wake_check_settle", move |conn| {
+            settle_check(conn, &run_id, &report)
+        })
+        .await;
+    match settled {
+        Ok(true) => drive_fresh(state).await,
+        Ok(false) => {}
+        Err(err) => tracing::error!(
+            category = "wake",
+            code = crate::inbox::error_code(&err),
+            "check result could not be written"
+        ),
+    }
+}
+
+/// Write what a check did (§11.2), in one writer transaction; `true` when a
+/// fresh run may now create its child.
+///
+/// * Exit 0: the run happens. It is the wake-up's last real run, and its
+///   bounded stdout rides the run's detail as its summary (quoted as
+///   untrusted data in the envelope or the fresh brief).
+/// * Exit 2: `skipped`. No model turn, no notice, and the last real run is
+///   left as it was.
+/// * Any other exit, a signal, the timeout, a syntax error or a check that
+///   could not start: `failed`, with a `wake-failed` fact to the lineage; the
+///   `notify` declaration applies with its repeat-failure latch.
+/// * The call never reached the Node: the check waits for its host again.
+/// * The link went away mid-check: `interrupted`, never asked again (the
+///   rule a Hub restart applies at boot).
+fn settle_check(
+    conn: &mut Connection,
+    run_id: &str,
+    report: &CheckReport,
+) -> Result<bool, StoreError> {
+    let tx = immediate_tx(conn)?;
+    #[allow(clippy::type_complexity)]
+    let run: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    )> = tx
+        .query_row(
+            "SELECT wake_id, lineage_id, name, mode, fired_at, detail_json, check_host_id
+               FROM wake_runs
+              WHERE run_id = ?1 AND state = 'running' AND check_state = 'running'",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((wake_id, lineage_id, name, mode, fired_at, detail, host_id)) = run else {
+        return Ok(false);
+    };
+    let host_id = host_id.unwrap_or_default();
+    let now = now_rfc3339();
+    let result = match report {
+        CheckReport::NotSent => {
+            tx.execute(
+                "UPDATE wake_runs SET state = 'queued', check_state = 'pending', started_at = NULL
+                  WHERE run_id = ?1",
+                params![run_id],
+            )?;
+            tx.commit()?;
+            tracing::info!(category = "wake", outcome = "check-not-sent");
+            return Ok(false);
+        }
+        CheckReport::Lost => {
+            tx.execute(
+                "UPDATE wake_runs SET state = 'interrupted', check_state = 'interrupted',
+                        ended_at = ?2, check_summary = 'the link to its Node was lost'
+                  WHERE run_id = ?1",
+                params![run_id, now],
+            )?;
+            tx.commit()?;
+            tracing::info!(category = "wake", outcome = "check-interrupted");
+            return Ok(false);
+        }
+        CheckReport::Refused => None,
+        CheckReport::Done(result) => Some(result),
+    };
+    let exit = result.and_then(|result| {
+        (result.outcome == remuda_protocol::WakeCheckOutcome::Exited)
+            .then_some(result.exit_code)
+            .flatten()
+    });
+    let (summary, output, truncated) = match result {
+        Some(result) => (
+            result.summary.clone(),
+            Some(result.stdout.clone()),
+            result.stdout_truncated,
+        ),
+        None => ("its Node refused the call".to_owned(), None, false),
+    };
+    // A Node's report is bounded here too: the Hub keeps no more than the
+    // protocol allows, whatever arrived.
+    let output = output.map(|text| {
+        let mut end = text.len().min(remuda_protocol::WAKE_CHECK_STDOUT_MAX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_owned()
+    });
+    let summary: String = summary.chars().take(200).collect();
+    let (check_state, failure_kind) = match (result.map(|result| result.outcome), exit) {
+        (Some(remuda_protocol::WakeCheckOutcome::Exited), Some(0)) => ("passed", None),
+        (Some(remuda_protocol::WakeCheckOutcome::Exited), Some(2)) => ("skipped", None),
+        (Some(remuda_protocol::WakeCheckOutcome::Exited), _) => {
+            ("failed", Some(failure::CHECK_EXIT))
+        }
+        (Some(remuda_protocol::WakeCheckOutcome::TimedOut), _) => {
+            ("failed", Some(failure::CHECK_TIMEOUT))
+        }
+        (Some(remuda_protocol::WakeCheckOutcome::Syntax), _) => {
+            ("failed", Some(failure::CHECK_SYNTAX))
+        }
+        (Some(remuda_protocol::WakeCheckOutcome::Unavailable), _) | (None, _) => {
+            ("failed", Some(failure::CHECK_UNAVAILABLE))
+        }
+    };
+    tx.execute(
+        "UPDATE wake_runs SET check_state = ?2, check_exit = ?3, check_summary = ?4,
+                check_output = ?5, check_output_truncated = ?6
+          WHERE run_id = ?1",
+        params![run_id, check_state, exit, summary, output, truncated],
+    )?;
+    let mut fresh_due = false;
+    match check_state {
+        "passed" => {
+            let mut detail: Value = serde_json::from_str(&detail).unwrap_or_else(|_| json!({}));
+            detail["check"] = json!({
+                "hostId": host_id,
+                "exit": 0,
+                "output": output.clone().unwrap_or_default(),
+                "outputTruncated": truncated,
+            });
+            tx.execute(
+                "UPDATE wake_runs SET state = 'queued', detail_json = ?2 WHERE run_id = ?1",
+                params![run_id, detail.to_string()],
+            )?;
+            tx.execute(
+                "UPDATE wake_ups SET last_run_at = ?2 WHERE wake_id = ?1",
+                params![wake_id, fired_at],
+            )?;
+            let mut outcome = TickOutcome::default();
+            deliver(&tx, run_id, &lineage_id, &mode, detail, &now, &mut outcome)?;
+            fresh_due = outcome.fresh_due;
+        }
+        "skipped" => queue_outcome(&tx, run_id, "skipped", None, &now)?,
+        _ => {
+            let kind = failure_kind.unwrap_or(failure::CHECK_UNAVAILABLE);
+            queue_outcome(&tx, run_id, "failed", Some(kind), &now)?;
+            // The lineage hears that its check failed, at its idle point
+            // like any fact; the check's output is not carried.
+            crate::inbox::record(
+                &tx,
+                &lineage_id,
+                crate::inbox::Fact {
+                    kind: InboxFactKind::WakeFailed,
+                    subject_instance_id: None,
+                    key_subject: run_id.to_owned(),
+                    cap_subject: wake_id.clone(),
+                    run: 0,
+                    run_in_key: false,
+                    entered_at: now.clone(),
+                    project_id: None,
+                    payload: json!({
+                        "wakeId": wake_id,
+                        "runId": run_id,
+                        "name": name,
+                        "hostId": host_id,
+                        "failureKind": kind,
+                        "checkExit": exit,
+                        "summary": summary,
+                    }),
+                },
+            )?;
+        }
+    }
+    tx.commit()?;
+    tracing::info!(
+        category = "wake",
+        outcome = match check_state {
+            "passed" => "check-passed",
+            "skipped" => "check-skipped",
+            _ => "check-failed",
+        },
+        failure = failure_kind.unwrap_or(""),
+        exit_code = exit,
+        "wake check settled"
+    );
+    Ok(fresh_due)
+}
+
 // ── fresh mode ─────────────────────────────────────────────────────────────
 
 /// A fresh run claimed for its create.
@@ -2158,7 +3147,8 @@ fn claim_fresh(
     let run: Option<(String, String)> = tx
         .query_row(
             "SELECT lineage_id, detail_json FROM wake_runs
-              WHERE run_id = ?1 AND state = 'queued' AND mode = 'fresh'",
+              WHERE run_id = ?1 AND state = 'queued' AND mode = 'fresh'
+                AND (check_state IS NULL OR check_state = 'passed')",
             params![run_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -2281,6 +3271,7 @@ pub(crate) async fn drive_fresh(state: &AppState) {
             Ok(conn
                 .prepare_cached(
                     "SELECT run_id FROM wake_runs WHERE state = 'queued' AND mode = 'fresh'
+                       AND (check_state IS NULL OR check_state = 'passed')
                       ORDER BY fired_at, run_id LIMIT ?1",
                 )?
                 .query_map(params![FRESH_PER_DRIVE], |row| row.get::<_, String>(0))?
@@ -2402,7 +3393,7 @@ async fn create_fresh(state: &AppState, claim: FreshClaim) {
                     queue_outcome(
                         conn,
                         &run_id,
-                        false,
+                        "failed",
                         Some(failure::FRESH_REFUSED),
                         &now_rfc3339(),
                     )
@@ -2620,14 +3611,12 @@ mod tests {
                 ..
             })
         ));
-        let mut with_check = request(json!({"kind": "at", "afterSecs": 1}));
-        with_check.check = Some(json!({"command": "true"}));
         assert!(matches!(
-            check_add(&with_check, now),
-            Err(WakeError::Unsupported {
-                reason: "check-unsupported",
-                ..
-            })
+            check_add(
+                &request(json!({"kind": "when", "factKind": "wake-failed"})),
+                now
+            ),
+            Err(WakeError::BadRequest(_))
         ));
         let mut long = request(json!({"kind": "at", "afterSecs": 1}));
         long.text = "x".repeat(WAKE_TEXT_MAX_CHARS + 1);
@@ -2643,6 +3632,85 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    fn with_check(check: Value) -> WakeAddRequest {
+        let mut add = request(json!({"kind": "every", "everySecs": 180}));
+        add.check = Some(serde_json::from_value(check).unwrap());
+        add
+    }
+
+    /// §11.2: the timeout is mandatory and bounded, the command bounded, and
+    /// the check is part of what a repeat must match.
+    #[test]
+    fn a_check_is_bounded_and_its_timeout_is_mandatory() {
+        let now = at("2026-11-04T10:00:00.000Z");
+        let checked = check_add(
+            &with_check(json!({"command": " test -s q ", "hostId": "hst_a", "timeoutSecs": 30})),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            checked.check,
+            Some(CheckedCheck {
+                command: "test -s q".into(),
+                host_id: Some("hst_a".into()),
+                timeout_secs: 30
+            })
+        );
+        let other = check_add(
+            &with_check(json!({"command": "test -s r", "hostId": "hst_a", "timeoutSecs": 30})),
+            now,
+        )
+        .unwrap();
+        assert_ne!(
+            checked.request_json, other.request_json,
+            "a changed command is a new add"
+        );
+        for bad in [
+            json!({"command": "true"}),
+            json!({"command": "true", "timeoutSecs": 0}),
+            json!({"command": "true", "timeoutSecs": WAKE_CHECK_TIMEOUT_MAX_SECS + 1}),
+            json!({"command": "true", "timeoutSecs": -5}),
+            json!({"timeoutSecs": 5}),
+            json!({"command": "   ", "timeoutSecs": 5}),
+            json!({"command": "x".repeat(WAKE_CHECK_COMMAND_MAX_CHARS + 1), "timeoutSecs": 5}),
+            json!({"command": "true", "timeoutSecs": 5, "hostId": "two words"}),
+        ] {
+            assert!(
+                matches!(
+                    check_add(&with_check(bad.clone()), now),
+                    Err(WakeError::BadRequest(_))
+                ),
+                "{bad}"
+            );
+        }
+        let longest = "x".repeat(WAKE_CHECK_COMMAND_MAX_CHARS);
+        assert!(
+            check_add(
+                &with_check(json!({"command": longest, "timeoutSecs": 3600})),
+                now
+            )
+            .is_ok()
+        );
+    }
+
+    /// A credential in a check's command is refused as one, before any
+    /// other check (a missing timeout included), and never echoed.
+    #[test]
+    fn a_credential_in_a_check_is_refused_as_one() {
+        let now = at("2026-11-04T10:00:00.000Z");
+        let secret = ["sk", "-ant-api03-", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"].concat();
+        let refused = check_add(
+            &with_check(json!({"command": format!("curl -H 'x-api-key: {secret}' q")})),
+            now,
+        );
+        let Err(WakeError::SecretRejected { field, rule }) = refused else {
+            panic!("expected a secret refusal");
+        };
+        assert_eq!(field, "check.command");
+        let body = WakeError::SecretRejected { field, rule }.into_response();
+        assert_eq!(body.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

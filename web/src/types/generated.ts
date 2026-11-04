@@ -1707,7 +1707,7 @@ export type InboxFact = ({
 });
 
 /** InboxFactKind wire values; `protocol.md` §8.4. */
-export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold");
+export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold" | "wake-failed");
 
 /** Why and when a row fell back to the owner push (§10.1 item 4). */
 export type InboxFallback = ({
@@ -4983,7 +4983,7 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 
 /** `POST /v1/lineages/{id}/wake-ups`. */
 export type WakeAddRequest = ({
-  "check"?: unknown;
+  "check"?: (WakeCheckRequest | (null));
   "mode"?: (WakeMode | (null));
   "name"?: (string | null);
   "notify": WakeNotify;
@@ -5004,6 +5004,57 @@ export type WakeAt = ({
   "at"?: (string | null);
   [key: string]: unknown;
 });
+
+/** A stored wake-up's check, and how it was admitted. */
+export type WakeCheck = ({
+  "admission": WakeCheckAdmission;
+  "approvalId"?: (string | null);
+  "command": (string);
+  "hostId": (string);
+  "timeoutSecs": (number);
+  [key: string]: unknown;
+});
+
+/** WakeCheckAdmission wire values; `protocol.md` §8.4. */
+export type WakeCheckAdmission = ("owner" | "own-host-bypass" | "approved");
+
+/** WakeCheckOutcome wire values; `protocol.md` §8.4. */
+export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable");
+
+/** `wake.check` params (Hub→Node). */
+export type WakeCheckParams = ({
+  "command": (string);
+  "cwd"?: (string | null);
+  "env": ({
+  [key: string]: (string);
+});
+  "runId": (string);
+  "timeoutSecs": (number);
+  "workspaceId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** `check` on an add. Every field is optional on the wire so that a missing one is refused with the Hub's own 400, not a body-parse error. */
+export type WakeCheckRequest = ({
+  "command"?: (string | null);
+  "hostId"?: (string | null);
+  "timeoutSecs"?: (number | null);
+});
+
+/** `wake.check` result. */
+export type WakeCheckResult = ({
+  "exitCode"?: (number | null);
+  "outcome": WakeCheckOutcome;
+  "runId": (string);
+  "signal"?: (number | null);
+  "stdout": (string);
+  "stdoutTruncated": (boolean);
+  "summary": (string);
+  [key: string]: unknown;
+});
+
+/** WakeCheckState wire values; `protocol.md` §8.4. */
+export type WakeCheckState = ("pending" | "running" | "passed" | "skipped" | "failed" | "interrupted");
 
 /** Who added a wake-up. */
 export type WakeCreator = ({
@@ -5043,6 +5094,7 @@ export type WakeRemoved = ({
 /** One run of a wake-up. */
 export type WakeRun = ({
   "batchId"?: (string | null);
+  "check"?: (WakeRunCheck | (null));
   "checkExit": (number | null);
   "childInstanceId"?: (string | null);
   "endedAt"?: (string | null);
@@ -5058,6 +5110,16 @@ export type WakeRun = ({
   "startedAt"?: (string | null);
   "state": WakeRunState;
   "wakeId": (string);
+  [key: string]: unknown;
+});
+
+/** One run's check. */
+export type WakeRunCheck = ({
+  "hostId": (string);
+  "output"?: (string | null);
+  "outputTruncated"?: (boolean);
+  "state": WakeCheckState;
+  "summary"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -5078,10 +5140,11 @@ export type WakeTrigger = (WakeAt & ({
 
 /** One wake-up row. */
 export type WakeUp = ({
-  "check"?: unknown;
+  "check"?: (WakeCheck | (null));
   "createdAt": (string);
   "creator": WakeCreator;
   "lastFiredAt"?: (string | null);
+  "lastRunAt"?: (string | null);
   "lineageId": (string);
   "missedCount": (number);
   "mode": WakeMode;

@@ -219,6 +219,7 @@ test.describe("home-main-extras", () => {
     const { context, page } = await phonePage(browser);
     try {
       const mainId = await seatMain(page, "hextras-main phone");
+      const host = await fakeHost(page);
       const lineageId = await lineageOf(page, mainId);
       const wakeName = `hextras-${Date.now().toString(36)}`;
       await addWake(page, lineageId, wakeName);
@@ -227,6 +228,16 @@ test.describe("home-main-extras", () => {
       const cardBox = page.getByTestId("main-card");
       await expect(cardBox).toBeVisible({ timeout: 20_000 });
       await expect(cardBox).toHaveAttribute("data-main-id", mainId);
+
+      // ② ★ rides Main's host chip even though the single-host strip is
+      // collapsed (home.md §1 ②, r2 item 1).
+      const star = page.getByTestId("host-main-star");
+      await expect(star).toBeVisible({ timeout: 20_000 });
+      await expect(star.locator("xpath=ancestor::*[@data-testid='host-chip']")).toHaveAttribute(
+        "data-host-id",
+        host.id!,
+      );
+      await expect(page.getByTestId("host-summary")).toContainText("主机在线");
 
       // ⑩: the line names the next fire and the active count.
       const line = page.getByTestId("main-wake-line");
@@ -256,6 +267,14 @@ test.describe("home-main-extras", () => {
       await page.getByTestId("wakes-close").click();
 
       // ⑨: chips appear only on focus and a tap fills the dock's draft.
+      // Observe every command POST from here on: the chip tap must produce
+      // none (the hand-off later does, proving the window and the listener).
+      const commandPosts: string[] = [];
+      page.on("request", (request) => {
+        if (request.method() !== "POST") return;
+        if (!/\/v1\/instances\/[^/]+\/commands$/.test(new URL(request.url()).pathname)) return;
+        commandPosts.push(request.postData() ?? "");
+      });
       const dock = page.getByTestId("main-ask-dock");
       await expect(dock).toBeVisible();
       await expect(page.getByTestId("composer-suggestions")).toHaveCount(0);
@@ -266,7 +285,7 @@ test.describe("home-main-extras", () => {
       await expect(chip).toContainText("谁在等我");
       await chip.click();
       await expect(input).toHaveValue("谁在等我");
-      // The tap filled the draft; it did not send it.
+      // A second tap fills nothing new: the draft only keeps what was typed.
       await expect(page.getByTestId("main-card-reply")).not.toContainText("echo: 谁在等我");
 
       // §6.4 交给 Main: a worker question quotes itself to Main, stays pending.
@@ -276,18 +295,27 @@ test.describe("home-main-extras", () => {
       // Main's own pending approval is pinned first and labelled.
       const pinned = page.locator('[data-testid="home-queue-card"][data-main-asking="1"]');
       await expect(pinned.first()).toContainText("Main 在问你");
+      // r2: Main never gets its own pinned question back.
+      await expect(pinned.first().getByTestId("home-card-more")).toHaveCount(0);
       const askCard = card(page, worker.interactionId);
       await expect(askCard).toBeVisible({ timeout: 20_000 });
       await expect(askCard).toHaveAttribute("data-home-kind", "simple-question");
       await askCard.getByTestId("home-card-more").click();
       await page.getByTestId("home-card-hand-main").click();
+      // r2: the receipt is the command's SETTLED outcome, not the enqueue.
       await expect(askCard.getByTestId("home-card-hand-receipt")).toHaveText("已交给 Main");
+      await expect(askCard.getByTestId("home-card-hand-receipt")).toHaveAttribute("data-state", "accepted");
       // The quote reached Main's journal…
       await expect.poll(async () => journalHas(page, mainId, "untrusted:"), { timeout: 30_000 }).toBe(true);
       await expect.poll(async () => journalHas(page, mainId, "旧迁移 0042 删掉还是保留？"), { timeout: 30_000 }).toBe(true);
       // …and the interaction itself is still pending.
       expect(await pendingOnHub(page, worker.interactionId)).toBe(true);
       await expect(askCard).toBeVisible();
+      // r2 item 8: the chip tap never sent. The hand-off POST above proves
+      // this observer was live and the window elapsed; no command carried the
+      // chip's question.
+      expect(commandPosts.length, "the hand-off command was observed").toBeGreaterThan(0);
+      expect(commandPosts.some((body) => body.includes("谁在等我"))).toBe(false);
     } finally {
       await cleanup(page);
       await context.close();
@@ -306,6 +334,8 @@ test.describe("home-main-extras", () => {
       const aside = page.getByTestId("sessions-aside");
       await expect(aside).toBeVisible({ timeout: 20_000 });
       await expect(aside.getByTestId("main-card")).toHaveAttribute("data-main-id", mainId);
+      // ② ★ is visible in the all-online collapsed strip at 1440 too (r2).
+      await expect(page.getByTestId("host-main-star")).toBeVisible({ timeout: 20_000 });
       // §2.2: the right column owns ⑩ here, so the card has no third line.
       await expect(page.getByTestId("main-wake-line")).toHaveCount(0);
       const today = aside.getByTestId("home-today");

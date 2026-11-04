@@ -5,6 +5,7 @@ import { useNowTick } from "../../lib/useNowTick";
 import { readPushStatus, type PushStatus } from "../../lib/push";
 import { useHomeFreshness } from "./freshness";
 import { hostStrip } from "./hostStrip";
+import type { HostStripChip } from "./hostStrip";
 import css from "./hostStrip.module.css";
 
 /**
@@ -13,9 +14,11 @@ import css from "./hostStrip.module.css";
  * Phone: a 28px row under ①, scrolling with the page. Desktop: the 32px band
  * under the PageHeader, whose right end carries the 「空间 ▸」 toggle
  * (`trailing`). Offline hosts come first as 「离线 Nm」; when every host is OK
- * the strip collapses to one [N/M 主机在线 ›] chip. The Hub chip appears only
- * while the list is stale (home.md §8) and the 「通知未开」 chip only while
- * notifications are not granted. ★ belongs to home-main-extras and is absent.
+ * the strip collapses to a [N/M 主机在线 ›] summary. ★ marks Main's host
+ * (home.md §1 ②, home-main-extras): it rides that host's own chip, which stays
+ * visible beside the collapsed summary so the mark is never hidden. The Hub
+ * chip appears only while the list is stale (home.md §8) and the 「通知未开」
+ * chip only while notifications are not granted.
  */
 export function HostStrip({
   placement,
@@ -72,33 +75,18 @@ export function HostStrip({
             添加主机 ›
           </Link>
         ) : model.collapsed ? (
-          <Link className={css.chip} data-testid="host-summary" to="/hosts">
-            {model.online}/{model.total} 主机在线 ›
-          </Link>
-        ) : (
-          model.chips.map((chip) => (
-            <Link
-              key={chip.id}
-              className={css.chip}
-              data-testid="host-chip"
-              data-host-id={chip.id}
-              data-offline={chip.offline ? "1" : "0"}
-              to={`/hosts/${chip.id}`}
-              title={chip.label}
-            >
-              <span className={css.name}>{chip.label}</span>
-              {chip.main ? (
-                <span className={css.mainMark} data-testid="host-main-star" title="Main 所在主机" aria-label="Main 所在主机">
-                  ★
-                </span>
-              ) : null}
-              {chip.offline ? (
-                <span className={css.offline}>
-                  ┄离线{chip.age ? ` ${chip.age}` : ""}
-                </span>
-              ) : null}
+          <>
+            {/* Main's own host chip stays beside the summary so ★ is visible
+                in the all-online state too (home.md §1 ②). */}
+            {model.chips.map((chip) => (
+              <HostChipLink key={chip.id} chip={chip} />
+            ))}
+            <Link className={css.chip} data-testid="host-summary" to="/hosts">
+              {model.online}/{model.total} 主机在线 ›
             </Link>
-          ))
+          </>
+        ) : (
+          model.chips.map((chip) => <HostChipLink key={chip.id} chip={chip} />)
         )}
         {hubDown && !unknown ? (
           <span className={css.chip} data-testid="host-hub-chip" data-tone="attention">
@@ -113,5 +101,27 @@ export function HostStrip({
       </div>
       {trailing ? <div className={css.trailing}>{trailing}</div> : null}
     </div>
+  );
+}
+
+/** One host chip; ★ rides Main's host (home.md §1 ②). */
+function HostChipLink({ chip }: { chip: HostStripChip }) {
+  return (
+    <Link
+      className={css.chip}
+      data-testid="host-chip"
+      data-host-id={chip.id}
+      data-offline={chip.offline ? "1" : "0"}
+      to={`/hosts/${chip.id}`}
+      title={chip.label}
+    >
+      <span className={css.name}>{chip.label}</span>
+      {chip.main ? (
+        <span className={css.mainMark} data-testid="host-main-star" title="Main 所在主机" aria-label="Main 所在主机">
+          ★
+        </span>
+      ) : null}
+      {chip.offline ? <span className={css.offline}>┄离线{chip.age ? ` ${chip.age}` : ""}</span> : null}
+    </Link>
   );
 }

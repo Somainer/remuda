@@ -86,4 +86,23 @@ describe("② ★ on Main's host (§1 ②, home-main-extras)", () => {
     renderStrip();
     expect(screen.queryByTestId("host-main-star")).toBeNull();
   });
+
+  it("keeps ★ visible when every host is online and the strip collapses", () => {
+    fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
+    fake.main = { instance: { hostId: "hst_main" } };
+    fake.state = hub({
+      hosts: [
+        { id: "hst_main", label: "forge", state: "online" },
+        { id: "hst_other", label: "studio", state: "online" },
+      ],
+    } as Partial<HubState>);
+    renderStrip();
+    // The summary chip is still there, and Main's own chip sits beside it.
+    expect(screen.getByTestId("host-summary")).toHaveTextContent("2/2 主机在线");
+    const chip = screen.getByText("forge").closest("[data-testid='host-chip']")!;
+    expect(chip.querySelector("[data-testid='host-main-star']")).not.toBeNull();
+    // The other online host folds into the summary.
+    expect(screen.queryByText("studio")).toBeNull();
+    fake.main = null;
+  });
 });

@@ -79,6 +79,22 @@ describe("hostStrip", () => {
     expect(model).toMatchObject({ total: 3, online: 3, collapsed: true, chips: [] });
   });
 
+  it("keeps Main's host chip beside the collapsed summary so ★ stays visible", () => {
+    const model = hostStrip(
+      [host({ id: "a", label: "a" }), host({ id: "forge", label: "forge" }), host({ id: "c", label: "c" })],
+      NOW,
+      "forge",
+    );
+    expect(model.collapsed).toBe(true);
+    expect(model.online).toBe(3);
+    expect(model.chips.map((chip) => [chip.id, chip.main, chip.offline])).toEqual([["forge", true, false]]);
+  });
+
+  it("has no chip in the collapsed state when no Main resolves", () => {
+    const model = hostStrip([host({ id: "a", label: "a" })], NOW, null);
+    expect(model).toMatchObject({ collapsed: true, chips: [] });
+  });
+
   it("does not collapse an empty list: the strip offers 添加主机 instead", () => {
     expect(hostStrip([], NOW)).toEqual({ total: 0, online: 0, collapsed: false, chips: [] });
   });

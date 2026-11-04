@@ -412,7 +412,11 @@ async fn create_fleet(
                 spec: host_spec,
                 operation: "instance.create",
                 idempotency_key: None,
-                delegation: crate::store::InstanceDelegation::default(),
+                // home-glance-d060 §5.3: the operator fan-out is hand-opened.
+                delegation: crate::store::InstanceDelegation {
+                    creator_origin: Some(crate::agent_scope::origin_wire(&device).to_string()),
+                    ..Default::default()
+                },
                 initiator: fleet_initiator.clone(),
                 initiator_device_id: fleet_device_id.clone(),
             },

@@ -609,6 +609,7 @@ function HomeDecision({
       data-interaction-id={item.id}
       data-kind={item.kind}
       data-home-kind={kind}
+      data-main-asking={home.mainAsking ? "1" : undefined}
       data-state={uiState}
       data-focus={focused ? "true" : "false"}
       data-receipt={home.receipt ?? undefined}

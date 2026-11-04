@@ -214,7 +214,8 @@ describe("HomeQueue (§4.1)", () => {
     renderQueue("phone");
     expect(cards().map((card) => card.getAttribute("data-card-id"))).toEqual(["int_main", "int_other"]);
     expect(cards()[0]).toHaveTextContent("Main 在问你");
-    expect(cards()[1]).not.toHaveTextContent("Main 在问你");
+    expect(cards()[0]).toHaveAttribute("data-main-asking", "1");
+    expect(cards()[1]).not.toHaveAttribute("data-main-asking");
     // The pinned card is one of the same queue rows: N = 2, never 3.
     expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 2");
   });

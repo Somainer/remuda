@@ -135,7 +135,7 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
           </span>
         </button>
       ) : null}
-      {!aside && wakeText ? (
+      {!aside && wakesOpen ? (
         <WakeSheet
           open={wakesOpen}
           wakes={wakes.wakes}

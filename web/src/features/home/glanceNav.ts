@@ -6,6 +6,13 @@
 export const GLANCE_TARGETS = {
   /** The ④ 需要你 queue's element id (home.md §4; the push/① scroll anchor). */
   queueId: "home-queue",
+  /**
+   * ⑥'s 「+N ›」: the board filtered by the SAME §3.1 rank the 工作中 count
+   * uses, across every Space. A rank filter keeps dispatched workers and
+   * sessions on a dropped host (rank reads lifecycle and activity, never
+   * connectivity); `status=working` filtered on UiStatus and dropped both.
+   */
+  workingHref: "/sessions?rank=working&scope=all",
 } as const;
 
 /**

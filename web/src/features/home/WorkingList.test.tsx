@@ -6,6 +6,7 @@ import { mockDb } from "../../lib/mock";
 import type { OwnerGlance, OwnerGlanceRow } from "../../types/generated";
 import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
+import { GLANCE_TARGETS } from "./glanceNav";
 import { WorkingList } from "./WorkingList";
 
 const hub = {
@@ -84,6 +85,10 @@ describe("WorkingList (home.md ⑥)", () => {
     expect(rows).toHaveLength(5);
     expect(rows[0].textContent).toContain("title ins_7");
     expect(screen.getByTestId("home-working-overflow").textContent).toBe("+2 ›");
+    // [r5 item 1] +N opens the board under the rank the count uses, not the
+    // UiStatus filter (SessionsPage.glance.test pins what that board lists).
+    expect(screen.getByTestId("home-working-overflow")).toHaveAttribute("href", GLANCE_TARGETS.workingHref);
+    expect(GLANCE_TARGETS.workingHref).toBe("/sessions?rank=working&scope=all");
     expect(screen.getByText("工作中 · 7")).toBeTruthy();
   });
 

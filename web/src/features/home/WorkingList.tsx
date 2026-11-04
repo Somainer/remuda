@@ -5,6 +5,7 @@ import { formatListTime } from "../../lib/format";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import { HOME_FRESHNESS } from "./freshness";
+import { GLANCE_TARGETS } from "./glanceNav";
 import type { Id } from "../../types/wire";
 import { RowActions, ROW_ACTIONS_HOST } from "./RowActions";
 import css from "./workingList.module.css";
@@ -14,9 +15,9 @@ const WORKING_ROWS = 5;
 
 /**
  * ⑥ 「工作中」 (home.md §2.2): the desktop right column's list of running
- * sessions at ≥1440, newest first, five rows then 「+N ›」 to the list filtered
- * on 工作中. Each row opens /s/:id; its ⋯ holds 中断 (the turn only — the
- * process keeps running). Stale data greys out while the Hub link is not live.
+ * sessions at ≥1440, newest first, five rows then 「+N ›」 to the board filtered
+ * by the 工作中 rank the count uses (`GLANCE_TARGETS.workingHref`). Each row
+ * opens /s/:id; its ⋯ holds 中断 (the turn only — the process keeps running). Stale data greys out while the Hub link is not live.
  *
  * home-glance-d060: the membership, the count and the row's one-line headline
  * all come from the SAME `GET /v1/owner/glance` the ① row reads (home.md
@@ -82,7 +83,7 @@ export function WorkingList() {
         </ul>
       )}
       {total !== null && total > WORKING_ROWS ? (
-        <Link className={css.overflow} to="/sessions?status=working&scope=all" data-testid="home-working-overflow">
+        <Link className={css.overflow} to={GLANCE_TARGETS.workingHref} data-testid="home-working-overflow">
           +{total - WORKING_ROWS} ›
         </Link>
       ) : null}

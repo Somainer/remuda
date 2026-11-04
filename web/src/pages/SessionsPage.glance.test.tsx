@@ -16,6 +16,7 @@ import { hubStore } from "../lib/store";
 import type { OwnerGlance } from "../types/generated";
 import type { Instance } from "../types/instance";
 import { known } from "../types/wire";
+import { GLANCE_TARGETS } from "../features/home/glanceNav";
 import { SessionsPage } from "./SessionsPage";
 
 vi.mock("../lib/viewport", () => ({
@@ -463,4 +464,85 @@ it("drops the 子 agent caption when a rank filter lists the workers", async () 
   expect(screen.getAllByTestId("board-card")).toHaveLength(2);
   expect(screen.getByTestId("session-group-meta-recent")).toHaveTextContent("2");
   expect(screen.getByTestId("session-group-meta-recent")).not.toHaveTextContent("子 agent");
+});
+
+/**
+ * [r5 item 1] ⑥'s 「+N ›」 must open the set ⑥ counted. Among more than five
+ * working rows sit a dispatched worker (the unfiltered board hides it) and a
+ * session on a disconnected host (UiStatus calls it offline, not working); the
+ * destination still lists exactly the glance's working set, and nothing else.
+ */
+it("opens ⑥'s +N on exactly the working set the glance counted", async () => {
+  const hostA = {
+    ...mockDb.hosts[0],
+    id: "host-a",
+    workspaces: [{ workspaceId: "wsp-a", hostId: "host-a", root: "/home/dev/ws" }],
+  };
+  const hostB = {
+    ...mockDb.hosts[0],
+    id: "host-b",
+    state: "offline",
+    workspaces: [{ workspaceId: "wsp-b", hostId: "host-b", root: "/home/dev/ws" }],
+  };
+  const base = {
+    ...mockDb.instances[0],
+    hostId: "host-a",
+    workspaceId: "wsp-a",
+    lifecycle: "running",
+    connectivity: "connected",
+    activity: known("working"),
+    parent: null,
+    creatorOrigin: "human",
+  };
+  const plain = ["ins-w1", "ins-w2", "ins-w3", "ins-w4", "ins-w5"].map((id) => ({ ...base, id }) as Instance);
+  const child = {
+    ...base,
+    id: "ins-w-child",
+    parent: { instanceId: "ins-w1", runId: null, commandId: null },
+    creatorOrigin: "agent",
+  } as Instance;
+  const offline = {
+    ...base,
+    id: "ins-w-offline",
+    hostId: "host-b",
+    workspaceId: "wsp-b",
+    connectivity: "disconnected",
+  } as Instance;
+  // Not counted: an idle session and an idle dispatched worker.
+  const idle = { ...base, id: "ins-idle", activity: known("idle") } as Instance;
+  const idleChild = { ...child, id: "ins-idle-child", activity: known("idle") } as Instance;
+  const counted = [...plain, child, offline].map((row) => row.id as string);
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [hostA, hostB], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [...plain, child, offline, idle, idleChild],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue({
+    ...glance({ working: counted.length }),
+    working: counted.map((instanceId) => ({ instanceId, kind: "working", headline: instanceId })),
+  });
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+  await hubStore.refreshGlance();
+  expect(counted).toHaveLength(7);
+
+  render(
+    <MemoryRouter initialEntries={[GLANCE_TARGETS.workingHref]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  await screen.findByTestId("session-list");
+  const ids = screen
+    .getAllByTestId("board-card")
+    .map((card) => card.getAttribute("data-instance-id"))
+    .sort();
+  expect(ids).toEqual([...counted].sort());
 });

@@ -362,7 +362,12 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 
 **范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义：
 
-- **Main 子树**：`address-owner` 持有者血缘的当前章节（没有现行章节时取最近一版）所在的 `lineage_id` 及以此起点的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。
+- **Main 子树**：先按**唯一的 Main 解析规则**定出 Main 的章节，再取它所在 `lineage_id` 的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。Main 解析规则（Hub 端 `owner_glance::pick_main_seat`，客户端 `resolveMain`，两边跑同一份用例 `crates/remuda-hub/tests/fixtures/main_seat_cases.json`）：
+  1. 在所有持有 `address-owner` 的章节里，取**现行**章节：没有 `fenced_at`，并且没结束（不是 `exited` / `failed` / `closing`），或者是 §5 的失联行（`last_error = host-contact-lost`，可能仍在运行）；有多个时取 generation 最高的，再取最近更新的；
+  2. **没有现行章节时取最近一版**：Main 暂停、关闭或结束后，取每条 `address-owner` 血缘的最新章节（generation 最高，再按最近更新），再在这些血缘里取最近更新的那条；
+  3. 时间完全相同按 id 升序取第一个，所以结果不依赖读取顺序。
+
+  因此 Main 暂停（关闭一条续跑血缘的章节 = 无继任的 fence，会给章节写上 `fenced_at`）时，它的血缘照样解析得出来，它派出去还在跑的 worker 仍计入 ① 和 ⑥。
 - **owner 亲手开的会话（hand-opened）**：**一条规则**——会话本身或其恢复/续跑链的**根**（该链第 1 章）是一个**真根**（没有 `parentInstanceId`、没有 `resumedFrom`，`lineage_id` 为空或等于自身），并且这个真根是 owner 自己的 **Human 设备**创建的。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体；升级前的旧行由打开数据库时的幂等回填补齐：有 Agent 派发审计行或 `spec.parentInstanceId` 的判为 `agent`；血缘 `origin_spec_ref.seatedOrigin` 是 Human 的判为 `human`；剩下的、没有创建者证据的真根判为 `legacy`，按 hand-opened 对待。链的其余章节（`resumedFrom`，以及同一血缘 `generation > 1` 的续跑章节，第 2 章、第 3 章……）跟随根进入范围；续跑继任行自身也继承并写入根的 `creator_origin`。由此：
   - **Bot 创建的根不算**（包括 owner 后来用 Human 设备重新拉起的 Bot 会话——它的链根仍是 Bot 会话，不是一个真根）；
   - 监督进程重启的 worker、自动续跑的继任章节不算——它们的链根是 Agent 派发的 worker；

@@ -1,0 +1,95 @@
+{
+  "about": "home.md §5.3 / §6.1: the ONE Main resolution. The Hub (owner_glance::pick_main_seat) and the client (web/src/lib/store.ts resolveMain) both run every case; rows are address-owner chapters. timeMs is updatedAt in Unix ms.",
+  "cases": [
+    {
+      "name": "no address-owner chapter resolves nothing",
+      "seats": [],
+      "expect": null
+    },
+    {
+      "name": "the one live chapter",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "running", "lastError": null, "fenced": false, "timeMs": 1000 }
+      ],
+      "expect": "ins_a1"
+    },
+    {
+      "name": "a paused Main (its only chapter fenced) still resolves",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "running", "lastError": null, "fenced": true, "timeMs": 1000 }
+      ],
+      "expect": "ins_a1"
+    },
+    {
+      "name": "a closed Main (ended and fenced) still resolves",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 1000 }
+      ],
+      "expect": "ins_a1"
+    },
+    {
+      "name": "the live successor beats its fenced predecessor",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 5000 },
+        { "instanceId": "ins_a2", "lineageId": "ins_a1", "generation": 2, "lifecycle": "running", "lastError": null, "fenced": false, "timeMs": 2000 }
+      ],
+      "expect": "ins_a2"
+    },
+    {
+      "name": "within a paused lineage the newest generation wins over a later touch",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 9000 },
+        { "instanceId": "ins_a2", "lineageId": "ins_a1", "generation": 2, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 3000 }
+      ],
+      "expect": "ins_a2"
+    },
+    {
+      "name": "any live chapter beats a newer-generation dead lineage",
+      "seats": [
+        { "instanceId": "ins_a3", "lineageId": "ins_a1", "generation": 3, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 9000 },
+        { "instanceId": "ins_b1", "lineageId": "ins_b1", "generation": 1, "lifecycle": "running", "lastError": null, "fenced": false, "timeMs": 1000 }
+      ],
+      "expect": "ins_b1"
+    },
+    {
+      "name": "between dead lineages the more recently touched lineage wins, whatever the generation",
+      "seats": [
+        { "instanceId": "ins_a3", "lineageId": "ins_a1", "generation": 3, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 4000 },
+        { "instanceId": "ins_b1", "lineageId": "ins_b1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 7000 }
+      ],
+      "expect": "ins_b1"
+    },
+    {
+      "name": "a contact-loss row (exited, host-contact-lost, not fenced) is live",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "exited", "lastError": "host-contact-lost", "fenced": false, "timeMs": 1000 },
+        { "instanceId": "ins_b1", "lineageId": "ins_b1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 9000 }
+      ],
+      "expect": "ins_a1"
+    },
+    {
+      "name": "a closing chapter is not live",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "closing", "lastError": null, "fenced": false, "timeMs": 9000 },
+        { "instanceId": "ins_b1", "lineageId": "ins_b1", "generation": 1, "lifecycle": "running", "lastError": null, "fenced": false, "timeMs": 1000 }
+      ],
+      "expect": "ins_b1"
+    },
+    {
+      "name": "two live chapters (a racing successor): the newest generation",
+      "seats": [
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "running", "lastError": null, "fenced": false, "timeMs": 9000 },
+        { "instanceId": "ins_a2", "lineageId": "ins_a1", "generation": 2, "lifecycle": "starting", "lastError": null, "fenced": false, "timeMs": 1000 }
+      ],
+      "expect": "ins_a2"
+    },
+    {
+      "name": "an exact tie falls to the lower id",
+      "seats": [
+        { "instanceId": "ins_b1", "lineageId": "ins_b1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 5000 },
+        { "instanceId": "ins_a1", "lineageId": "ins_a1", "generation": 1, "lifecycle": "exited", "lastError": null, "fenced": true, "timeMs": 5000 }
+      ],
+      "expect": "ins_a1"
+    }
+  ]
+}

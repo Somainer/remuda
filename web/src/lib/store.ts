@@ -9307,6 +9307,11 @@ export function useHub(): HubState {
  * - otherwise the latest chapter of the most recent address-owner lineage,
  *   which the surfaces label as paused/stopped.
  * - `null` when no address-owner lineage exists: nothing Main renders.
+ *
+ * home-glance-d060 (home.md §5.3): the Hub resolves Main for the owner glance
+ * with the SAME rule (`owner_glance::pick_main_seat`); both run the cases in
+ * `crates/remuda-hub/tests/fixtures/main_seat_cases.json`, so a paused Main's
+ * subtree is the same set on both sides. Exact ties fall to the lower id.
  */
 export type MainEntry = {
   /** The chapter Main addresses (sends, Stop, Pause, Resume target it). */
@@ -9335,6 +9340,14 @@ function chapterTime(instance: Instance): number {
   return Number.isFinite(t) ? t : 0;
 }
 
+/** The more recently touched chapter; an exact tie falls to the lower id. */
+function laterChapter(a: Instance, b: Instance): Instance {
+  const ta = chapterTime(a);
+  const tb = chapterTime(b);
+  if (ta !== tb) return ta > tb ? a : b;
+  return a.id <= b.id ? a : b;
+}
+
 export function resolveMain(instances: readonly Instance[]): MainEntry | null {
   const seats = instances.filter((row) => row.grants?.includes(ADDRESS_OWNER_GRANT));
   if (seats.length === 0) return null;
@@ -9346,9 +9359,7 @@ export function resolveMain(instances: readonly Instance[]): MainEntry | null {
       ? generationOf(a) > generationOf(b)
         ? a
         : b
-      : chapterTime(a) >= chapterTime(b)
-        ? a
-        : b;
+      : laterChapter(a, b);
   const live = seats.filter(mainChapterLive);
   let pick: Instance;
   if (live.length > 0) {
@@ -9361,7 +9372,7 @@ export function resolveMain(instances: readonly Instance[]): MainEntry | null {
       const current = latestByLineage.get(key);
       latestByLineage.set(key, current ? newer(current, row) : row);
     }
-    pick = [...latestByLineage.values()].reduce((a, b) => (chapterTime(a) >= chapterTime(b) ? a : b));
+    pick = [...latestByLineage.values()].reduce(laterChapter);
   }
   const lineageId = lineageOf(pick);
   const chapterIds = instances

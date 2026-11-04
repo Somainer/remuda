@@ -101,6 +101,7 @@ async fn enroll_node(
 
 struct Ctx {
     _dir: tempfile::TempDir,
+    data_dir: std::path::PathBuf,
     hub: remuda_hub::RunningHub,
     http: reqwest::Client,
     human: String,
@@ -135,6 +136,7 @@ impl Ctx {
         let node = enroll_node(&hub, &host, &workspace).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
         Ok(Ctx {
+            data_dir: dir.path().join("hub"),
             _dir: dir,
             hub,
             http: reqwest::Client::new(),
@@ -421,6 +423,78 @@ async fn the_scope_is_main_subtree_plus_hand_opened_not_private_lineages() -> Re
             .iter()
             .all(|row| row["instanceId"].as_str() != Some(private.as_str())),
         "the out-of-scope session gets no waiting row: {waiting:?}"
+    );
+    Ok(())
+}
+
+/// [r4 item 1] A paused Main must not drop its subtree: the owner taps 暂停
+/// (the close of a continuity lineage = F without successor, which fences the
+/// chapter) while a worker Main dispatched keeps working. The Main seat still
+/// resolves (home.md §5.3, the shared `main_seat_cases`), so the worker is
+/// still counted in ① and listed in ⑥'s rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_main_keeps_its_working_subtree_in_the_glance() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("glance-paused-main").await?;
+    let main = ctx
+        .create_session(
+            &ctx.human,
+            json!({ "role": "top-coordinator", "projectId": project,
+                    "prompt": "coordinate", "driver": "claude-pty" }),
+        )
+        .await?;
+    let main_token = ctx.agent_token(&main).await?;
+    let worker = ctx
+        .create_session(
+            &main_token,
+            json!({ "role": "worker", "projectId": project, "prompt": "work",
+                    "driver": "claude-pty" }),
+        )
+        .await?;
+    ctx.activity(&worker, "working").await?;
+
+    let working_ids = |glance: &Value| -> Vec<String> {
+        glance["working"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["instanceId"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (status, before) = ctx.get(&ctx.human, "/v1/owner/glance").await?;
+    assert_eq!(status, 200, "{before}");
+    assert!(working_ids(&before).contains(&worker), "{before}");
+
+    // 暂停: the close of a continuity lineage's chapter fences it.
+    let response = ctx
+        .http
+        .post(format!("{}/v1/instances/{main}/commands", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({ "operation": "instance.close", "payload": {} }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    assert!(status.is_success(), "pause {status}: {body}");
+    assert_eq!(body["paused"], true, "{body}");
+    let db = rusqlite::Connection::open(ctx.data_dir.join("hub.sqlite"))?;
+    let fenced: Option<String> = db.query_row(
+        "SELECT fenced_at FROM instances WHERE id = ?1",
+        rusqlite::params![main],
+        |row| row.get(0),
+    )?;
+    assert!(fenced.is_some(), "the pause fenced Main's chapter");
+    drop(db);
+
+    let (status, after) = ctx.get(&ctx.human, "/v1/owner/glance").await?;
+    assert_eq!(status, 200, "{after}");
+    assert!(
+        working_ids(&after).contains(&worker),
+        "the paused Main's working worker is still listed: {after}"
+    );
+    assert_eq!(
+        after["counts"]["working"], before["counts"]["working"],
+        "and still counted: {before} → {after}"
     );
     Ok(())
 }

@@ -49,6 +49,122 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new().route("/v1/owner/glance", get(owner_glance))
 }
 
+// ── the Main seat (home.md §5.3 / §6.1) ────────────────────────────────────
+
+/// One `address-owner` chapter, as the Main resolver reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MainSeatRow {
+    pub instance_id: String,
+    pub lineage_id: String,
+    pub generation: i64,
+    pub lifecycle: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Whether authority moved away from this chapter (`fenced_at` set).
+    pub fenced: bool,
+    /// `updated_at` (else `created_at`) as Unix milliseconds.
+    pub time_ms: i64,
+}
+
+/// Lifecycles that end a Main chapter (the client's `MAIN_TERMINAL`).
+const MAIN_TERMINAL: &[&str] = &["exited", "failed", "closing"];
+
+/// The chapter is the live Main: not fenced, and either not ended or a §5
+/// contact-loss row (`host-contact-lost`, no end), which may still run.
+fn main_seat_live(row: &MainSeatRow) -> bool {
+    if row.fenced {
+        return false;
+    }
+    !MAIN_TERMINAL.contains(&row.lifecycle.as_str())
+        || row.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER)
+}
+
+/// The more recently touched row; equal times fall to the lower id, so the
+/// pick never depends on the order the rows were read in.
+fn main_seat_later<'a>(a: &'a MainSeatRow, b: &'a MainSeatRow) -> &'a MainSeatRow {
+    if a.time_ms != b.time_ms {
+        return if a.time_ms > b.time_ms { a } else { b };
+    }
+    if a.instance_id <= b.instance_id { a } else { b }
+}
+
+/// The newer chapter: a higher generation, then [`main_seat_later`].
+fn main_seat_newer<'a>(a: &'a MainSeatRow, b: &'a MainSeatRow) -> &'a MainSeatRow {
+    if a.generation != b.generation {
+        return if a.generation > b.generation { a } else { b };
+    }
+    main_seat_later(a, b)
+}
+
+/// THE Main resolution, one definition for the Hub (home.md §5.3, §6.1),
+/// written to match the client's `resolveMain` (`web/src/lib/store.ts`); the
+/// shared cases in `tests/fixtures/main_seat_cases.json` hold both to it.
+///
+/// 1. The live `address-owner` chapter ([`main_seat_live`]), the newest when
+///    a chapter races its successor.
+/// 2. Otherwise — Main paused, closed or ended — the newest chapter of each
+///    `address-owner` lineage, and of those the most recently touched one.
+///
+/// A paused Main therefore still resolves, so its subtree (the workers it
+/// dispatched, still running) stays in the owner's world.
+pub(crate) fn pick_main_seat(seats: &[MainSeatRow]) -> Option<&MainSeatRow> {
+    if let Some(live) = seats
+        .iter()
+        .filter(|row| main_seat_live(row))
+        .reduce(main_seat_newer)
+    {
+        return Some(live);
+    }
+    let mut newest: std::collections::BTreeMap<&str, &MainSeatRow> =
+        std::collections::BTreeMap::new();
+    for row in seats {
+        newest
+            .entry(row.lineage_id.as_str())
+            .and_modify(|current| *current = main_seat_newer(current, row))
+            .or_insert(row);
+    }
+    newest.into_values().reduce(main_seat_later)
+}
+
+fn rfc3339_ms(stamp: &str) -> Option<i64> {
+    OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|at| i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok())
+}
+
+/// Every `address-owner` chapter, then [`pick_main_seat`].
+pub(crate) fn resolve_main_seat(
+    conn: &rusqlite::Connection,
+) -> Result<Option<MainSeatRow>, crate::store::StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, COALESCE(lineage_id, id), generation, lifecycle, last_error,
+                fenced_at IS NOT NULL, updated_at, created_at
+           FROM instances
+          WHERE grants_json LIKE '%\"address-owner\"%'",
+    )?;
+    let seats = stmt
+        .query_map([], |row| {
+            let updated: Option<String> = row.get(6)?;
+            let created: Option<String> = row.get(7)?;
+            Ok(MainSeatRow {
+                instance_id: row.get(0)?,
+                lineage_id: row.get(1)?,
+                generation: row.get::<_, Option<i64>>(2)?.unwrap_or(1),
+                lifecycle: row.get(3)?,
+                last_error: row.get(4)?,
+                fenced: row.get(5)?,
+                time_ms: updated
+                    .as_deref()
+                    .and_then(rfc3339_ms)
+                    .or_else(|| created.as_deref().and_then(rfc3339_ms))
+                    .unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(pick_main_seat(&seats).cloned())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GlanceQuery {
@@ -247,19 +363,11 @@ impl Store {
     ) -> Result<OwnerGlanceSnapshot, crate::store::StoreError> {
         self.read("owner_glance_snapshot", move |conn| {
             let tx = conn.unchecked_transaction()?;
-            // The Main seat: one active address-owner holder (§2.5). The
-            // newest generation wins when a chapter races its successor.
-            let main: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT COALESCE(lineage_id, id), id FROM instances
-                      WHERE grants_json LIKE '%\"address-owner\"%'
-                        AND fenced_at IS NULL
-                      ORDER BY generation DESC, updated_at DESC, id ASC
-                      LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok();
+            // The Main seat, resolved exactly as the client resolves it
+            // ([`resolve_main_seat`]): a paused or closed Main still names its
+            // lineage, so the workers it dispatched stay in scope.
+            let main: Option<(String, String)> =
+                resolve_main_seat(&tx)?.map(|seat| (seat.lineage_id, seat.instance_id));
             let main_lineage = main.as_ref().map(|(lineage, _)| lineage.clone());
             // §5.3 scope: Main's lineage subtree, plus the sessions the owner
             // opened by hand. ONE rule: a session is the owner's when the ROOT
@@ -791,6 +899,35 @@ mod tests {
 
     fn render_with(snapshot: OwnerGlanceSnapshot, pending: Vec<PendingInteraction>) -> OwnerGlance {
         render_owner_glance(snapshot, pending, NOW, 0)
+    }
+
+    /// The ONE Main resolution (home.md §5.3/§6.1): the Hub runs the same
+    /// cases the client's `resolveMain` test runs, from the same file.
+    #[test]
+    fn the_main_seat_follows_the_shared_cases() {
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            seats: Vec<MainSeatRow>,
+            expect: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Cases {
+            cases: Vec<Case>,
+        }
+        let cases: Cases =
+            serde_json::from_str(include_str!("../tests/fixtures/main_seat_cases.json"))
+                .expect("main seat cases");
+        assert!(cases.cases.len() >= 10, "the fixture is the contract");
+        for case in &cases.cases {
+            let picked = pick_main_seat(&case.seats).map(|seat| seat.instance_id.clone());
+            assert_eq!(picked, case.expect, "{}", case.name);
+            // Order-independent: the rule is a total order, never "first read".
+            let mut reversed = case.seats.clone();
+            reversed.reverse();
+            let again = pick_main_seat(&reversed).map(|seat| seat.instance_id.clone());
+            assert_eq!(again, case.expect, "{} (reversed)", case.name);
+        }
     }
 
     #[test]

@@ -1785,6 +1785,110 @@ async fn the_successor_carries_the_seating_human_origin_not_the_spec_origin() ->
     Ok(())
 }
 
+// ── home-glance-d060 r4 item 7: a twice-continued hand-opened lineage ───
+
+/// The SECOND continuation of a lineage the owner opened by hand, through the
+/// real paths (home.md §5.3): the owner pauses and resumes it (S1, an
+/// `owner-resume` continuation), then its process dies and the C1 supervisor
+/// restarts it (S2, `process-exit`). Both successors inherit the root's
+/// `human` stamp, and S2 stays in the owner glance. The seat holds no
+/// `address-owner` grant, so only the hand-opened arm can reach it.
+#[tokio::test]
+async fn a_twice_continued_hand_opened_lineage_stays_in_the_owner_glance() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    // A continuity lineage the owner opens by hand: a restart policy, no grant.
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-sdk",
+            "name": "hand", "title": "Hand", "permissionMode": "auto",
+            "model": "claude-test-model", "prompt": "hand brief",
+            "restart": {"onProcessLoss": true, "maxPerHour": 3},
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let root = created["instance"]["instanceId"]
+        .as_str()
+        .context("root")?
+        .to_owned();
+    assert_eq!(node.next_launch().await?.0, "instance.create");
+    assert_eq!(ctx.lineage(&root).await?["generation"], json!(1));
+    ctx.report_running(&node, &root, SESSION).await?;
+
+    // 1. The owner pauses, then resumes: the owner-resume continuation.
+    assert_eq!(ctx.close(&root).await?.status(), 200);
+    ctx.report_closed(&node, &root).await?;
+    let resumed: Value = ctx.resume(&root).await?.error_for_status()?.json().await?;
+    assert_eq!(resumed["instance"]["chapterCause"], json!("owner-resume"));
+    let first = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("S1")?
+        .to_owned();
+    assert_eq!(node.next_launch().await?.0, "instance.resume");
+    ctx.report_running(&node, &first, SESSION).await?;
+
+    // 2. Its process dies: the C1 restart, the SECOND continuation.
+    ctx.report_killed(&node, &first).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!(decided[0]["cause"], json!("process-exit"));
+    assert_eq!(decided[0]["outcome"], json!("restarted"));
+    let second = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("S2")?
+        .to_owned();
+    assert_eq!(node.next_launch().await?.0, "instance.resume");
+    ctx.report_running(&node, &second, SESSION).await?;
+
+    let s1 = ctx.instance(&first).await?;
+    assert_eq!(s1["resumedFrom"], json!(root), "{s1}");
+    assert_eq!(s1["generation"], json!(2));
+    assert_eq!(s1["creatorOrigin"], json!("human"), "{s1}");
+    let s2 = ctx.instance(&second).await?;
+    assert_eq!(s2["resumedFrom"], json!(first), "{s2}");
+    assert_eq!(s2["lineageId"], json!(root));
+    assert_eq!(s2["generation"], json!(3));
+    assert_eq!(s2["chapterCause"], json!("process-exit"));
+    assert_eq!(
+        s2["creatorOrigin"],
+        json!("human"),
+        "the second successor still carries the root's stamp: {s2}"
+    );
+
+    // The owner glance reaches S2 through the hand-opened arm alone. A live
+    // claude-sdk chapter with no classified activity ranks working (§3.1 h).
+    let glance: Value = ctx
+        .http
+        .get(format!("{}/v1/owner/glance", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let working: Vec<&str> = glance["working"]
+        .as_array()
+        .context("working rows")?
+        .iter()
+        .filter_map(|row| row["instanceId"].as_str())
+        .collect();
+    assert!(
+        working.contains(&second.as_str()),
+        "S2 is in the owner's world: {glance}"
+    );
+    assert!(
+        !working.contains(&first.as_str()) && !working.contains(&root.as_str()),
+        "only the live chapter is working: {glance}"
+    );
+    Ok(())
+}
+
 // ── r2 item 2: a C1 push is sent before it is marked sent ───────────────
 
 /// A failed fanout leaves the push unsent (no `sent_at`, `recipients` NULL);

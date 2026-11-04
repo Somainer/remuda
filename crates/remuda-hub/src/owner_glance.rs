@@ -1331,12 +1331,14 @@ mod tests {
                 1,
             ),
             (
-                // A plain D-026 resume: the Hub writes `resumedFrom` and
-                // inherits the predecessor's (null) parent, so it is NOT a
-                // true root — it joins through the chain.
+                // A plain D-026 resume, as http.rs writes it: the resumed
+                // session is BOTH `parentInstanceId` and `resumedFrom`, and
+                // the stamp is inherited. It is NOT a true root — it joins
+                // through the chain.
                 "ins.human_root.resumed",
                 Some("human"),
-                json!({ "resumedFrom": "ins.human_root" }),
+                json!({ "parentInstanceId": "ins.human_root",
+                        "resumedFrom": "ins.human_root" }),
                 "ins.human_root.resumed",
                 1,
             ),
@@ -1349,9 +1351,10 @@ mod tests {
                 1,
             ),
             (
-                // supervisor respawn / auto-continued successor of an
-                // Agent-dispatched worker: stamped Human by the seating, but
-                // its lineage root is an Agent-created worker.
+                // A successor in an Agent-dispatched worker's chain. The Hub
+                // stamps it `agent` (inherited); this row is deliberately
+                // mis-stamped `human` to pin that scope reads the ROOT's
+                // stamp, never the row's own.
                 "ins.worker_root.successor",
                 Some("human"),
                 json!({ "parentInstanceId": "ins.worker_root",
@@ -1368,35 +1371,20 @@ mod tests {
                 "ins.legacy_root",
                 1,
             ),
-            // A Bot-created root relaunched by the owner's device: the
-            // relaunch is a resume, never a true root, and its ROOT is the
-            // Bot session.
+            // The owner resumes a Bot-created root (D-026): a resume, never a
+            // true root, whose ROOT is the Bot session. Deliberately stamped
+            // `human` (the Hub inherits `bot`) for the same reason as above.
             (
-                // The real resume shape: `resumedFrom` + the inherited (null)
-                // parent. A seed that gave it a parent would dodge item 4.
                 "ins.bot_root.relaunch",
                 Some("human"),
-                json!({ "resumedFrom": "ins.bot_root" }),
+                json!({ "parentInstanceId": "ins.bot_root",
+                        "resumedFrom": "ins.bot_root" }),
                 "ins.bot_root.relaunch",
                 1,
             ),
-            // The SECOND continuation of a hand-opened lineage: its own
-            // stamp is NULL and its resumedFrom names S1; the chain root is
-            // still the Human root, so the lineage arm reaches it.
-            (
-                "ins.human_root.cont2",
-                None,
-                json!({ "resumedFrom": "ins.human_root.cont1" }),
-                "ins.human_root",
-                2,
-            ),
-            (
-                "ins.human_root.cont3",
-                None,
-                json!({ "resumedFrom": "ins.human_root.cont2" }),
-                "ins.human_root",
-                3,
-            ),
+            // The SECOND continuation of a hand-opened lineage is driven
+            // through the real resume and C1 restart paths in
+            // tests/restart.rs (`a_twice_continued_hand_opened_lineage_…`).
         ];
         for (id, creator, spec, lineage, generation) in seeds {
             store
@@ -1447,11 +1435,7 @@ mod tests {
         );
         assert!(
             !scope.contains("ins.bot_root.relaunch"),
-            "a human relaunch of a Bot root is not hand-opened"
-        );
-        assert!(
-            scope.contains("ins.human_root.cont3"),
-            "the SECOND continuation of a hand-opened lineage is in scope"
+            "a human resume of a Bot root is not hand-opened"
         );
         store.close().await;
     }

@@ -5019,7 +5019,7 @@ export type WakeCheck = ({
 export type WakeCheckAdmission = ("owner" | "own-host-bypass" | "approved");
 
 /** WakeCheckOutcome wire values; `protocol.md` §8.4. */
-export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable");
+export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable" | "no-workspace");
 
 /** `wake.check` params (Hub→Node). */
 export type WakeCheckParams = ({
@@ -5028,6 +5028,7 @@ export type WakeCheckParams = ({
   "env": ({
   [key: string]: (string);
 });
+  "instanceId"?: (string | null);
   "runId": (string);
   "timeoutSecs": (number);
   "workspaceId"?: (string | null);

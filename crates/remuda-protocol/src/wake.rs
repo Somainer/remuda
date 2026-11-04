@@ -193,6 +193,7 @@ wire_enum!(WakeCheckOutcome, "8.4", {
     TimedOut => "timed-out",
     Syntax => "syntax",
     Unavailable => "unavailable",
+    NoWorkspace => "no-workspace",
 });
 
 wire_enum!(WakeRunState, "8.4", {
@@ -499,7 +500,7 @@ pub struct WakeRun {
     /// Why it failed: `not-received`, `not-delivered`, `delivery`,
     /// `turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,
     /// `child-ended`, `check-exit`, `check-timeout`, `check-syntax`,
-    /// `check-unavailable`.
+    /// `check-unavailable`, `check-no-workspace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<String>,
 }
@@ -547,10 +548,15 @@ pub struct WakeCheckParams {
     /// The timeout in seconds; the Node refuses 0 and anything over
     /// [`WAKE_CHECK_TIMEOUT_MAX_SECS`].
     pub timeout_secs: u64,
-    /// The workspace it runs in (the lineage's on that host); the Node's
-    /// first workspace when absent.
+    /// The workspace it runs in: the lineage's on that host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// The lineage's chapter, when it lives on that host: without a
+    /// `workspaceId`, the check runs in that instance's own workspace. With
+    /// neither, the Node refuses (`no-workspace`); it never picks a workspace
+    /// of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// The directory inside that workspace (the lineage's cwd on that host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -566,9 +572,10 @@ pub struct WakeCheckParams {
 pub struct WakeCheckResult {
     /// The run, echoed.
     pub run_id: String,
-    /// `exited`, `timed-out` (the process group was killed), `syntax`
-    /// (`sh -n` refused it; nothing ran) or `unavailable` (it could not
-    /// start).
+    /// `exited`, `timed-out` (everything it started was killed), `syntax`
+    /// (`sh -n` refused it; nothing ran), `unavailable` (it could not start)
+    /// or `no-workspace` (no workspace of the lineage on this Node; nothing
+    /// ran).
     pub outcome: WakeCheckOutcome,
     /// The exit code, when it exited with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

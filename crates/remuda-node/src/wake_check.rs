@@ -37,7 +37,7 @@
 
 use crate::{DevNode, NodeError};
 use remuda_protocol::{
-    METHOD_WAKE_CHECK, WAKE_CHECK_ENV_PREFIX, WAKE_CHECK_STDOUT_MAX_BYTES,
+    InstanceId, METHOD_WAKE_CHECK, WAKE_CHECK_ENV_PREFIX, WAKE_CHECK_STDOUT_MAX_BYTES,
     WAKE_CHECK_TIMEOUT_MAX_SECS, WakeCheckOutcome, WakeCheckParams, WakeCheckResult, WorkspaceId,
 };
 use serde_json::Value;
@@ -544,13 +544,23 @@ impl DevNode {
                 "wake.check timeoutSecs must be between 1 and {max}"
             )));
         }
-        let workspace = request
-            .workspace_id
-            .as_deref()
-            .map(WorkspaceId::from_str)
-            .transpose()?;
-        let run = match self.resolve_workspace_cwd(workspace.as_ref(), request.cwd.as_deref()) {
-            Ok((_, cwd)) => {
+        // The lineage's workspace on this host: the one the Hub names, else
+        // that of the lineage's chapter here. Never one the Node picks: with
+        // neither, the check is refused and nothing runs.
+        let workspace = match (&request.workspace_id, &request.instance_id) {
+            (Some(workspace), _) => WorkspaceId::from_str(workspace).ok(),
+            (None, Some(instance)) => InstanceId::from_str(instance)
+                .ok()
+                .and_then(|instance| self.get_instance(&instance).ok())
+                .map(|instance| instance.workspace_id),
+            (None, None) => None,
+        };
+        let place = workspace.and_then(|workspace| {
+            self.resolve_workspace_cwd(Some(&workspace), request.cwd.as_deref())
+                .ok()
+        });
+        let run = match place {
+            Some((_, cwd)) => {
                 let env = check_env(&node_env(), &request.env);
                 run_check(
                     &request.command,
@@ -560,9 +570,9 @@ impl DevNode {
                 )
                 .await
             }
-            Err(_) => CheckRun::without_output(
-                WakeCheckOutcome::Unavailable,
-                "its working directory is not usable on this Node",
+            None => CheckRun::without_output(
+                WakeCheckOutcome::NoWorkspace,
+                "no workspace of the lineage on this Node; nothing ran",
             ),
         };
         tracing::info!(
@@ -825,7 +835,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(missing["outcome"], "unavailable");
+        assert_eq!(missing["outcome"], "no-workspace");
+        // r2: neither a workspace nor a chapter here: refused, and nothing
+        // runs in the Node's first workspace.
+        let marker = project.join("ran");
+        for params in [
+            serde_json::json!({"runId": "wrn_4", "command": format!("touch {}", marker.display()),
+                               "timeoutSecs": 30}),
+            serde_json::json!({"runId": "wrn_5", "command": format!("touch {}", marker.display()),
+                               "timeoutSecs": 30, "instanceId": remuda_protocol::InstanceId::new()}),
+        ] {
+            let refused =
+                crate::transport::hubnode::dispatch_method(&node, METHOD_WAKE_CHECK, params)
+                    .await
+                    .unwrap();
+            assert_eq!(refused["outcome"], "no-workspace", "{refused}");
+        }
+        assert!(!marker.exists(), "nothing ran in the first workspace");
         for timeout in [0, 3601] {
             assert!(
                 crate::transport::hubnode::dispatch_method(

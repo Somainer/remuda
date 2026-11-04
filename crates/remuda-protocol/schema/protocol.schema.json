@@ -22364,6 +22364,11 @@
           "const": "unavailable",
           "description": "Wire value `unavailable`.",
           "type": "string"
+        },
+        {
+          "const": "no-workspace",
+          "description": "Wire value `no-workspace`.",
+          "type": "string"
         }
       ]
     },
@@ -22389,6 +22394,13 @@
           "description": "Variables about the run, each named with [`WAKE_CHECK_ENV_PREFIX`];\nthe Node drops any other name.",
           "type": "object"
         },
+        "instanceId": {
+          "description": "The lineage's chapter, when it lives on that host: without a\n`workspaceId`, the check runs in that instance's own workspace. With\nneither, the Node refuses (`no-workspace`); it never picks a workspace\nof its own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "runId": {
           "description": "The run the check decides.",
           "type": "string"
@@ -22400,7 +22412,7 @@
           "type": "integer"
         },
         "workspaceId": {
-          "description": "The workspace it runs in (the lineage's on that host); the Node's\nfirst workspace when absent.",
+          "description": "The workspace it runs in: the lineage's on that host.",
           "type": [
             "string",
             "null"
@@ -22457,7 +22469,7 @@
         },
         "outcome": {
           "$ref": "#/$defs/WakeCheckOutcome",
-          "description": "`exited`, `timed-out` (the process group was killed), `syntax`\n(`sh -n` refused it; nothing ran) or `unavailable` (it could not\nstart)."
+          "description": "`exited`, `timed-out` (everything it started was killed), `syntax`\n(`sh -n` refused it; nothing ran), `unavailable` (it could not start)\nor `no-workspace` (no workspace of the lineage on this Node; nothing\nran)."
         },
         "runId": {
           "description": "The run, echoed.",
@@ -22705,7 +22717,7 @@
           ]
         },
         "failureKind": {
-          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`, `check-exit`, `check-timeout`, `check-syntax`,\n`check-unavailable`.",
+          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`, `check-exit`, `check-timeout`, `check-syntax`,\n`check-unavailable`, `check-no-workspace`.",
           "type": [
             "string",
             "null"

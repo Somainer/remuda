@@ -181,6 +181,9 @@ struct Ctx {
     checks: Checks,
     /// Other hosts' fake Nodes, kept connected.
     others: Vec<FakeNode>,
+    /// Other hosts and their workspaces; every project made after
+    /// `other_host` has a member workspace on each.
+    other_hosts: Vec<(String, String)>,
 }
 
 fn test_config(dir: &Path) -> HubConfig {
@@ -225,6 +228,7 @@ impl Ctx {
             node_token,
             checks,
             others: Vec::new(),
+            other_hosts: Vec::new(),
         })
     }
 
@@ -295,6 +299,7 @@ impl Ctx {
             node_token,
             checks,
             others: Vec::new(),
+            other_hosts: Vec::new(),
         })
     }
 
@@ -327,12 +332,20 @@ impl Ctx {
     }
 
     async fn project(&self, name: &str) -> Result<String> {
+        let mut members =
+            vec![json!({"hostId": self.host, "workspaceId": self.workspace, "role": "primary"})];
+        for (host, workspace) in &self.other_hosts {
+            members.push(json!({"hostId": host, "workspaceId": workspace, "role": "build"}));
+        }
+        self.project_with(name, members).await
+    }
+
+    async fn project_with(&self, name: &str, members: Vec<Value>) -> Result<String> {
         let created = self
             .post(
                 &self.human,
                 "/v1/projects",
-                json!({ "name": name, "members": [
-                    {"hostId": self.host, "workspaceId": self.workspace, "role": "primary"}] }),
+                json!({ "name": name, "members": members }),
             )
             .await?;
         Ok(created["id"].as_str().context("project id")?.to_string())
@@ -1772,6 +1785,7 @@ impl Ctx {
         )
         .await?;
         self.others.push(node);
+        self.other_hosts.push((host.clone(), workspace));
         Ok(host)
     }
 
@@ -2793,5 +2807,107 @@ async fn a_failed_check_settle_write_is_retried_never_the_run() -> Result<()> {
     assert_eq!(run["failureKind"], "check-exit");
     assert_eq!(run["checkExit"], 1);
     assert_eq!(queued()?.0, 0, "nothing left queued");
+    Ok(())
+}
+
+/// r2: a check runs only in the lineage's own workspace on its host, never
+/// in one its Node picks (another project's checkout). Knowable at add time,
+/// it is refused then; a workspace gone by run time fails the run
+/// `check-no-workspace` with nothing asked of the Node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_never_runs_outside_the_lineage_workspace() -> Result<()> {
+    let mut ctx = Ctx::spawn().await?;
+    let other = ctx.other_host().await?;
+    let other_workspace = ctx.other_hosts[0].1.clone();
+    // A project with no workspace on the other host.
+    let here_only = ctx
+        .project_with(
+            "wake-check-here",
+            vec![json!({"hostId": ctx.host, "workspaceId": ctx.workspace, "role": "primary"})],
+        )
+        .await?;
+    let (seat, _) = ctx.bypass_seat(&here_only).await?;
+    let check = json!({ "command": "exit 2", "timeoutSecs": 5, "hostId": other });
+    let (status, body) = ctx
+        .add(&ctx.human, &seat, checked("q", check.clone(), "failure"))
+        .await?;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], "check-no-workspace");
+    assert!(ctx.approval_cards().await?.is_empty());
+    assert_eq!(ctx.list(&seat).await?["items"], json!([]));
+
+    // With a member workspace there, the check is added and runs in it.
+    let both = ctx.project("wake-check-both").await?;
+    let (seat, _) = ctx.bypass_seat(&both).await?;
+    let wake = ctx
+        .add_ok(&ctx.human, &seat, checked("q", check.clone(), "failure"))
+        .await?;
+    let first = next_fire(&wake);
+    ctx.checks.exit(2, "");
+    ctx.check_tick(&shift(&first, 1)).await?;
+    let calls = ctx.check_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["workspaceId"], other_workspace.as_str());
+    assert!(
+        calls[0].get("instanceId").is_none(),
+        "the chapter is not on that host"
+    );
+    // An own-host check names the chapter, so its Node resolves the
+    // workspace the instance runs in.
+    let own = ctx
+        .add_ok(
+            &ctx.human,
+            &seat,
+            checked(
+                "own",
+                json!({ "command": "exit 2", "timeoutSecs": 5, "hostId": ctx.host }),
+                "never",
+            ),
+        )
+        .await?;
+    ctx.checks.exit(2, "");
+    ctx.check_tick(&shift(&next_fire(&own), 1)).await?;
+    let call = ctx.check_calls().last().cloned().context("own call")?;
+    assert_eq!(call["instanceId"], seat.as_str());
+    assert_eq!(call["workspaceId"], ctx.workspace.as_str());
+
+    // The member is removed after the add: the next run fails, unasked.
+    let (status, body) = ctx
+        .request(
+            reqwest::Method::DELETE,
+            &ctx.human,
+            &format!("/v1/projects/{both}/members"),
+            Some(json!({ "hostId": other, "workspaceId": other_workspace })),
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "remove member {status}: {body}");
+    let asked_q = |ctx: &Ctx| {
+        ctx.check_calls()
+            .iter()
+            .filter(|call| call["env"]["REMUDA_WAKE_NAME"] == "q")
+            .count()
+    };
+    let asked = asked_q(&ctx);
+    ctx.check_tick(&shift(&first, 181)).await?;
+    let runs = ctx.runs(&seat).await?;
+    let run = runs
+        .iter()
+        .rev()
+        .find(|run| run["name"] == "q")
+        .context("the second run")?;
+    assert_eq!(run["state"], "failed", "{runs:#?}");
+    assert_eq!(run["failureKind"], "check-no-workspace");
+    assert!(run["checkExit"].is_null());
+    assert_eq!(asked_q(&ctx), asked, "nothing was asked of the Node");
+    assert!(
+        ctx.notice_titles(&seat)?
+            .contains(&"Wake-up q failed: check-no-workspace".to_owned())
+    );
+    let fact: i64 = ctx.count(
+        "SELECT COUNT(*) FROM inbox_facts WHERE subscriber_lineage_id = ?1 AND kind = 'wake-failed'
+            AND json_extract(payload_json, '$.failureKind') = 'check-no-workspace'",
+        &seat,
+    )?;
+    assert_eq!(fact, 1);
     Ok(())
 }

@@ -168,6 +168,9 @@ pub(crate) mod failure {
     /// The check could not start on its Node (the Node refused the call, its
     /// working directory is unusable, or the stored check is unreadable).
     pub(crate) const CHECK_UNAVAILABLE: &str = "check-unavailable";
+    /// The lineage has no workspace on the check's host: nothing ran (r2;
+    /// a check never runs in a workspace its Node picks).
+    pub(crate) const CHECK_NO_WORKSPACE: &str = "check-no-workspace";
 }
 
 // ── tables ─────────────────────────────────────────────────────────────────
@@ -1057,6 +1060,8 @@ enum CheckHostRefusal {
     Required,
     /// Not a Node in the lineage's scope.
     OutOfScope,
+    /// The lineage has no workspace on that host.
+    NoWorkspace,
 }
 
 fn probe_check(
@@ -1091,8 +1096,11 @@ fn probe_check(
     };
     let host = match requested.map(str::to_owned).or_else(|| caller_host.clone()) {
         None => Err(CheckHostRefusal::Required),
-        Some(host) if host_in_scope(conn, lineage_id, &host)? => Ok(host),
-        Some(_) => Err(CheckHostRefusal::OutOfScope),
+        Some(host) if !host_in_scope(conn, lineage_id, &host)? => Err(CheckHostRefusal::OutOfScope),
+        Some(host) if check_place(conn, lineage_id, &host)?.is_none() => {
+            Err(CheckHostRefusal::NoWorkspace)
+        }
+        Some(host) => Ok(host),
     };
     Ok(CheckProbe {
         repeat,
@@ -1474,6 +1482,17 @@ async fn admit_check(
         // A host outside the lineage's scope is refused before anyone is
         // paged.
         Err(CheckHostRefusal::OutOfScope) => return Err(HubError::out_of_scope().into()),
+        // r2: knowable now, so refused now; nobody is paged for it.
+        Err(CheckHostRefusal::NoWorkspace) => {
+            return Err(WakeError::Conflict {
+                reason: "check-no-workspace",
+                message: "the lineage has no workspace on that host: its chapter is not there \
+                          and its project has no member workspace there"
+                    .into(),
+                hint: "name a host where the lineage has a workspace, or ask the owner to add \
+                       the host's workspace to the project",
+            });
+        }
     };
     let (admission, approval_id) = match caller.origin {
         InputOrigin::Human => (WakeCheckAdmission::Owner, None),
@@ -2486,6 +2505,7 @@ fn failure_text(kind: &str) -> &'static str {
         failure::CHECK_TIMEOUT => "its check ran into its timeout and was killed",
         failure::CHECK_SYNTAX => "its check is not valid shell; nothing ran",
         failure::CHECK_UNAVAILABLE => "its check could not start on its Node",
+        failure::CHECK_NO_WORKSPACE => "the lineage has no workspace on its check's host",
         _ => "it did not finish",
     }
 }
@@ -2712,27 +2732,50 @@ enum CheckReport {
     Lost,
 }
 
-/// The workspace and directory a check runs in: the lineage's on that host.
-/// The current chapter's own workspace and cwd when it lives there (a seat
-/// placed by its project may record no workspace); else the workspace its
-/// project has on that host (its primary member first); else none (the
-/// Node's first workspace).
-fn check_place(
+/// Where a check runs on its host: the lineage's workspace there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CheckPlace {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) cwd: Option<String>,
+    /// The lineage's chapter on that host: its Node resolves the instance's
+    /// own workspace when the Hub has none on record.
+    pub(crate) instance_id: Option<String>,
+}
+
+/// The lineage's workspace on `host_id`, or `None` when it has none there
+/// (r2: a check then never runs, and never in a workspace its Node picks).
+///
+/// * The current chapter lives on that host: its workspace and cwd (the
+///   workspace the Hub recorded, else its spec's, else its project's member
+///   there), and the chapter itself, so its Node can resolve the workspace
+///   the instance really runs in.
+/// * Otherwise the workspace its project has on that host (its primary
+///   member first).
+pub(crate) fn check_place(
     conn: &Connection,
     lineage_id: &str,
     host_id: &str,
-) -> Result<(Option<String>, Option<String>), StoreError> {
-    let chapter: Option<(String, Option<String>, String, Option<String>)> = conn
+) -> Result<Option<CheckPlace>, StoreError> {
+    #[allow(clippy::type_complexity)]
+    let chapter: Option<(String, String, Option<String>, String, Option<String>)> = conn
         .query_row(
-            "SELECT host_id, workspace_id, spec_json, scope_json FROM instances
+            "SELECT id, host_id, workspace_id, spec_json, scope_json FROM instances
               WHERE id = COALESCE((SELECT current_instance_id FROM lineages
                                     WHERE lineage_id = ?1), ?1)",
             params![lineage_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((chapter_host, workspace_id, spec, scope)) = chapter else {
-        return Ok((None, None));
+    let Some((chapter_id, chapter_host, workspace_id, spec, scope)) = chapter else {
+        return Ok(None);
     };
     let spec: Value = serde_json::from_str(&spec).unwrap_or(Value::Null);
     let text = |field: &str| {
@@ -2741,31 +2784,37 @@ fn check_place(
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
     };
-    if chapter_host == host_id
-        && let Some(workspace) = workspace_id.or_else(|| text("workspaceId"))
-    {
-        return Ok((Some(workspace), text("cwd")));
-    }
     let project = scope
         .and_then(|raw| serde_json::from_str::<remuda_protocol::InstanceScope>(&raw).ok())
         .and_then(|scope| scope.single_project_id().map(|id| id.as_id().to_string()))
         .or_else(|| text("projectId"));
-    let Some(project) = project else {
-        return Ok((None, None));
+    let member = match &project {
+        Some(project) => conn
+            .query_row(
+                "SELECT json_extract(m.value, '$.workspaceId')
+                   FROM projects p, json_each(p.doc_json, '$.members') m
+                  WHERE p.id = ?1 AND json_extract(m.value, '$.hostId') = ?2
+                  ORDER BY json_extract(m.value, '$.role') = 'primary' DESC
+                  LIMIT 1",
+                params![project, host_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten(),
+        None => None,
     };
-    let workspace: Option<String> = conn
-        .query_row(
-            "SELECT json_extract(m.value, '$.workspaceId')
-               FROM projects p, json_each(p.doc_json, '$.members') m
-              WHERE p.id = ?1 AND json_extract(m.value, '$.hostId') = ?2
-              ORDER BY json_extract(m.value, '$.role') = 'primary' DESC
-              LIMIT 1",
-            params![project, host_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok((workspace, None))
+    if chapter_host == host_id {
+        return Ok(Some(CheckPlace {
+            workspace_id: workspace_id.or_else(|| text("workspaceId")).or(member),
+            cwd: text("cwd"),
+            instance_id: Some(chapter_id),
+        }));
+    }
+    Ok(member.map(|workspace| CheckPlace {
+        workspace_id: Some(workspace),
+        cwd: None,
+        instance_id: None,
+    }))
 }
 
 /// Claim the check of `run_id` when its host is online: the run turns
@@ -2833,7 +2882,28 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
     if !online {
         return Ok(None);
     }
-    let (workspace_id, cwd) = check_place(&tx, &lineage_id, &spec.host_id)?;
+    let Some(place) = check_place(&tx, &lineage_id, &spec.host_id)? else {
+        // r2: the lineage no longer has a workspace on that host (the
+        // chapter moved, the project member was removed): the run fails, and
+        // nothing is asked of the Node.
+        tx.execute(
+            "UPDATE wake_runs SET state = 'running', check_state = 'running', started_at = ?2
+              WHERE run_id = ?1",
+            params![run_id, now],
+        )?;
+        let report = CheckReport::Done(remuda_protocol::WakeCheckResult {
+            run_id: run_id.to_owned(),
+            outcome: remuda_protocol::WakeCheckOutcome::NoWorkspace,
+            exit_code: None,
+            signal: None,
+            stdout: String::new(),
+            stdout_truncated: false,
+            summary: "the lineage has no workspace on that host; nothing ran".into(),
+        });
+        apply_report(&tx, run_id, &report)?;
+        tx.commit()?;
+        return Ok(None);
+    };
     let last_run_at: Option<String> = tx
         .query_row(
             "SELECT last_run_at FROM wake_ups WHERE wake_id = ?1",
@@ -2877,8 +2947,9 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
             run_id: run_id.to_owned(),
             command: spec.command,
             timeout_secs,
-            workspace_id,
-            cwd,
+            workspace_id: place.workspace_id,
+            cwd: place.cwd,
+            instance_id: place.instance_id,
             env,
         },
     }))
@@ -3223,6 +3294,9 @@ fn apply_report_state_only(
                 (remuda_protocol::WakeCheckOutcome::Unavailable, _) => {
                     ("failed", "failed", Some(failure::CHECK_UNAVAILABLE), None)
                 }
+                (remuda_protocol::WakeCheckOutcome::NoWorkspace, _) => {
+                    ("failed", "failed", Some(failure::CHECK_NO_WORKSPACE), None)
+                }
             }
         }
     };
@@ -3387,6 +3461,9 @@ fn apply_report(
         }
         (Some(remuda_protocol::WakeCheckOutcome::Syntax), _) => {
             ("failed", Some(failure::CHECK_SYNTAX))
+        }
+        (Some(remuda_protocol::WakeCheckOutcome::NoWorkspace), _) => {
+            ("failed", Some(failure::CHECK_NO_WORKSPACE))
         }
         (Some(remuda_protocol::WakeCheckOutcome::Unavailable), _) | (None, _) => {
             ("failed", Some(failure::CHECK_UNAVAILABLE))

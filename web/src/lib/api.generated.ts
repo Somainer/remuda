@@ -1200,7 +1200,7 @@ export interface paths {
         put?: never;
         /**
          * Add a wake-up (`remuda wake add`)
-         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. A check (main-agent.md §11.2) runs on one Node with a mandatory timeout before each run: an Agent's check on another host, or from a chapter that keeps its harness's permission control on, waits for the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED; retry the same add with x-remuda-approval-id); changing a check is a new add. Refusals: 400 invalid-wake-up (bounds, a check without timeoutSecs, the owner's check without hostId), 403 out-of-scope (a check host outside the lineage's scope), 422 WAKE_SECRET_REJECTED (field and rule only, never the text; check.command included), 422 WAKE_UNSUPPORTED (condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage), 409 wake-name-taken.
+         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. A check (main-agent.md §11.2) runs on one Node with a mandatory timeout before each run: an Agent's check on another host, or from a chapter that keeps its harness's permission control on, waits for the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED; retry the same add with x-remuda-approval-id); changing a check is a new add. Refusals: 400 invalid-wake-up (bounds, a check without timeoutSecs, the owner's check without hostId), 403 out-of-scope (a check host outside the lineage's scope), 409 check-no-workspace (the lineage has no workspace on the check host: its chapter is not there and its project has no member workspace there; a check never runs in a workspace the Node picks), 422 WAKE_SECRET_REJECTED (field and rule only, never the text; check.command included), 422 WAKE_UNSUPPORTED (condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage), 409 wake-name-taken.
          */
         post: operations["addLineageWakeUp"];
         delete?: never;
@@ -4057,7 +4057,7 @@ export interface components {
         WakeCheckRequest: {
             /** @description The shell command (sh -c), at most 2000 characters; required. The secret lint runs over it (422 WAKE_SECRET_REJECTED, field check.command, never echoed). */
             command?: string;
-            /** @description The Node it runs on, a host in the lineage's scope (403 out-of-scope otherwise). An Agent may omit it for its own host; the owner must name it (400). */
+            /** @description The Node it runs on, a host in the lineage's scope (403 out-of-scope otherwise). An Agent may omit it for its own host; the owner must name it (400). The lineage must have a workspace there (409 check-no-workspace). */
             hostId?: string;
             /** @description 1..=3600 seconds; required, there is no default (400 when missing). */
             timeoutSecs?: number;
@@ -4117,7 +4117,7 @@ export interface components {
             endedAt?: string;
             /** @description The wake-due inbox row (persistent mode). */
             factId?: number;
-            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax or check-unavailable. */
+            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax, check-unavailable or check-no-workspace. */
             failureKind?: string;
             /** Format: date-time */
             firedAt: string;

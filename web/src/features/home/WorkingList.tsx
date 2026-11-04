@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime } from "../../lib/format";
-import { projectStatus } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import type { Id } from "../../types/wire";
@@ -17,53 +16,62 @@ const WORKING_ROWS = 5;
  * sessions at ≥1440, newest first, five rows then 「+N ›」 to the list filtered
  * on 工作中. Each row opens /s/:id; its ⋯ holds 中断 (the turn only — the
  * process keeps running). Stale data greys out while the Hub link is not live.
+ *
+ * home-glance-d060: the membership, the count and the row's one-line headline
+ * all come from the SAME `GET /v1/owner/glance` the ① row reads (home.md
+ * §5.3) — never from a second per-row projection. The store row remains the
+ * source for the live status dot and the ⋯ menu, so the list still reacts to
+ * frames those rows carry.
  */
 export function WorkingList() {
   const hub = useHub();
   const nowMs = useNowTick();
   const [menuFor, setMenuFor] = useState<string | null>(null);
-  const rows = hub.instances
-    .filter((row) => row.parent == null && projectStatus(row) === "working")
-    .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+  const glance = hub.glance;
+  const byId = new Map(hub.instances.map((row) => [row.id as string, row]));
+  const rows = (glance?.working ?? []).flatMap((row) =>
+    byId.has(row.instanceId) ? [{ glance: row, instance: byId.get(row.instanceId)! }] : [],
+  );
+  const total = glance ? glance.counts.working : null;
   const stale = hub.connection !== "live";
   // A menu id whose row left the PAINTED slice has no menu to close it: a
   // later re-rank would otherwise pop it open by itself. (Checking all working
   // rows is not enough — the row can stay working behind 「+N」.)
   useEffect(() => {
     if (menuFor === null) return;
-    if (rows.slice(0, WORKING_ROWS).some((row) => row.id === menuFor)) return;
+    if (rows.slice(0, WORKING_ROWS).some((row) => row.instance.id === menuFor)) return;
     setMenuFor(null);
   }, [menuFor, rows]);
   return (
     <section className={css.section} data-testid="home-working" data-stale={stale ? "1" : "0"} aria-label="工作中">
-      <header className={css.head}>工作中 · {hub.ready ? rows.length : "–"}</header>
-      {!hub.ready ? (
+      <header className={css.head}>工作中 · {total ?? "–"}</header>
+      {total === null ? (
         <div className={css.skeleton} aria-hidden="true" />
       ) : rows.length === 0 ? (
         <p className={css.empty}>没有在跑的会话</p>
       ) : (
         <ul className={css.list}>
           {rows.slice(0, WORKING_ROWS).map((row) => (
-            <li key={row.id} className={`${css.row} ${ROW_ACTIONS_HOST}`} data-testid="home-working-row">
-              <Link className={css.rowLink} to={`/s/${row.id}`}>
+            <li key={row.instance.id} className={`${css.row} ${ROW_ACTIONS_HOST}`} data-testid="home-working-row">
+              <Link className={css.rowLink} to={`/s/${row.instance.id}`} title={row.glance.headline}>
                 <StateDot status="working" />
-                <span className={css.title}>{hubStore.titleOf(row.id as Id)}</span>
-                <span className={css.time}>{formatListTime(row.updatedAt, nowMs)}</span>
+                <span className={css.title}>{hubStore.titleOf(row.instance.id as Id)}</span>
+                <span className={css.time}>{formatListTime(row.instance.updatedAt, nowMs)}</span>
               </Link>
               <RowActions
-                instance={row}
-                open={menuFor === row.id}
-                onOpen={() => setMenuFor(row.id)}
-                onClose={() => setMenuFor((current) => (current === row.id ? null : current))}
+                instance={row.instance}
+                open={menuFor === row.instance.id}
+                onOpen={() => setMenuFor(row.instance.id)}
+                onClose={() => setMenuFor((current) => (current === row.instance.id ? null : current))}
                 stale={stale}
               />
             </li>
           ))}
         </ul>
       )}
-      {rows.length > WORKING_ROWS ? (
+      {total !== null && total > WORKING_ROWS ? (
         <Link className={css.overflow} to="/sessions?status=working&scope=all" data-testid="home-working-overflow">
-          +{rows.length - WORKING_ROWS} ›
+          +{total - WORKING_ROWS} ›
         </Link>
       ) : null}
     </section>

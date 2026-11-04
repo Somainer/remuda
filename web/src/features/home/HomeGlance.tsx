@@ -1,32 +1,30 @@
-import { Fragment, useEffect, useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { useHub } from "../../lib/store";
-import { thisDeviceId } from "../../lib/interactionStatus";
 import { hostIsOnline } from "../hosts/model";
-import { useInboxClockNow } from "../mobile/useInboxPendingCount";
-import { syncInboxDeadlineClock } from "../mobile/inboxClock";
-import { useTaskLedger } from "../tasks/taskLedger";
 import { useHomeFreshness } from "./freshness";
 import {
   formatGlanceCount,
   formatUpdatedAt,
-  glanceCounts,
   glancePieces,
   type GlanceCounts,
-  type GlanceSource,
 } from "./glance";
 import css from "./homeGlance.module.css";
 
 /**
- * ① 计数行 (home.md §5.1–5.2).
+ * ① 计数行 (home.md §5.1–5.2, §5.3).
  *
  * Phone: the 28px row under the 52px title row, sticky together with it (80px
- * total). Desktop: the same line inside the PageHeader. The counts are the
- * pure §5.1 derivation in `glance.ts` (H2's queue and the badge will read the
- * same function); this component only wires the store, the 5 s task ledger,
- * the inbox deadline clock and the §8 freshness verdict.
+ * total). Desktop: the same line inside the PageHeader, plus the desktop-only
+ * 「今日完成 N」 segment.
  *
- * Taps: 需要你 scrolls to the queue (today: the ledger's first blocked row —
- * the queue itself lands with H2); 完成未看 and 工作中 each filter the ledger
+ * home-glance-d060: every count reads ONE `GET /v1/owner/glance` per poll —
+ * the projection home.md §5.3 defines over Main's subtree plus the sessions
+ * the owner opened by hand. Nothing here derives a number from the instance
+ * list any more, so the row cannot disagree with the Hub (or with
+ * `remuda glance`); before the first glance the segments read 「–」 and
+ * 今日完成 stays hidden, exactly as §5.2 asks.
+ *
+ * Taps: 需要你 scrolls to the queue; 完成未看 and 工作中 each filter the ledger
  * to that rank, and a second tap clears it.
  */
 export function HomeGlance({
@@ -36,7 +34,6 @@ export function HomeGlance({
   onDoneUnseen,
   workingFilter = false,
   doneUnseenFilter = false,
-  workingInstances,
 }: {
   placement: "phone" | "desktop";
   onNeedYou: () => void;
@@ -47,48 +44,19 @@ export function HomeGlance({
   workingFilter?: boolean;
   /** The done-unseen rank filter this segment currently applies. */
   doneUnseenFilter?: boolean;
-  /**
-   * Which instances this surface lists for 工作中 (default: every instance).
-   * `/sessions` hides child sessions, so it passes TOP_LEVEL_WORKING — the
-   * count must equal the rows the 工作中 tap can show.
-   */
-  workingInstances?: (instance: NonNullable<GlanceSource["instances"][number]>) => boolean;
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
-  // Owner-wide (§5.1): N is the queue that matches the badge. A ?project=
-  // filter narrows the ledger/list only; the count keeps the global scope,
-  // which also means it shares the phone task layer's poller when that layer
-  // is unfiltered (default /m).
-  const { tasks } = useTaskLedger(null);
-  const deviceId = useMemo(() => thisDeviceId(), []);
-  const nowMs = useInboxClockNow();
-  useEffect(() => {
-    syncInboxDeadlineClock(hub.interactions);
-  }, [hub.interactions]);
-
-  // The §5.1 derivation lives in glance.ts so H2's queue header and the OS
-  // badge can read it later; the in-app badge is still A-only until
-  // home-queue adds B. A store re-notification with unchanged counts
-  // re-derives the same numbers and paints identically.
-  const counts = useMemo<GlanceCounts | null>(
-    () =>
-      freshness.state === "unknown"
-        ? null
-        : glanceCounts(
-            {
-              instances: hub.instances,
-              interactions: hub.interactions,
-              hosts: hub.hosts,
-              tasks,
-              answering: hub.answering,
-              deviceId,
-              nowMs,
-            },
-            workingInstances ? hub.instances.filter(workingInstances) : hub.instances,
-          ),
-    [freshness.state, hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs, workingInstances],
-  );
+  const counts = useMemo<GlanceCounts | null>(() => {
+    const glance = hub.glance;
+    if (!glance) return null;
+    return {
+      needYou: glance.counts.needYou,
+      doneUnseen: glance.counts.doneUnseen,
+      working: glance.counts.working,
+      doneToday: glance.counts.doneToday,
+    };
+  }, [hub.glance]);
 
   const hostsOnline = hub.hosts.filter((host) => hostIsOnline(host)).length;
   const pieces = glancePieces({
@@ -99,6 +67,8 @@ export function HomeGlance({
     // Keep the segment on screen while it is the only way to clear the filter.
     workingFilter,
     doneUnseenFilter,
+    // §5.2: 今日完成 is desktop-only.
+    showDoneToday: placement === "desktop",
   });
   // §8: stale greys the whole row and names the last successful update. A
   // foreground grace is explicitly NOT stale.
@@ -159,6 +129,10 @@ export function HomeGlance({
               </span>
               {piece.count === null ? "–" : formatGlanceCount(piece.count)} 工作中
             </button>
+          ) : piece.key === "doneToday" ? (
+            <span className={css.doneToday} data-testid="glance-done-today" data-key="doneToday">
+              今日完成 {formatGlanceCount(piece.count)}
+            </span>
           ) : piece.key === "greeting" ? (
             <span className={css.greeting} data-testid="glance-greeting">
               {piece.text} · 都处理完了

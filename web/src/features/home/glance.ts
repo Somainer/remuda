@@ -41,6 +41,13 @@ export type GlanceCounts = {
   doneUnseen: number;
   /** §5.2 ●: instances ranked working (§3.1 rank 3). */
   working: number;
+  /**
+   * §5.2 今日完成: sessions whose latest settled root turn ended in the owner's
+   * local day. Desktop only, and hidden while unknown — the client receives it
+   * from `GET /v1/owner/glance` (home-glance-d060), so an older Hub that omits
+   * it simply never paints the segment.
+   */
+  doneToday?: number;
 };
 
 /**
@@ -163,6 +170,7 @@ export type GlancePiece =
   | { key: "needYou"; count: number | null }
   | { key: "doneUnseen"; count: number | null }
   | { key: "working"; count: number | null }
+  | { key: "doneToday"; count: number }
   | { key: "greeting"; text: string }
   | { key: "hosts"; text: string };
 
@@ -189,6 +197,11 @@ export type GlanceLineInput = {
    * ◉ segment stays until the second tap.
    */
   doneUnseenFilter?: boolean;
+  /**
+   * §5.2: 今日完成 is desktop-only. On the phone the segment is absent
+   * whatever the count is.
+   */
+  showDoneToday?: boolean;
 };
 
 /**
@@ -214,10 +227,21 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
   // §5.2 order: 需要你 · 完成未看 · 工作中.
   if (doneUnseen > 0 || input.doneUnseenFilter === true) pieces.push({ key: "doneUnseen", count: doneUnseen });
   if (working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
+  // §5.2 今日完成: desktop only, hidden while unknown (`doneToday` absent), and
+  // a known zero is hidden like every other segment.
+  const doneToday = input.counts.doneToday ?? null;
+  const paintedDoneToday = input.showDoneToday === true && doneToday !== null && doneToday > 0;
+  if (paintedDoneToday && doneToday !== null) pieces.push({ key: "doneToday", count: doneToday });
   // The host tail closes a line that otherwise says nothing but the greeting.
-  // A zero segment kept alive only because its filter is active still leaves
-  // the line empty of news, so the tail stays.
-  else if (needYou === 0 && doneUnseen === 0 && input.hostsTotal > 0) {
+  // A zero ◉ segment kept alive only because its filter is active still leaves
+  // the line empty of news, so the tail stays; a painted ● segment does not.
+  if (
+    needYou === 0 &&
+    doneUnseen === 0 &&
+    !(working > 0 || input.workingFilter === true) &&
+    !paintedDoneToday &&
+    input.hostsTotal > 0
+  ) {
     pieces.push({ key: "hosts", text: `${input.hostsOnline}/${input.hostsTotal} 主机在线` });
   }
   return pieces;
@@ -235,6 +259,9 @@ export function glanceText(pieces: readonly GlancePiece[]): string {
       }
       if (piece.key === "working") {
         return `●${piece.count === null ? "–" : formatGlanceCount(piece.count)} 工作中`;
+      }
+      if (piece.key === "doneToday") {
+        return `今日完成 ${formatGlanceCount(piece.count)}`;
       }
       if (piece.key === "greeting") return `${piece.text} · 都处理完了`;
       return piece.text;

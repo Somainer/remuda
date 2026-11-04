@@ -1,8 +1,9 @@
 /**
- * home.md §5.1/§5.2: /sessions lists top-level sessions only (SessionList
- * drops `parent != null`, and its caption says 「子 agent 不在此列」). ① must
- * count exactly that set, so the 工作中 tap can never show fewer rows than the
- * count promised.
+ * home.md §5.1/§5.2/§5.3: the desktop ① row paints the ONE owner glance the
+ * Hub serves (`GET /v1/owner/glance`), never a derivation over the instance
+ * list. /sessions still lists top-level sessions only, so the board can hold
+ * fewer rows than the owner-scope ● count — the count is the owner's whole
+ * world, which is what ⑥ renders.
  */
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -11,6 +12,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import { mockDb } from "../lib/mock";
 import { hubStore } from "../lib/store";
+import type { OwnerGlance } from "../types/generated";
 import type { Instance } from "../types/instance";
 import { known } from "../types/wire";
 import { SessionsPage } from "./SessionsPage";
@@ -25,7 +27,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it("counts 工作中 from the top-level sessions the list shows, not child agents", async () => {
+function glance(counts: Partial<OwnerGlance["counts"]> = {}): OwnerGlance {
+  return {
+    generatedAt: "2026-10-30T10:09:00.000Z",
+    timezoneOffsetMinutes: 0,
+    counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...counts },
+    waiting: [],
+    working: [],
+    more: { waiting: 0, working: 0 },
+  } as unknown as OwnerGlance;
+}
+
+it("paints the owner glance's 工作中 count, while the board lists top-level sessions only", async () => {
   const host = {
     ...mockDb.hosts[0],
     id: "host-a",
@@ -60,11 +73,14 @@ it("counts 工作中 from the top-level sessions the list shows, not child agent
   vi.spyOn(api, "interactionList").mockResolvedValue([]);
   vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
   vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  // The Hub's owner-scope count includes the child session the board hides.
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(glance({ working: 2 }));
   vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
   vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
 
   await hubStore.bootstrap();
   await hubStore.refresh();
+  await hubStore.refreshGlance();
   expect(hubStore.getSnapshot().instances).toHaveLength(2);
 
   render(
@@ -73,10 +89,10 @@ it("counts 工作中 from the top-level sessions the list shows, not child agent
     </MemoryRouter>,
   );
   await screen.findByTestId("session-list");
-  // One card: the child session is not listed on /sessions.
+  // One card: the child session is not a desktop row.
   expect(screen.getAllByTestId("board-card")).toHaveLength(1);
-  // So the count says 1, not 2 — the tapped list equals it.
-  expect(await screen.findByTestId("glance-working")).toHaveTextContent("1 工作中");
+  // ① is the glance's number, not a re-derivation from that board.
+  expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
 });
 
 it("filters the ledger to 完成未看 when ◉ is tapped, and clears it on the second tap", async () => {
@@ -102,10 +118,12 @@ it("filters the ledger to 完成未看 when ◉ is tapped, and clears it on the 
   vi.spyOn(api, "interactionList").mockResolvedValue([]);
   vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
   vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(glance({ doneUnseen: 1, working: 1 }));
   vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
   vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
   await hubStore.bootstrap();
   await hubStore.refresh();
+  await hubStore.refreshGlance();
 
   render(
     <MemoryRouter initialEntries={["/sessions"]}>

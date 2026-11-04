@@ -907,6 +907,14 @@ export type HubState = {
   screens: Record<string, ScreenEntry>;
   /** List-row live phrases projected from each instance's journal tail. */
   summaries: Record<string, string>;
+  /**
+   * home-glance-d060: `GET /v1/owner/glance`, the one owner-scope projection
+   * the home's ① counts, the desktop 今日完成 segment, ⑥ and the ledger row
+   * headlines read. `null` until the first successful read (the row then
+   * paints 「–」, never a derived guess). A failed refresh keeps the last value:
+   * §8's stale path owns the freshness signal, not this slice.
+   */
+  glance: import("../types/generated").OwnerGlance | null;
   /** Number of outbox rows pending/inflight (offline banner). */
   outboxPending: number;
   /**
@@ -956,6 +964,7 @@ const initial: HubState = {
   /** Outbox rows still awaiting a definite Hub answer (D-055 banner count). */
   outboxPending: 0,
   summaries: {},
+  glance: null,
   lineages: {},
 };
 
@@ -6203,6 +6212,9 @@ class HubStore {
       if (!this.state.authed) return;
       void this.refresh();
       void this.refreshHosts().catch(() => undefined);
+      // home-glance-d060 §5.3: the home reads ONE glance per poll instead of
+      // one journal per row. Coalesced, so every mounted reader shares it.
+      void this.refreshGlance();
     }, 2000);
   }
 
@@ -8989,6 +9001,61 @@ class HubStore {
     // The live list projects the phrase from the journal tail into state;
     // the mock client still supplies its scripted summaries directly.
     return this.state.summaries[instanceId] ?? api.summaryOf(instanceId);
+  }
+
+  /**
+   * home-glance-d060: the owner glance's row for a session, waiting rows
+   * first. Indexed once per glance response so a ledger render does not scan
+   * the row lists per row.
+   */
+  glanceRowOf(instanceId: Id): import("../types/generated").OwnerGlanceRow | undefined {
+    const glance = this.state.glance;
+    if (!glance) return undefined;
+    if (this.glanceIndex?.glance !== glance) {
+      const index = new Map<string, import("../types/generated").OwnerGlanceRow>();
+      for (const row of [...glance.waiting, ...glance.working]) {
+        if (!index.has(row.instanceId)) index.set(row.instanceId, row);
+      }
+      this.glanceIndex = { glance, index };
+    }
+    return this.glanceIndex.index.get(instanceId);
+  }
+
+  /** The one deterministic headline for a session, when the glance has one. */
+  glanceHeadlineOf(instanceId: Id): string | undefined {
+    return this.glanceRowOf(instanceId)?.headline;
+  }
+
+  private glanceIndex: {
+    glance: NonNullable<HubState["glance"]>;
+    index: Map<string, import("../types/generated").OwnerGlanceRow>;
+  } | null = null;
+
+  private glanceInFlight: Promise<void> | null = null;
+
+  /**
+   * home-glance-d060: one `GET /v1/owner/glance` per poll. Coalesced — the
+   * home's several readers share the in-flight read — and epoch-guarded, so a
+   * response that lands after logout cannot repaint the next identity's row.
+   * A failure keeps the last glance; §8's stale path owns the signal.
+   */
+  refreshGlance(): Promise<void> {
+    if (this.glanceInFlight) return this.glanceInFlight;
+    const epoch = this.bootGen;
+    const job = (async () => {
+      try {
+        // The owner's local-day offset, east of UTC (the Hub clamps it).
+        const glance = await api.ownerGlance(-new Date().getTimezoneOffset());
+        if (epoch !== this.bootGen) return;
+        this.emit({ glance });
+      } catch {
+        // Keep the previous numbers; the badge/row never flips to a guess.
+      }
+    })().finally(() => {
+      if (this.glanceInFlight === job) this.glanceInFlight = null;
+    });
+    this.glanceInFlight = job;
+    return job;
   }
 
   permissionModeOf(instanceId: Id) {

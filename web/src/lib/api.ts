@@ -745,6 +745,14 @@ export type HubApi = {
   instanceResume(instanceId: Id, mode?: ResumeMode): Promise<ResumeResult>;
   /** `GET /v1/lineages/{id}`: lineage state and every chapter (D-057). */
   lineageGet(lineageId: Id): Promise<LineageRecord>;
+  /**
+   * home-glance-d060: `GET /v1/owner/glance`. The owner's world — Main's
+   * lineage subtree plus hand-opened sessions — as the ① counts, the desktop
+   * 今日完成 count and one deterministic headline per waiting/working session.
+   * `tzOffsetMinutes` is `-new Date().getTimezoneOffset()`; it only moves the
+   * local-day boundary 今日完成 is counted in.
+   */
+  ownerGlance(tzOffsetMinutes: number): Promise<import("../types/generated").OwnerGlance>;
   /** `DELETE /v1/instances/{id}`; `force` stops a live Instance first. */
   instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
   /**
@@ -1262,6 +1270,47 @@ function createMockApi(): HubApi {
         .sort((a, b) => a.generation - b.generation);
       if (!chapters.length) throw new HubHttpError(404, "NOT_FOUND", "lineage not found");
       return { lineageId, state: "running", generation: chapters.at(-1)!.generation, chapters };
+    },
+    async ownerGlance(tzOffsetMinutes) {
+      // The demo database has no journal tails, so every headline falls back to
+      // the session title; the counts stay the same §5.1/§5.2 rules.
+      const pending = mockDb.interactions.filter((row) => row.state === "pending");
+      const queued = new Set(pending.map((row) => row.instanceId));
+      const waiting = [...queued].flatMap((instanceId) => {
+        const row = mockDb.instances.find((item) => item.id === instanceId);
+        const interaction = pending.find((item) => item.instanceId === instanceId);
+        if (!row || !interaction) return [];
+        return [{
+          instanceId,
+          title: mockDb.titles.get(instanceId) ?? null,
+          kind: interaction.request.kind,
+          headline: interaction.request.kind === "question" ? "提问" : interaction.request.title,
+          taskId: row.taskId ?? null,
+        }];
+      });
+      const working = mockDb.instances
+        .filter((row) => row.lifecycle === "running" && !queued.has(row.id)
+          && (row.activity?.state !== "known" || row.activity.value !== "idle"))
+        .map((row) => ({
+          instanceId: row.id,
+          title: mockDb.titles.get(row.id) ?? null,
+          kind: "working",
+          headline: mockDb.summaries.get(row.id) ?? mockDb.titles.get(row.id) ?? "运行中",
+          taskId: row.taskId ?? null,
+        }));
+      return {
+        generatedAt: new Date().toISOString(),
+        timezoneOffsetMinutes: tzOffsetMinutes,
+        counts: {
+          needYou: pending.length,
+          doneUnseen: mockDb.instances.filter((row) => row.unseen === true).length,
+          working: working.length,
+          doneToday: 0,
+        },
+        waiting,
+        working,
+        more: { waiting: 0, working: 0 },
+      };
     },
     async instanceDelete(instanceId, force) {
       return mockDelete(instanceId, force);
@@ -1862,6 +1911,11 @@ function createLiveApi(): HubApi {
     },
     async lineageGet(lineageId) {
       return rest<LineageRecord>(`/v1/lineages/${encodeURIComponent(lineageId)}`);
+    },
+    async ownerGlance(tzOffsetMinutes) {
+      return rest<import("../types/generated").OwnerGlance>(
+        `/v1/owner/glance?tzOffsetMinutes=${Math.trunc(tzOffsetMinutes)}`,
+      );
     },
     async instanceDelete(instanceId, force) {
       // `force=1` is what stops a live Instance — the Hub stops and deletes

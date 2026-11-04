@@ -43,10 +43,24 @@ const hub = {
   screens: {} as Record<string, unknown>,
   answering: {} as Record<string, true>,
   connection: "live",
+  // home-glance-d060: ① reads this, never the instance list.
+  glance: null as { counts: { needYou: number; doneUnseen: number; working: number; doneToday: number } } | null,
 };
+
+/** The owner glance the row's ① reads (the Hub's numbers, verbatim). */
+function setGlance(counts: { needYou?: number; doneUnseen?: number; working?: number } = {}) {
+  hub.glance = {
+    counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...counts },
+  };
+}
 
 const resumeMock = vi.fn();
 const listeners = new Set<() => void>();
+/** The per-row reads the home used to issue; home-glance-d060 retires the journal one. */
+const rowReads = vi.hoisted(() => ({
+  refreshScreens: vi.fn(() => Promise.resolve(undefined)),
+  hydrateRowSummaries: vi.fn(() => Promise.resolve(undefined)),
+}));
 /** The store's freshness projection (home.md §8) as the component sees it. */
 const health = { lastOkAt: Date.now() as number | null, failingSince: null as number | null, settledSeq: 0 };
 const healthListeners = new Set<() => void>();
@@ -83,9 +97,11 @@ vi.mock("../../lib/store", async (importOriginal) => {
       hostName: () => "alpha",
       usageRollupOf: () => null,
       summaryOf: () => undefined,
+      // home-glance-d060: the row body's phrase is the glance's headline.
+      glanceHeadlineOf: () => undefined,
       resume: (...args: unknown[]) => resumeMock(...args),
-      refreshScreens: vi.fn().mockResolvedValue(undefined),
-      hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
+      refreshScreens: rowReads.refreshScreens,
+      hydrateRowSummaries: rowReads.hydrateRowSummaries,
     },
   };
 });
@@ -144,6 +160,9 @@ async function openQuiet() {
 beforeEach(() => {
   resumeMock.mockReset();
   refreshMock.mockClear();
+  rowReads.refreshScreens.mockClear();
+  rowReads.hydrateRowSummaries.mockClear();
+  hub.glance = null;
   health.lastOkAt = Date.now();
   health.failingSince = null;
   localStorage.removeItem(SPACES_PREFS_KEY);
@@ -744,6 +763,7 @@ describe("① 完成未看 filter", () => {
       row("ins-done", { activity: known("idle"), unseen: true }),
       row("ins-work", { activity: known("working") }),
     ];
+    setGlance({ doneUnseen: 1, working: 1 });
     renderHome();
     const segment = await screen.findByTestId("glance-done-unseen");
     expect(segment).toHaveTextContent("1 完成未看");
@@ -799,9 +819,28 @@ describe("① count vs the phone ledger's set", () => {
         parent: { instanceId: "ins-parent", runId: "run_1", commandId: "cmd_1" },
       }),
     ];
+    // The Hub's owner-scope count includes the child; the ledger lists it too.
+    setGlance({ working: 2 });
     renderHome();
     expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
     expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+  });
+});
+
+describe("the home poll", () => {
+  it("reads no journal per row — one glance carries every headline", async () => {
+    hub.instances = [
+      row("ins-a", { activity: known("working") }),
+      row("ins-b", { activity: known("working") }),
+    ];
+    setGlance({ working: 2 });
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    await screen.findByTestId("glance-working");
+    // The mount tick is the poll's first iteration. The per-row journal read
+    // that used to feed each body is gone — one glance carries every headline
+    // (home.md §5.3); the tty screen read is a different source and stays.
+    expect(rowReads.hydrateRowSummaries).not.toHaveBeenCalled();
   });
 });
 

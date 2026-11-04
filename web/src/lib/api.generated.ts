@@ -4053,6 +4053,11 @@ export interface components {
          * @enum {string}
          */
         WakeCheckAdmission: "owner" | "own-host-bypass" | "approved";
+        /**
+         * @description How a check's processes were contained once it ended (cleanup, not a security boundary): cgroup (every process killed with its verified cgroup v2 leaf), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.
+         * @enum {string}
+         */
+        WakeCheckContainment: "cgroup" | "subreaper" | "process-group";
         /** @description The optional check (main-agent.md §11.2): a shell command one Node runs before each run, under a mandatory timeout, after an sh -n precheck. Exit 0 lets the run happen with the check's bounded stdout as its summary; exit 2 skips it; anything else, or the timeout, fails it. Admitted on the OA1 axis: an Agent adds one without the owner's approval only on its own host while it runs with its harness's permission control off; any other check needs the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED, then the same add with x-remuda-approval-id). The owner's own add is admitted on the host it names. */
         WakeCheckRequest: {
             /** @description The shell command (sh -c), at most 2000 characters; required. The secret lint runs over it (422 WAKE_SECRET_REJECTED, field check.command, never echoed). */
@@ -4138,6 +4143,9 @@ export interface components {
             wakeId: string;
         };
         WakeRunCheck: {
+            containment?: components["schemas"]["WakeCheckContainment"];
+            /** @description The sweep stopped at its hard limit with processes the kernel could not kill still live. */
+            containmentIncomplete?: boolean;
             hostId: string;
             /** @description Its stdout, at most 4096 bytes. Untrusted data. */
             output?: string;

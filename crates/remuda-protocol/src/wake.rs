@@ -197,6 +197,12 @@ wire_enum!(WakeCheckOutcome, "8.4", {
     CwdUnusable => "cwd-unusable",
 });
 
+wire_enum!(WakeCheckContainment, "8.4", {
+    Cgroup => "cgroup",
+    Subreaper => "subreaper",
+    ProcessGroup => "process-group",
+});
+
 wire_enum!(WakeRunState, "8.4", {
     Queued => "queued",
     Running => "running",
@@ -390,6 +396,18 @@ pub struct WakeRunCheck {
     /// The stdout was longer and was cut.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
+    /// How its processes were contained once it ended (cleanup, not a
+    /// security boundary): `cgroup` (every process killed with its verified
+    /// cgroup v2 leaf), `subreaper` (Linux: descendants, marked processes and
+    /// the process group swept; a check that kills its supervisor and
+    /// detaches with a cleared environment can outlive it) or `process-group`
+    /// (only the group). Absent when nothing ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<WakeCheckContainment>,
+    /// The sweep stopped at its hard limit with processes the kernel could
+    /// not kill still live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub containment_incomplete: bool,
 }
 
 /// Who added a wake-up.
@@ -594,6 +612,13 @@ pub struct WakeCheckResult {
     pub stdout_truncated: bool,
     /// How it exited, in a few words; never its stderr.
     pub summary: String,
+    /// How its processes were contained; absent when nothing ran (see
+    /// [`WakeRunCheck::containment`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<WakeCheckContainment>,
+    /// The sweep stopped at its hard limit with processes still live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub containment_incomplete: bool,
 }
 
 #[cfg(test)]

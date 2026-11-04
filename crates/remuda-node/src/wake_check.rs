@@ -135,6 +135,10 @@ pub(crate) struct CheckRun {
     pub(crate) stdout: String,
     pub(crate) stdout_truncated: bool,
     pub(crate) summary: String,
+    /// How its processes were contained; `None` when nothing ran.
+    pub(crate) containment: Option<Label>,
+    /// The sweep stopped at its hard limit with processes still live.
+    pub(crate) containment_incomplete: bool,
 }
 
 impl CheckRun {
@@ -146,6 +150,8 @@ impl CheckRun {
             stdout: String::new(),
             stdout_truncated: false,
             summary: summary.into(),
+            containment: None,
+            containment_incomplete: false,
         }
     }
 }
@@ -700,6 +706,8 @@ pub(crate) async fn run_check(
         containment = containment.label().as_str(),
         "check contained"
     );
+    let label = containment.label();
+    let incomplete = swept.incomplete;
     let exit_code = match waited {
         Err(_) => {
             return CheckRun {
@@ -709,16 +717,24 @@ pub(crate) async fn run_check(
                 stdout,
                 stdout_truncated,
                 summary: format!(
-                    "timed out after {} s; every process it started was killed",
-                    timeout.as_secs()
+                    "timed out after {} s; its processes were swept ({})",
+                    timeout.as_secs(),
+                    label.as_str()
                 ),
+                containment: Some(label),
+                containment_incomplete: incomplete,
             };
         }
         Ok(None) => {
-            return CheckRun::without_output(
-                WakeCheckOutcome::Unavailable,
-                "its exit was not seen",
-            );
+            return CheckRun {
+                containment: Some(label),
+                containment_incomplete: incomplete,
+                ..CheckRun::without_output(
+                    WakeCheckOutcome::Unavailable,
+                    "its exit was not seen (its supervisor shell ended first); its processes \
+                     were swept",
+                )
+            };
         }
         Ok(Some(code)) => code,
     };
@@ -735,6 +751,8 @@ pub(crate) async fn run_check(
         stdout,
         stdout_truncated,
         summary,
+        containment: Some(label),
+        containment_incomplete: incomplete,
     }
 }
 
@@ -809,6 +827,8 @@ impl DevNode {
             stdout: run.stdout,
             stdout_truncated: run.stdout_truncated,
             summary: run.summary,
+            containment: run.containment.map(Label::wire),
+            containment_incomplete: run.containment_incomplete,
         })
         .map_err(NodeError::from)
     }
@@ -863,6 +883,15 @@ mod tests {
     async fn exit_codes_and_stdout_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         let passed = run(dir.path(), "printf 'queue: 3 jobs\\n'; exit 0", 30).await;
+        // r3: the run names the containment that applied.
+        // (A host without a delegated cgroup: the subreaper on Linux.)
+        let expected = if CgroupFs::system().and_then(|fs| fs.leaf_parent()).is_some() {
+            passed.containment
+        } else {
+            Some(Label::without_leaf())
+        };
+        assert!(passed.containment.is_some());
+        assert_eq!(passed.containment, expected);
         assert_eq!(passed.outcome, WakeCheckOutcome::Exited);
         assert_eq!(passed.exit_code, Some(0));
         assert_eq!(passed.stdout, "queue: 3 jobs\n");
@@ -892,6 +921,7 @@ mod tests {
         .await;
         assert_eq!(checked.outcome, WakeCheckOutcome::Syntax);
         assert_eq!(checked.exit_code, None);
+        assert_eq!(checked.containment, None, "nothing ran");
         assert!(!marker.exists(), "sh -n executes nothing");
     }
 
@@ -1182,6 +1212,10 @@ mod tests {
         let result: WakeCheckResult = serde_json::from_value(result).unwrap();
         assert_eq!(result.run_id, "wrn_1");
         assert_eq!(result.outcome, WakeCheckOutcome::Exited);
+        assert!(
+            result.containment.is_some(),
+            "r3: the wire result names its containment"
+        );
         assert_eq!(result.exit_code, Some(2));
         let mut lines = result.stdout.lines();
         assert_eq!(

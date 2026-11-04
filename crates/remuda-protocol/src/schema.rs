@@ -518,6 +518,7 @@ pub fn schema_document() -> Value {
         WakeAt,
         WakeCheck,
         WakeCheckAdmission,
+        WakeCheckContainment,
         WakeCheckOutcome,
         WakeCheckParams,
         WakeCheckRequest,

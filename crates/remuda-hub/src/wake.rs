@@ -299,6 +299,14 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "check_output_truncated",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // r3: how the check's processes were contained, as its Node reported.
+    ensure_column(conn, "wake_runs", "check_containment", "TEXT")?;
+    ensure_column(
+        conn,
+        "wake_runs",
+        "check_containment_incomplete",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // r2: attempts that never reached the check's Node, and when to try again.
     ensure_column(
         conn,
@@ -955,7 +963,7 @@ fn wake_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeUp> {
 const RUN_COLUMNS: &str = "run_id, wake_id, lineage_id, name, mode, scheduled_at, fired_at, \
      state, started_at, ended_at, check_exit, fact_id, batch_id, child_instance_id, \
      missed_before, failure_kind, check_state, check_host_id, check_summary, check_output, \
-     check_output_truncated";
+     check_output_truncated, check_containment, check_containment_incomplete";
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeRun> {
     let mode: String = row.get(4)?;
@@ -968,6 +976,10 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WakeRun> {
             summary: row.get(18)?,
             output: row.get(19)?,
             output_truncated: row.get::<_, i64>(20)? != 0,
+            containment: row
+                .get::<_, Option<String>>(21)?
+                .and_then(|raw| serde_json::from_value(Value::String(raw)).ok()),
+            containment_incomplete: row.get::<_, i64>(22)? != 0,
         }),
         None => None,
     };
@@ -2924,6 +2936,8 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
             stdout: String::new(),
             stdout_truncated: false,
             summary: "the lineage has no workspace on that host; nothing ran".into(),
+            containment: None,
+            containment_incomplete: false,
         });
         apply_report(&tx, run_id, &report)?;
         tx.commit()?;
@@ -3500,11 +3514,26 @@ fn apply_report(
             ("failed", Some(failure::CHECK_UNAVAILABLE))
         }
     };
+    let containment = result
+        .and_then(|result| result.containment)
+        .and_then(|label| serde_json::to_value(label).ok())
+        .and_then(|label| label.as_str().map(str::to_owned));
+    let incomplete = result.is_some_and(|result| result.containment_incomplete);
     tx.execute(
         "UPDATE wake_runs SET check_state = ?2, check_exit = ?3, check_summary = ?4,
-                check_output = ?5, check_output_truncated = ?6
+                check_output = ?5, check_output_truncated = ?6, check_containment = ?7,
+                check_containment_incomplete = ?8
           WHERE run_id = ?1",
-        params![run_id, check_state, exit, summary, output, truncated],
+        params![
+            run_id,
+            check_state,
+            exit,
+            summary,
+            output,
+            truncated,
+            containment,
+            incomplete
+        ],
     )?;
     let mut fresh_due = false;
     match check_state {

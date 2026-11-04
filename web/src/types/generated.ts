@@ -5018,6 +5018,9 @@ export type WakeCheck = ({
 /** WakeCheckAdmission wire values; `protocol.md` §8.4. */
 export type WakeCheckAdmission = ("owner" | "own-host-bypass" | "approved");
 
+/** WakeCheckContainment wire values; `protocol.md` §8.4. */
+export type WakeCheckContainment = ("cgroup" | "subreaper" | "process-group");
+
 /** WakeCheckOutcome wire values; `protocol.md` §8.4. */
 export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable" | "no-workspace" | "cwd-unusable");
 
@@ -5044,6 +5047,8 @@ export type WakeCheckRequest = ({
 
 /** `wake.check` result. */
 export type WakeCheckResult = ({
+  "containment"?: (WakeCheckContainment | (null));
+  "containmentIncomplete"?: (boolean);
   "exitCode"?: (number | null);
   "outcome": WakeCheckOutcome;
   "runId": (string);
@@ -5116,6 +5121,8 @@ export type WakeRun = ({
 
 /** One run's check. */
 export type WakeRunCheck = ({
+  "containment"?: (WakeCheckContainment | (null));
+  "containmentIncomplete"?: (boolean);
   "hostId": (string);
   "output"?: (string | null);
   "outputTruncated"?: (boolean);

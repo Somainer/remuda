@@ -6918,6 +6918,15 @@
         ],
         "type": "string"
       },
+      "WakeCheckContainment": {
+        "description": "How a check's processes were contained once it ended (cleanup, not a security boundary): cgroup (every process killed with its verified cgroup v2 leaf), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.",
+        "enum": [
+          "cgroup",
+          "subreaper",
+          "process-group"
+        ],
+        "type": "string"
+      },
       "WakeRunCheck": {
         "properties": {
           "state": {
@@ -6936,6 +6945,13 @@
           },
           "outputTruncated": {
             "description": "The stdout was longer and was cut.",
+            "type": "boolean"
+          },
+          "containment": {
+            "$ref": "#/components/schemas/WakeCheckContainment"
+          },
+          "containmentIncomplete": {
+            "description": "The sweep stopped at its hard limit with processes the kernel could not kill still live.",
             "type": "boolean"
           }
         },

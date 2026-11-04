@@ -52,6 +52,7 @@ impl Checks {
         self.push(CheckAnswer::Result(json!({
             "outcome": "exited", "exitCode": code, "stdout": stdout,
             "stdoutTruncated": false, "summary": format!("exit {code}"),
+            "containment": "subreaper",
         })));
     }
 
@@ -2252,6 +2253,11 @@ async fn check_exits_route_the_run() -> Result<()> {
     assert_eq!(runs[0]["state"], "skipped", "{runs:#?}");
     assert_eq!(runs[0]["checkExit"], 2);
     assert_eq!(runs[0]["check"]["state"], "skipped");
+    assert_eq!(
+        runs[0]["check"]["containment"], "subreaper",
+        "r3: the run records the containment its Node reported"
+    );
+    assert!(runs[0]["check"].get("containmentIncomplete").is_none());
     assert!(ctx.wake_sends(&seat).is_empty(), "no model turn");
     assert!(
         ctx.notice_titles(&seat)?.is_empty(),
@@ -2298,7 +2304,8 @@ async fn check_exits_route_the_run() -> Result<()> {
     // 4. The timeout: failed with its own kind, notified once.
     ctx.checks.push(CheckAnswer::Result(json!({
         "outcome": "timed-out", "stdout": "", "stdoutTruncated": false,
-        "summary": "timed out after 30 s; its process group was killed",
+        "summary": "timed out after 30 s; its processes were swept (cgroup)",
+        "containment": "cgroup", "containmentIncomplete": true,
     })));
     ctx.check_tick(&tick(3)).await?;
     // 5. Exit 1 again while it has not recovered: latched, not pushed.
@@ -2327,6 +2334,8 @@ async fn check_exits_route_the_run() -> Result<()> {
         "{runs:#?}"
     );
     assert_eq!(ctx.wake_sends(&seat).len(), 1, "no turn for a failed check");
+    assert_eq!(runs[3]["check"]["containment"], "cgroup");
+    assert_eq!(runs[3]["check"]["containmentIncomplete"], true);
     assert_eq!(
         ctx.notice_titles(&seat)?,
         [

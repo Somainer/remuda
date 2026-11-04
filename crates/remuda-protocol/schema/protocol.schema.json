@@ -22342,6 +22342,26 @@
         }
       ]
     },
+    "WakeCheckContainment": {
+      "description": "WakeCheckContainment wire values; `protocol.md` §8.4.",
+      "oneOf": [
+        {
+          "const": "cgroup",
+          "description": "Wire value `cgroup`.",
+          "type": "string"
+        },
+        {
+          "const": "subreaper",
+          "description": "Wire value `subreaper`.",
+          "type": "string"
+        },
+        {
+          "const": "process-group",
+          "description": "Wire value `process-group`.",
+          "type": "string"
+        }
+      ]
+    },
     "WakeCheckOutcome": {
       "description": "WakeCheckOutcome wire values; `protocol.md` §8.4.",
       "oneOf": [
@@ -22464,6 +22484,21 @@
     "WakeCheckResult": {
       "description": "`wake.check` result.",
       "properties": {
+        "containment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeCheckContainment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How its processes were contained; absent when nothing ran (see\n[`WakeRunCheck::containment`])."
+        },
+        "containmentIncomplete": {
+          "description": "The sweep stopped at its hard limit with processes still live.",
+          "type": "boolean"
+        },
         "exitCode": {
           "description": "The exit code, when it exited with one.",
           "format": "int32",
@@ -22790,6 +22825,21 @@
     "WakeRunCheck": {
       "description": "One run's check.",
       "properties": {
+        "containment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WakeCheckContainment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How its processes were contained once it ended (cleanup, not a\nsecurity boundary): `cgroup` (every process killed with its verified\ncgroup v2 leaf), `subreaper` (Linux: descendants, marked processes and\nthe process group swept; a check that kills its supervisor and\ndetaches with a cleared environment can outlive it) or `process-group`\n(only the group). Absent when nothing ran."
+        },
+        "containmentIncomplete": {
+          "description": "The sweep stopped at its hard limit with processes the kernel could\nnot kill still live.",
+          "type": "boolean"
+        },
         "hostId": {
           "description": "The Node it ran on.",
           "type": "string"

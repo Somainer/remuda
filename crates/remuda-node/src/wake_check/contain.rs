@@ -33,6 +33,15 @@ impl Label {
         }
     }
 
+    /// The wire value.
+    pub(crate) fn wire(self) -> remuda_protocol::WakeCheckContainment {
+        match self {
+            Self::Cgroup => remuda_protocol::WakeCheckContainment::Cgroup,
+            Self::Subreaper => remuda_protocol::WakeCheckContainment::Subreaper,
+            Self::ProcessGroup => remuda_protocol::WakeCheckContainment::ProcessGroup,
+        }
+    }
+
     /// The label without a verified cgroup leaf, on this platform.
     pub(crate) fn without_leaf() -> Self {
         if cfg!(target_os = "linux") {

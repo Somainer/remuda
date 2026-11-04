@@ -2709,3 +2709,89 @@ async fn a_node_busy_check_is_retried_not_consumed() -> Result<()> {
     );
     Ok(())
 }
+
+/// r2 (§11.1, only the write is retried): a check settle write that fails
+/// is not dropped. The report stays queued, the run keeps running (the
+/// wake-up busy) until a later drain writes it, then the run ends as its
+/// check said; a failing write of the report itself is retried by the
+/// check's task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_check_settle_write_is_retried_never_the_run() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-check-settle").await?;
+    let (seat, token) = ctx.bypass_seat(&project).await?;
+    let wake = ctx
+        .add_ok(
+            &token,
+            &seat,
+            checked(
+                "q",
+                json!({ "command": "exit 1", "timeoutSecs": 5 }),
+                "failure",
+            ),
+        )
+        .await?;
+    let wake_id = wake["wakeId"].as_str().context("wake id")?.to_owned();
+    remuda_hub::wake_test_support::arm_check_settle_failure(&wake_id, 2);
+    remuda_hub::wake_test_support::arm_check_report_failure(&wake_id, 1);
+    ctx.checks.exit(1, "");
+    let first = next_fire(&wake);
+    ctx.check_tick(&shift(&first, 1)).await?;
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs[0]["state"], "running", "not settled yet: {runs:#?}");
+    let queued = || -> Result<(i64, i64)> {
+        Ok(ctx.db()?.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(attempts), 0) FROM wake_check_reports",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    };
+    let (count, attempts) = queued()?;
+    assert_eq!(count, 1, "the report is kept");
+    assert!(attempts >= 1, "its apply failed and is retried");
+    // A later drain (each tick drains, past the backoff) writes it; the
+    // ticks stay inside the 3-minute interval.
+    for step in 1..=4 {
+        ctx.check_tick(&shift(&first, 1 + 30 * step)).await?;
+    }
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs.len(), 1, "the run is not run again: {runs:#?}");
+    assert_eq!(runs[0]["state"], "failed");
+    assert_eq!(runs[0]["failureKind"], "check-exit");
+    assert_eq!(runs[0]["checkExit"], 1);
+    assert_eq!(queued()?.0, 0);
+    assert_eq!(ctx.check_calls().len(), 1, "asked once");
+    assert_eq!(ctx.notice_titles(&seat)?, ["Wake-up q failed: check-exit"]);
+
+    // An apply that never succeeds still ends the run, its state only, after
+    // the bounded tries (a one-shot wake-up, so no later occurrence fires).
+    let once = ctx
+        .add_ok(
+            &token,
+            &seat,
+            json!({ "name": "once", "text": "Once.", "trigger": { "kind": "at", "afterSecs": 60 },
+                    "notify": "failure",
+                    "check": { "command": "exit 1", "timeoutSecs": 5 } }),
+        )
+        .await?;
+    let once_id = once["wakeId"].as_str().context("wake id")?.to_owned();
+    remuda_hub::wake_test_support::arm_check_settle_failure(&once_id, 1000);
+    ctx.checks.exit(1, "");
+    let at = next_fire(&once);
+    ctx.check_tick(&shift(&at, 1)).await?;
+    for step in 1..=10 {
+        ctx.check_tick(&shift(&at, 1 + 120 * step)).await?;
+    }
+    remuda_hub::wake_test_support::arm_check_settle_failure(&once_id, 0);
+    let run = ctx
+        .runs(&seat)
+        .await?
+        .into_iter()
+        .find(|run| run["name"] == "once")
+        .context("the once run")?;
+    assert_eq!(run["state"], "failed", "{run:#?}");
+    assert_eq!(run["failureKind"], "check-exit");
+    assert_eq!(run["checkExit"], 1);
+    assert_eq!(queued()?.0, 0, "nothing left queued");
+    Ok(())
+}

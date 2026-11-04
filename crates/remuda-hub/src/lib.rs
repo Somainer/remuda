@@ -371,6 +371,18 @@ pub mod wake_test_support {
         crate::wake::test_seams::arm_check_node_busy(run_id, times);
     }
 
+    /// cb-wake-check r2: make the next `times` applies of the check report of
+    /// `run_id` fail (the drain retries them); 0 disarms.
+    pub fn arm_check_settle_failure(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_settle_failure(run_id, times);
+    }
+
+    /// cb-wake-check r2: make the next `times` writes queueing the check
+    /// report of `run_id` fail (the check's task retries them); 0 disarms.
+    pub fn arm_check_report_failure(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_report_failure(run_id, times);
+    }
+
     /// Seconds without a completed tick after which `/healthz` answers 503.
     pub fn stale_after_secs() -> u64 {
         crate::wake::stale_after_secs()

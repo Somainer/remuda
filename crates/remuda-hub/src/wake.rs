@@ -283,6 +283,18 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "wake_runs", "check_next_at", "TEXT")?;
+    // r2: a Node's report on a check, waiting to be applied (§11.1: only the
+    // write is retried, never the run).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS wake_check_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT
+         );",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS wake_runs_check
             ON wake_runs(check_state) WHERE check_state IN ('pending', 'running');",
@@ -2122,6 +2134,7 @@ fn due_conditions(
 /// One evaluation as of `now`, in one writer transaction (queued results are
 /// applied first, in their own).
 pub(crate) fn tick(conn: &mut Connection, now: OffsetDateTime) -> Result<TickOutcome, StoreError> {
+    let reports = drain_check_reports(conn, now);
     drain_outcomes(conn, now);
     let now_s = rfc3339(now);
     let mut outcome = TickOutcome::default();
@@ -2139,7 +2152,7 @@ pub(crate) fn tick(conn: &mut Connection, now: OffsetDateTime) -> Result<TickOut
     )?;
     tx.commit()?;
     outcome.oldest_waiting = oldest.as_deref().and_then(crate::inbox::parse_at);
-    outcome.fresh_due |= fresh;
+    outcome.fresh_due |= fresh || reports.fresh;
     outcome.check_due |= check;
     Ok(outcome)
 }
@@ -2554,6 +2567,7 @@ fn notify_run(
 /// applied on a later pass). An interrupted run is never replayed; its
 /// wake-up's next occurrence is computed from the schedule as usual.
 pub(crate) fn boot(conn: &mut Connection) {
+    drain_check_reports(conn, OffsetDateTime::now_utc());
     drain_outcomes(conn, OffsetDateTime::now_utc());
     // A check in flight is interrupted with its run: its Node's answer, if
     // one ever comes, goes to a link that no longer exists.
@@ -2562,7 +2576,8 @@ pub(crate) fn boot(conn: &mut Connection) {
                 check_state = CASE WHEN check_state = 'running' THEN 'interrupted'
                                    ELSE check_state END
           WHERE state = 'running'
-            AND run_id NOT IN (SELECT run_id FROM wake_outcomes)",
+            AND run_id NOT IN (SELECT run_id FROM wake_outcomes)
+            AND run_id NOT IN (SELECT run_id FROM wake_check_reports)",
         params![now_rfc3339()],
     ) {
         Ok(0) => {}
@@ -2682,7 +2697,8 @@ struct CheckClaim {
 }
 
 /// What came back from the Node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "result", rename_all = "kebab-case")]
 enum CheckReport {
     /// The Node ran it (or refused to start it) and said how it went.
     Done(remuda_protocol::WakeCheckResult),
@@ -2976,25 +2992,252 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
     {
         return;
     }
+    // §11.1: only the write is retried, never the run. The report is queued
+    // in a small write of its own (retried here while it fails), then applied
+    // by the drain every writer job runs, which retries its own failures.
     let run_id = claim.run_id;
-    let settled = state
-        .store
-        .run_named("wake_check_settle", move |conn| {
-            settle_check(conn, &run_id, &report)
-        })
-        .await;
-    match settled {
-        Ok(Settled::Fresh) => drive_fresh(state).await,
-        Ok(Settled::Done) => {}
-        Ok(Settled::RetryAfter(secs)) => {
-            tokio::spawn(redrive_checks(state.clone(), secs));
+    let report = match serde_json::to_string(&report) {
+        Ok(report) => report,
+        Err(_) => return,
+    };
+    let mut attempts = 0_i64;
+    loop {
+        attempts += 1;
+        let queued = state
+            .store
+            .run_named("wake_check_report", {
+                let run_id = run_id.clone();
+                let report = report.clone();
+                let wake_id = claim.wake_id.clone();
+                // Applied in the same job, so this task learns what it left
+                // to do; a failed apply stays queued for the next drain
+                // (every writer job, every tick), whose fresh children and
+                // retries the tick picks up.
+                move |conn| {
+                    queue_report(conn, &run_id, &wake_id, &report)?;
+                    Ok(drain_check_reports(conn, OffsetDateTime::now_utc()))
+                }
+            })
+            .await;
+        match queued {
+            Ok(drained) => {
+                if let Some(secs) = drained.retry_after {
+                    tokio::spawn(redrive_checks(state.clone(), secs));
+                }
+                if drained.fresh {
+                    drive_fresh(state).await;
+                }
+                return;
+            }
+            Err(err) if attempts < MAX_OUTCOME_ATTEMPTS => {
+                tracing::warn!(
+                    category = "wake",
+                    code = crate::inbox::error_code(&err),
+                    attempts,
+                    "a check report could not be queued; it is retried"
+                );
+                let secs = check_retry_secs(attempts).min(OUTCOME_RETRY_MAX_SECS);
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    u64::try_from(secs).unwrap_or(1),
+                ))
+                .await;
+            }
+            Err(err) => {
+                // The run stays running; a Hub restart interrupts it.
+                tracing::error!(
+                    category = "wake",
+                    code = crate::inbox::error_code(&err),
+                    "a check report could not be queued; given up"
+                );
+                return;
+            }
         }
-        Err(err) => tracing::error!(
+    }
+}
+
+/// Queue a Node's report on `run_id`'s check, in its own write.
+fn queue_report(
+    conn: &mut Connection,
+    run_id: &str,
+    wake_id: &str,
+    report: &str,
+) -> Result<(), StoreError> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_check_report_failure(run_id)
+        || test_seams::take_check_report_failure(wake_id)
+    {
+        return Err(StoreError::FaultInjected("wake check report".into()));
+    }
+    conn.execute(
+        "INSERT INTO wake_check_reports (run_id, report_json, observed_at) VALUES (?1, ?2, ?3)",
+        params![run_id, report, now_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// What a drain of queued check reports left to do.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drained {
+    /// A fresh run may now create its child.
+    pub(crate) fresh: bool,
+    /// A check its Node never received is asked again after this many seconds.
+    pub(crate) retry_after: Option<u64>,
+}
+
+/// Apply the queued check reports due at `now` (§11.1: only the write is
+/// retried, never the run). Runs after every writer job, on every tick and at
+/// open. A report whose apply fails stays queued and is tried again after
+/// 1 s, doubling, at most 60 s; after [`MAX_OUTCOME_ATTEMPTS`] failed tries
+/// the run's own state is written without its delivery, fact or notice
+/// ([`apply_report_state_only`]), so a run always ends.
+pub(crate) fn drain_check_reports(conn: &mut Connection, now: OffsetDateTime) -> Drained {
+    let mut drained = Drained::default();
+    let now_s = rfc3339(now);
+    let pending = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM wake_check_reports
+                             WHERE next_attempt_at IS NULL OR next_attempt_at <= ?1)",
+        )
+        .and_then(|mut stmt| stmt.query_row(params![now_s], |row| row.get::<_, bool>(0)));
+    if !matches!(pending, Ok(true)) {
+        return drained;
+    }
+    let result = (|| -> Result<(), StoreError> {
+        let tx = immediate_tx(conn)?;
+        let rows: Vec<(i64, String, String, i64)> = tx
+            .prepare_cached(
+                "SELECT id, run_id, report_json, attempts FROM wake_check_reports
+                  WHERE next_attempt_at IS NULL OR next_attempt_at <= ?1
+                  ORDER BY id LIMIT ?2",
+            )?
+            .query_map(params![now_s, OUTCOME_BATCH], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, run_id, raw, attempts) in rows {
+            let report: CheckReport = match serde_json::from_str(&raw) {
+                Ok(report) => report,
+                // A report this build cannot read ends its run as unavailable.
+                Err(_) => CheckReport::Refused,
+            };
+            let applied =
+                in_savepoint_with(&tx, || apply_report(&tx, &run_id, &report)).or_else(|err| {
+                    if attempts + 1 >= MAX_OUTCOME_ATTEMPTS {
+                        in_savepoint_with(&tx, || apply_report_state_only(&tx, &run_id, &report))
+                            .map_err(|_| err)
+                    } else {
+                        Err(err)
+                    }
+                });
+            match applied {
+                Ok(settled) => {
+                    tx.execute("DELETE FROM wake_check_reports WHERE id = ?1", params![id])?;
+                    match settled {
+                        Settled::Fresh => drained.fresh = true,
+                        Settled::RetryAfter(secs) => {
+                            drained.retry_after =
+                                Some(drained.retry_after.map_or(secs, |held| held.min(secs)));
+                        }
+                        Settled::Done => {}
+                    }
+                }
+                Err(err) => {
+                    tx.execute(
+                        "UPDATE wake_check_reports SET attempts = attempts + 1, next_attempt_at = ?2
+                          WHERE id = ?1",
+                        params![id, retry_at(now, attempts.saturating_add(1))],
+                    )?;
+                    tracing::warn!(
+                        category = "wake",
+                        code = crate::inbox::error_code(&err),
+                        attempts = attempts + 1,
+                        "a check settle write failed; it is retried"
+                    );
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        tracing::error!(
             category = "wake",
             code = crate::inbox::error_code(&err),
-            "check result could not be written"
-        ),
+            "check report drain failed"
+        );
     }
+    drained
+}
+
+/// [`in_savepoint`] for work that returns a value.
+fn in_savepoint_with<T>(
+    conn: &Connection,
+    work: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    conn.execute_batch("SAVEPOINT wake_check_settle")?;
+    match work() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE wake_check_settle")?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO wake_check_settle; RELEASE wake_check_settle");
+            Err(err)
+        }
+    }
+}
+
+/// The last resort of a report whose full apply kept failing: the run and its
+/// check end in the state the report names, with nothing else written (no
+/// delivery, no fact, no notice). A check that passed cannot run any more:
+/// its run fails `not-delivered`. A report that never reached the Node, or a
+/// lost link, interrupts the run.
+fn apply_report_state_only(
+    conn: &Connection,
+    run_id: &str,
+    report: &CheckReport,
+) -> Result<Settled, StoreError> {
+    let (state, check_state, kind, exit) = match report {
+        CheckReport::NotSent | CheckReport::Lost => ("interrupted", "interrupted", None, None),
+        CheckReport::Refused => ("failed", "failed", Some(failure::CHECK_UNAVAILABLE), None),
+        CheckReport::Done(result) => {
+            let exit = (result.outcome == remuda_protocol::WakeCheckOutcome::Exited)
+                .then_some(result.exit_code)
+                .flatten();
+            match (result.outcome, exit) {
+                (remuda_protocol::WakeCheckOutcome::Exited, Some(0)) => {
+                    ("failed", "passed", Some(failure::NOT_DELIVERED), exit)
+                }
+                (remuda_protocol::WakeCheckOutcome::Exited, Some(2)) => {
+                    ("skipped", "skipped", None, exit)
+                }
+                (remuda_protocol::WakeCheckOutcome::Exited, _) => {
+                    ("failed", "failed", Some(failure::CHECK_EXIT), exit)
+                }
+                (remuda_protocol::WakeCheckOutcome::TimedOut, _) => {
+                    ("failed", "failed", Some(failure::CHECK_TIMEOUT), None)
+                }
+                (remuda_protocol::WakeCheckOutcome::Syntax, _) => {
+                    ("failed", "failed", Some(failure::CHECK_SYNTAX), None)
+                }
+                (remuda_protocol::WakeCheckOutcome::Unavailable, _) => {
+                    ("failed", "failed", Some(failure::CHECK_UNAVAILABLE), None)
+                }
+            }
+        }
+    };
+    conn.execute(
+        "UPDATE wake_runs SET state = ?2, check_state = ?3, failure_kind = ?4, check_exit = ?5,
+                ended_at = ?6
+          WHERE run_id = ?1 AND state = 'running' AND check_state = 'running'",
+        params![run_id, state, check_state, kind, exit, now_rfc3339()],
+    )?;
+    tracing::warn!(
+        category = "wake",
+        outcome = "check-settled-state-only",
+        "a check report was written without its delivery, fact or notice"
+    );
+    Ok(Settled::Done)
 }
 
 /// Drive the due checks again after `secs` (a check its Node never
@@ -3020,7 +3263,7 @@ enum Settled {
     RetryAfter(u64),
 }
 
-/// Write what a check did (§11.2), in one writer transaction.
+/// Apply what a check did (§11.2), in the drain's savepoint.
 ///
 /// * Exit 0: the run happens. It is the wake-up's last real run, and its
 ///   bounded stdout rides the run's detail as its summary (quoted as
@@ -3035,12 +3278,11 @@ enum Settled {
 ///   1 s, doubling, at most 60 s.
 /// * The link went away mid-check: `interrupted`, never asked again (the
 ///   rule a Hub restart applies at boot).
-fn settle_check(
-    conn: &mut Connection,
+fn apply_report(
+    tx: &Connection,
     run_id: &str,
     report: &CheckReport,
 ) -> Result<Settled, StoreError> {
-    let tx = immediate_tx(conn)?;
     #[allow(clippy::type_complexity)]
     let run: Option<(
         String,
@@ -3072,6 +3314,12 @@ fn settle_check(
     let Some((wake_id, lineage_id, name, mode, fired_at, detail, host_id)) = run else {
         return Ok(Settled::Done);
     };
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::take_check_settle_failure(run_id)
+        || test_seams::take_check_settle_failure(&wake_id)
+    {
+        return Err(StoreError::FaultInjected("wake check settle".into()));
+    }
     let host_id = host_id.unwrap_or_default();
     let now = now_rfc3339();
     let result = match report {
@@ -3089,7 +3337,6 @@ fn settle_check(
                   WHERE run_id = ?1",
                 params![run_id, attempts, rfc3339(next)],
             )?;
-            tx.commit()?;
             tracing::info!(category = "wake", outcome = "check-not-sent", attempts);
             return Ok(Settled::RetryAfter(u64::try_from(secs).unwrap_or(1)));
         }
@@ -3100,7 +3347,6 @@ fn settle_check(
                   WHERE run_id = ?1",
                 params![run_id, now],
             )?;
-            tx.commit()?;
             tracing::info!(category = "wake", outcome = "check-interrupted");
             return Ok(Settled::Done);
         }
@@ -3171,17 +3417,17 @@ fn settle_check(
                 params![wake_id, fired_at],
             )?;
             let mut outcome = TickOutcome::default();
-            deliver(&tx, run_id, &lineage_id, &mode, detail, &now, &mut outcome)?;
+            deliver(tx, run_id, &lineage_id, &mode, detail, &now, &mut outcome)?;
             fresh_due = outcome.fresh_due;
         }
-        "skipped" => queue_outcome(&tx, run_id, "skipped", None, &now)?,
+        "skipped" => queue_outcome(tx, run_id, "skipped", None, &now)?,
         _ => {
             let kind = failure_kind.unwrap_or(failure::CHECK_UNAVAILABLE);
-            queue_outcome(&tx, run_id, "failed", Some(kind), &now)?;
+            queue_outcome(tx, run_id, "failed", Some(kind), &now)?;
             // The lineage hears that its check failed, at its idle point
             // like any fact; the check's output is not carried.
             crate::inbox::record(
-                &tx,
+                tx,
                 &lineage_id,
                 crate::inbox::Fact {
                     kind: InboxFactKind::WakeFailed,
@@ -3205,7 +3451,6 @@ fn settle_check(
             )?;
         }
     }
-    tx.commit()?;
     tracing::info!(
         category = "wake",
         outcome = match check_state {
@@ -3544,40 +3789,66 @@ pub(crate) mod test_seams {
     }
 
     static CHECK_NODE_BUSY: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+    static CHECK_SETTLE_FAILURES: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+    static CHECK_REPORT_FAILURES: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 
-    /// Make the next `times` Node calls of the check of `id` (a run id, or a
-    /// wake id for every run of it) answer NODE_BUSY (refused before the
-    /// frame was queued); 0 disarms.
-    pub fn arm_check_node_busy(run_id: &str, times: u32) {
-        let mut slot = CHECK_NODE_BUSY
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    fn arm(slot: &Mutex<Option<HashMap<String, u32>>>, id: &str, times: u32) {
+        let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
         let armed = slot.get_or_insert_with(HashMap::new);
         if times == 0 {
-            armed.remove(run_id);
+            armed.remove(id);
         } else {
-            armed.insert(run_id.to_owned(), times);
+            armed.insert(id.to_owned(), times);
         }
     }
 
-    /// Whether this Node call of `run_id`'s check is an armed NODE_BUSY.
-    pub(crate) fn take_check_node_busy(run_id: &str) -> bool {
-        let mut slot = CHECK_NODE_BUSY
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+    fn take(slot: &Mutex<Option<HashMap<String, u32>>>, id: &str) -> bool {
+        let mut slot = slot.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(armed) = slot.as_mut() else {
             return false;
         };
-        match armed.get_mut(run_id) {
+        match armed.get_mut(id) {
             Some(times) => {
                 *times -= 1;
                 if *times == 0 {
-                    armed.remove(run_id);
+                    armed.remove(id);
                 }
                 true
             }
             None => false,
         }
+    }
+
+    /// Make the next `times` applies of the check report of `id` (a run id,
+    /// or a wake id for every run of it) fail; 0 disarms.
+    pub fn arm_check_settle_failure(run_id: &str, times: u32) {
+        arm(&CHECK_SETTLE_FAILURES, run_id, times);
+    }
+
+    pub(crate) fn take_check_settle_failure(run_id: &str) -> bool {
+        take(&CHECK_SETTLE_FAILURES, run_id)
+    }
+
+    /// Make the next `times` writes queueing the check report of `id` (a run
+    /// id, or a wake id) fail; 0 disarms.
+    pub fn arm_check_report_failure(run_id: &str, times: u32) {
+        arm(&CHECK_REPORT_FAILURES, run_id, times);
+    }
+
+    pub(crate) fn take_check_report_failure(run_id: &str) -> bool {
+        take(&CHECK_REPORT_FAILURES, run_id)
+    }
+
+    /// Make the next `times` Node calls of the check of `id` (a run id, or a
+    /// wake id for every run of it) answer NODE_BUSY (refused before the
+    /// frame was queued); 0 disarms.
+    pub fn arm_check_node_busy(id: &str, times: u32) {
+        arm(&CHECK_NODE_BUSY, id, times);
+    }
+
+    /// Whether this Node call of the check of `id` is an armed NODE_BUSY.
+    pub(crate) fn take_check_node_busy(id: &str) -> bool {
+        take(&CHECK_NODE_BUSY, id)
     }
 
     /// Whether this result write for `run_id` is an armed failure (counts it).

@@ -87,6 +87,29 @@ describe("交给 Main settles the command before reporting it", () => {
     await expect(handToMain(fake.store, "ins_main", "quote", 10)).resolves.toMatchObject({ kind: "queued" });
   });
 
+  it("does not accept a reconciling row: the Hub has no verdict yet (r3)", async () => {
+    // store.ts's bubbleFromOutbox projects a reconciling row as
+    // {state:"accepted", outboxState:"reconciling"} — the projection is not a
+    // verdict, so the card must wait and then offer 核对.
+    const fake = fakeStore({
+      push: () => bubble({ state: "accepted", outboxState: "reconciling" }),
+      reconcile: "unknown",
+    });
+    await expect(handToMain(fake.store, "ins_main", "quote", 20)).resolves.toMatchObject({ kind: "unknown" });
+    expect(fake.reconcileSend).toHaveBeenCalled();
+  });
+
+  it("reconciles a reconciling row and accepts only a sent verdict (r3)", async () => {
+    const fake = fakeStore({
+      push: () => bubble({ state: "accepted", outboxState: "reconciling" }),
+      reconcile: "sent",
+    });
+    await expect(handToMain(fake.store, "ins_main", "quote", 1000)).resolves.toMatchObject({
+      kind: "accepted",
+      commandId: "cmd_1",
+    });
+  });
+
   it("follows a later settlement through the store's subscription", async () => {
     const first = bubble({ state: "queued", outboxState: "pending" });
     const fake = fakeStore({ push: () => first });

@@ -184,20 +184,32 @@ function commandIdOf(bubble: LocalBubble | undefined): string | null {
 }
 
 /**
- * A terminal outcome from the bubble, or null while it is still moving. The
- * outbox's `held` row is the send gate withholding input, not delivery, so it
- * is not accepted; `rejected` is the Node/Hub refusal (fencing included).
+ * A terminal outcome from the bubble, or null while it is still moving.
+ *
+ * Acceptance must be the outbox's own verdict: only `sent` or `done` count
+ * (or, on the legacy no-outbox path, a `settled` command). `reconciling` is
+ * projected by the store as `state: "accepted"` (store.ts bubbleFromOutbox)
+ * but is NOT a verdict — the Hub may still settle it rejected — so it stays
+ * null and is reconciled instead (r3 item 1). `held` is the send gate
+ * withholding input, also not delivery.
  */
 function settledOutcome(bubble: LocalBubble | undefined): HandOffOutcome | null {
   if (!bubble) return null;
   const commandId = commandIdOf(bubble);
   const outbox = bubble.outboxState;
   if (outbox === "rejected") return { kind: "rejected", reason: bubble.outboxError ?? null, commandId };
-  if (outbox === "held") return null;
-  if (bubble.state === "settled" || bubble.state === "accepted") {
-    return { kind: "accepted", commandId };
-  }
+  if (outbox === "sent" || outbox === "done") return { kind: "accepted", commandId };
+  if (outbox === undefined && bubble.state === "settled") return { kind: "accepted", commandId };
   return null;
+}
+
+/** A row whose delivery state the Hub has not settled — reconcile it. */
+function wantsReconcile(bubble: LocalBubble | undefined): bubble is LocalBubble & { commandId: string } {
+  return Boolean(
+    bubble
+    && bubble.commandId
+    && (bubble.outboxState === "reconciling" || bubble.state === "unknown"),
+  );
 }
 
 /** The honest verdict when the wait ran out with the row still moving. */
@@ -253,7 +265,7 @@ export async function handToMain(
   }
   const immediate = settledOutcome(bubble);
   if (immediate) return immediate;
-  if (bubble.state === "unknown" && bubble.commandId) {
+  if (wantsReconcile(bubble)) {
     const verdict = await store.reconcileSend(bubble.commandId);
     if (verdict !== "unknown") return verdictOutcome(verdict, bubble.commandId);
   }
@@ -274,11 +286,12 @@ export async function handToMain(
       const row = current();
       const outcome = settledOutcome(row);
       if (outcome) return finish(outcome);
-      if (row?.state === "unknown" && row.commandId && !reconciled) {
+      if (wantsReconcile(row) && !reconciled) {
         reconciled = true;
-        void store.reconcileSend(row.commandId).then(
+        const commandId = row.commandId;
+        void store.reconcileSend(commandId).then(
           (verdict) => {
-            if (verdict !== "unknown") finish(verdictOutcome(verdict, row.commandId));
+            if (verdict !== "unknown") finish(verdictOutcome(verdict, commandId));
           },
           () => undefined,
         );

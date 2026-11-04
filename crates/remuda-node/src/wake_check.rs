@@ -250,8 +250,18 @@ async fn parses(
 /// it. Being the subreaper, it adopts every orphan of the check meanwhile.
 const OUTER: &str =
     "sh -c \"$1\" </dev/null 2>/dev/null; echo \"$?\" >&2; read _ 2>/dev/null; exit 0";
-/// How long the descendant sweep may keep finding processes.
-const SWEEP_LIMIT: Duration = Duration::from_secs(5);
+/// While the sweep still finds processes, it pauses between kill passes until
+/// this long after it started; past it, it keeps killing without pausing.
+const SWEEP_SOFT: Duration = Duration::from_secs(5);
+/// The sweep stops with processes still live only this long after it started:
+/// a process the kernel cannot kill (uninterruptible sleep) must not hold the
+/// report forever. Such a sweep is logged as incomplete.
+const SWEEP_HARD: Duration = Duration::from_secs(15);
+/// The pause between kill passes before [`SWEEP_SOFT`].
+const KILL_GAP: Duration = Duration::from_millis(10);
+/// The delay between the two consecutive empty walks that end a sweep: a
+/// fork in flight shows up in the second.
+const EMPTY_GAP: Duration = Duration::from_millis(25);
 /// How long the outer shell may take to exit once released.
 const OUTER_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// The longest a `wake.check` call can take beyond the check's own timeout:
@@ -259,7 +269,7 @@ const OUTER_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// stdout drain. The Hub waits longer than the timeout plus this.
 pub(crate) const MAX_OVERHEAD: Duration = Duration::from_secs(
     SYNTAX_TIMEOUT.as_secs()
-        + SWEEP_LIMIT.as_secs()
+        + SWEEP_HARD.as_secs()
         + OUTER_EXIT_GRACE.as_secs()
         + STDOUT_GRACE.as_secs()
         + 1,
@@ -333,43 +343,179 @@ fn live_descendants(root: u32) -> Vec<i32> {
     found
 }
 
+/// The live processes of process group `pgid` owned by this user.
+#[cfg(target_os = "linux")]
+fn live_group_members(pgid: i32) -> Vec<i32> {
+    let uid = nix::unistd::getuid().as_raw();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if !owned_by(&entry.path(), uid) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        // state, ppid, pgrp, …
+        let fields: Vec<&str> = rest.split_whitespace().take(3).collect();
+        if fields.len() == 3 && fields[0] != "Z" && fields[2].parse::<i32>().ok() == Some(pgid) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn owned_by(proc_dir: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(proc_dir).is_ok_and(|meta| meta.uid() == uid)
+}
+
+/// The pids in a cgroup leaf.
+fn leaf_members(containment: &Containment) -> Vec<i32> {
+    containment
+        .leaf
+        .as_ref()
+        .and_then(|leaf| std::fs::read_to_string(leaf.dir.join("cgroup.procs")).ok())
+        .map(|procs| {
+            procs
+                .lines()
+                .filter_map(|pid| pid.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Kills what a find returns until the find is stably empty.
+struct Sweep {
+    started: tokio::time::Instant,
+    soft: Duration,
+    hard: Duration,
+    /// A sweep stopped at its hard limit with processes still live.
+    incomplete: bool,
+}
+
+impl Sweep {
+    fn new() -> Self {
+        Self::with_limits(SWEEP_SOFT, SWEEP_HARD)
+    }
+
+    fn with_limits(soft: Duration, hard: Duration) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            soft,
+            hard,
+            incomplete: false,
+        }
+    }
+
+    /// SIGKILL every pid `find` returns, pass after pass, until two
+    /// consecutive walks find nothing, [`EMPTY_GAP`] apart. While it still
+    /// finds processes it never stops at [`SWEEP_SOFT`] (which only ends the
+    /// pauses between kill passes), only at [`SWEEP_HARD`].
+    async fn until_stable(&mut self, find: impl Fn() -> Vec<i32>) {
+        let mut empty = 0;
+        loop {
+            let live = find();
+            if live.is_empty() {
+                empty += 1;
+                if empty >= 2 {
+                    return;
+                }
+                tokio::time::sleep(EMPTY_GAP).await;
+                continue;
+            }
+            empty = 0;
+            for pid in live {
+                #[cfg(unix)]
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                #[cfg(not(unix))]
+                let _ = pid;
+            }
+            let elapsed = self.started.elapsed();
+            if elapsed >= self.hard {
+                self.incomplete = true;
+                tracing::warn!(
+                    category = "wake-check",
+                    "processes of a check survived SIGKILL for the sweep's hard limit"
+                );
+                return;
+            }
+            if elapsed < self.soft {
+                tokio::time::sleep(KILL_GAP).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
 /// Kill everything the check started, whatever `setsid`, a double fork or
-/// `nohup` did: `cgroup.kill` on its leaf, then, until a walk finds nothing
-/// live, SIGKILL every descendant of the outer shell (the subreaper adopts each
-/// orphan, so none is out of reach). The outer shell itself is left alive
+/// `nohup` did, while the outer shell is still alive: `cgroup.kill` on a
+/// verified leaf, then [`Sweep::until_stable`] over the leaf's members and
+/// every live descendant of the outer shell (the subreaper adopts each
+/// orphan, so none is out of its reach). The outer shell itself is left alive
 /// for its release: were it killed first, its orphans would go to init, out
-/// of the walk's reach. (`cgroup.kill` also ends the outer shell, but every
-/// process in the leaf goes with it.) Elsewhere: the process group.
-async fn sweep(containment: &Containment, outer: Option<u32>) {
+/// of the walk's reach. Elsewhere: the process group.
+async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>) {
     if let Some(leaf) = &containment.leaf {
         let _ = std::fs::write(leaf.dir.join("cgroup.kill"), "1");
     }
     #[cfg(not(target_os = "linux"))]
     kill_group(outer);
     #[cfg(target_os = "linux")]
-    if let Some(outer) = outer {
-        let deadline = tokio::time::Instant::now() + SWEEP_LIMIT;
-        loop {
-            let live = live_descendants(outer);
-            if live.is_empty() {
-                break;
-            }
-            for pid in live {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    category = "wake-check",
-                    "the descendant sweep hit its limit"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    {
+        let outer = outer.and_then(|pid| i32::try_from(pid).ok());
+        sweep
+            .until_stable(|| {
+                let mut live = leaf_members(containment);
+                if let Some(outer) = outer {
+                    live.retain(|pid| *pid != outer);
+                    live.extend(live_descendants(outer.unsigned_abs()));
+                }
+                live
+            })
+            .await;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (sweep, containment);
+}
+
+/// After the outer shell is reaped: one more sweep, so anything reparented
+/// in its exit window is killed before the report. The outer shell's process
+/// group (its pid) is walked: a group's id stays reserved while any member
+/// lives, and only this user's processes are taken.
+async fn sweep_after_reap(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>) {
+    #[cfg(target_os = "linux")]
+    {
+        let group = outer.and_then(|pid| i32::try_from(pid).ok());
+        sweep
+            .until_stable(|| {
+                let mut live = leaf_members(containment);
+                if let Some(group) = group {
+                    live.extend(live_group_members(group));
+                }
+                live
+            })
+            .await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (sweep, containment, outer);
 }
 
 /// Remove a cgroup leaf once nothing is left in it.
@@ -454,7 +600,8 @@ pub(crate) async fn run_check(
         line.trim().parse::<i32>().ok()
     };
     let waited = tokio::time::timeout(timeout, reported).await;
-    sweep(&containment, outer).await;
+    let mut swept = Sweep::new();
+    sweep(&mut swept, &containment, outer).await;
     // Released, the outer shell exits; it is killed if it does not.
     drop(release);
     if tokio::time::timeout(OUTER_EXIT_GRACE, child.wait())
@@ -463,6 +610,7 @@ pub(crate) async fn run_check(
     {
         let _ = child.kill().await;
     }
+    sweep_after_reap(&mut swept, &containment, outer).await;
     remove_leaf(&containment);
     let (stdout, cut) = match reader {
         Some(reader) => match tokio::time::timeout(STDOUT_GRACE, reader).await {
@@ -732,6 +880,132 @@ mod tests {
                     "{tail}: the {name} escapee {pid} survived the report"
                 );
             }
+        }
+    }
+
+    /// Live (not zombie) processes whose cwd is `dir`: whatever a check run
+    /// there left behind, however it detached.
+    fn survivors(dir: &Path) -> Vec<String> {
+        let dir = dir.canonicalize().unwrap();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if std::fs::read_link(entry.path().join("cwd")).ok().as_deref() == Some(dir.as_path())
+                && alive(pid)
+            {
+                let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
+                    .unwrap_or_default()
+                    .replace('\0', " ");
+                found.push(format!("{pid} {cmdline}"));
+            }
+        }
+        found
+    }
+
+    /// Kill what a failed assertion would otherwise leave running.
+    fn reap_survivors(dir: &Path) {
+        for line in survivors(dir) {
+            if let Some(pid) = line.split(' ').next().and_then(|pid| pid.parse().ok()) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    /// r3: the sweep's own rules, with a scripted find: an empty walk does
+    /// not end it (a second one must follow), and past the soft limit it
+    /// keeps killing what it still finds.
+    #[tokio::test]
+    async fn the_sweep_needs_two_empty_walks_and_never_stops_on_a_live_set() {
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let mut second = spawn();
+        let mut third = spawn();
+        let pids: Vec<i32> = [&first, &second, &third]
+            .iter()
+            .map(|child| i32::try_from(child.id()).unwrap())
+            .collect();
+        // Walks: nothing; the first process; nothing; the second (after the
+        // soft limit of 0); the third; then nothing, twice.
+        let script = std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            vec![],
+            vec![pids[0]],
+            vec![],
+            vec![pids[1]],
+            vec![pids[2]],
+        ]));
+        let mut sweep = Sweep::with_limits(Duration::ZERO, Duration::from_secs(30));
+        sweep
+            .until_stable(|| script.lock().unwrap().pop_front().unwrap_or_default())
+            .await;
+        let killed: Vec<bool> = [&mut first, &mut second, &mut third]
+            .into_iter()
+            .map(|child| {
+                child.try_wait().unwrap().is_some() || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    child.try_wait().unwrap().is_some()
+                }
+            })
+            .collect();
+        for child in [&mut first, &mut second, &mut third] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(killed, [true, true, true]);
+        assert!(!sweep.incomplete);
+        assert!(script.lock().unwrap().is_empty(), "every walk was made");
+    }
+
+    /// r3: a check that kills its supervisor leaves its plain children to
+    /// init; they are still in the outer shell's process group, which the
+    /// sweep walks once more after the outer shell is reaped.
+    #[tokio::test]
+    async fn children_orphaned_by_a_killed_supervisor_are_swept_by_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = run(dir.path(), "sleep 600 & kill -9 $PPID; sleep 600", 30).await;
+        let left = survivors(dir.path());
+        reap_survivors(dir.path());
+        assert!(left.is_empty(), "{checked:?} left {left:?}");
+    }
+
+    /// r3: a fork in flight when the check exits (the setsid child has not
+    /// forked its own child yet), and a short fork storm, leave nothing
+    /// behind: the sweep ends only after two consecutive empty walks.
+    #[tokio::test]
+    async fn a_fork_in_flight_or_a_fork_storm_leaves_nothing_behind() {
+        for (name, command) in [
+            (
+                "in-flight",
+                "setsid sh -c 'sleep 600 & echo $! > f'; exit 0",
+            ),
+            (
+                "in-flight-timeout",
+                "setsid sh -c 'sleep 0.3; sleep 600 & echo $! > f' & sleep 600",
+            ),
+            (
+                "storm",
+                "(while :; do setsid sleep 600 & done) & sleep 0.3; exit 0",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secs = if name.ends_with("timeout") { 1 } else { 30 };
+            let checked = run(dir.path(), command, secs).await;
+            let left = survivors(dir.path());
+            reap_survivors(dir.path());
+            assert!(left.is_empty(), "{name}: {checked:?} left {left:?}");
         }
     }
 

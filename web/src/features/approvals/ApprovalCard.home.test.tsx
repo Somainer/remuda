@@ -245,6 +245,54 @@ describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
     expect(screen.queryByText("已交给 Main")).toBeNull();
   });
 
+  it("disables 发送给当前 Main when no live Main remains (r3)", async () => {
+    let release: (outcome: HandOffOutcome) => void = () => undefined;
+    const run = vi.fn(() => new Promise<HandOffOutcome>((resolve) => { release = resolve; }));
+    const item = interaction({ id: "int_q", instanceId: "ins_a", request: question() });
+    const tree = (home: Partial<HomeCardState>) => (
+      <MemoryRouter>
+        <DecisionCard
+          view={view(item)}
+          mode="home"
+          onRespond={vi.fn()}
+          home={{ placement: "phone", receipt: null, stale: false, ...home }}
+        />
+      </MemoryRouter>
+    );
+    const rendered = render(tree({ handToMain: run, reconcileHandOff: vi.fn() }));
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    release({ kind: "rejected", reason: "fenced", commandId: "cmd_1" });
+    expect(await screen.findByTestId("home-card-hand-retry")).toBeEnabled();
+    // Main goes away while the outcome is on screen: the action would be dead.
+    rendered.rerender(tree({ handToMain: null, reconcileHandOff: null }));
+    expect(screen.getByTestId("home-card-hand-retry")).toBeDisabled();
+    expect(screen.getByTestId("home-card-hand-retry").getAttribute("title")).toContain("已暂停或已结束");
+    expect(screen.getByTestId("home-card-hand-unavailable")).toHaveTextContent("Main 已暂停或已结束");
+  });
+
+  it("disables 核对 when no reconcile handler is mounted (r3)", async () => {
+    const run = vi.fn().mockResolvedValue({ kind: "unknown", commandId: "cmd_1" });
+    const item = interaction({ id: "int_q", instanceId: "ins_a", request: question() });
+    const tree = (home: Partial<HomeCardState>) => (
+      <MemoryRouter>
+        <DecisionCard
+          view={view(item)}
+          mode="home"
+          onRespond={vi.fn()}
+          home={{ placement: "phone", receipt: null, stale: false, ...home }}
+        />
+      </MemoryRouter>
+    );
+    const rendered = render(tree({ handToMain: run, reconcileHandOff: vi.fn() }));
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    expect(await screen.findByTestId("home-card-hand-reconcile")).toBeEnabled();
+    rendered.rerender(tree({ handToMain: run, reconcileHandOff: null }));
+    expect(screen.getByTestId("home-card-hand-reconcile")).toBeDisabled();
+    expect(screen.getByTestId("home-card-hand-unavailable")).toHaveTextContent("Main 已暂停或已结束");
+  });
+
   it("reconciles an unknown outcome through 核对 (a read, never a re-send) (r2)", async () => {
     const run = vi.fn().mockResolvedValue({ kind: "unknown", commandId: "cmd_1" });
     const reconcile = vi.fn().mockResolvedValue({ kind: "accepted", commandId: "cmd_1" });

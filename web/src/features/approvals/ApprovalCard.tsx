@@ -514,12 +514,20 @@ type HandState = { kind: "idle" } | { kind: "sending" } | HandOffOutcome;
  * others name what actually happened (r2), and rejection/unknown offer the
  * ⑨-style next step instead of a false success.
  */
+const HAND_UNAVAILABLE_TEXT = "Main 已暂停或已结束，恢复后再交";
+
 function HandReceipt({
   hand,
+  canRetry,
+  canReconcile,
   onRetry,
   onReconcile,
 }: {
   hand: HandState;
+  /** A live Main still resolves, so the retry would target a real chapter. */
+  canRetry: boolean;
+  /** A reconcile handler is mounted. */
+  canReconcile: boolean;
   onRetry: () => void;
   onReconcile: (commandId: string) => void;
 }) {
@@ -549,9 +557,21 @@ function HandReceipt({
     return (
       <p className={homeCss.hint} role="alert" data-testid="home-card-hand-receipt" data-state="rejected">
         未送达{hand.reason ? ` · ${hand.reason}` : ""}{" "}
-        <button type="button" className={homeCss.chip} data-testid="home-card-hand-retry" onClick={onRetry}>
+        <button
+          type="button"
+          className={homeCss.chip}
+          data-testid="home-card-hand-retry"
+          disabled={!canRetry}
+          title={canRetry ? undefined : HAND_UNAVAILABLE_TEXT}
+          onClick={onRetry}
+        >
           发送给当前 Main
         </button>
+        {canRetry ? null : (
+          <span className={homeCss.hint} data-testid="home-card-hand-unavailable">
+            {HAND_UNAVAILABLE_TEXT}
+          </span>
+        )}
       </p>
     );
   }
@@ -562,11 +582,17 @@ function HandReceipt({
         type="button"
         className={homeCss.chip}
         data-testid="home-card-hand-reconcile"
-        disabled={!hand.commandId}
+        disabled={!canReconcile || !hand.commandId}
+        title={canReconcile ? undefined : HAND_UNAVAILABLE_TEXT}
         onClick={() => hand.commandId && onReconcile(hand.commandId)}
       >
         核对
       </button>
+      {canReconcile ? null : (
+        <span className={homeCss.hint} data-testid="home-card-hand-unavailable">
+          {HAND_UNAVAILABLE_TEXT}
+        </span>
+      )}
     </p>
   );
 }
@@ -784,7 +810,13 @@ function HomeDecision({
           {submitError}
         </p>
       ) : null}
-      <HandReceipt hand={hand} onRetry={() => runHand()} onReconcile={reconcileHand} />
+      <HandReceipt
+        hand={hand}
+        canRetry={home.handToMain != null}
+        canReconcile={home.reconcileHandOff != null}
+        onRetry={() => runHand()}
+        onReconcile={reconcileHand}
+      />
       {handTriggers ? (
         <Sheet
           open={menuOpen}

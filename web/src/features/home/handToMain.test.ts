@@ -119,20 +119,32 @@ describe("the quote's content budget is UTF-8 bytes", () => {
 
   const encoder = new TextEncoder();
 
+  /** A lone surrogate on either side of a pair, or a replacement character. */
+  const SPLIT = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|\uFFFD/;
+
   it("cuts CJK to at most 2000 bytes, on a character boundary", () => {
     const content = contentOf("\u6c49".repeat(2000));
     expect(encoder.encode(content).length).toBeLessThanOrEqual(HAND_TO_MAIN_MAX_CONTENT);
     expect(content.endsWith("…")).toBe(true);
-    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(content)).toBe(false);
+    // A byte slice decoded with replacement characters would show these.
+    expect(SPLIT.test(content)).toBe(false);
   });
 
-  it("never splits an emoji at the boundary", () => {
-    // 1999 ASCII + an emoji: its 4 bytes do not fit, so it is dropped whole.
-    const content = contentOf(`${"a".repeat(1990)}😀${"b".repeat(50)}`);
+  it("never splits an emoji that straddles the byte budget", () => {
+    // The plan prefix is fixed; size the a-run so the emoji STARTS one byte
+    // before the 1997-byte content budget: its 4 UTF-8 bytes cross the
+    // boundary (a byte slicer would leave a lone surrogate or U+FFFD).
+    const prefixBytes = encoder.encode("\u8ba1\u5212\uff1aPlan: split the gate\n").length;
+    const budget = HAND_TO_MAIN_MAX_CONTENT - encoder.encode("…").length;
+    const run = budget - prefixBytes - 1;
+    const content = contentOf(`${"a".repeat(run)}😀${"b".repeat(50)}`);
     expect(encoder.encode(content).length).toBeLessThanOrEqual(HAND_TO_MAIN_MAX_CONTENT);
     expect(content.endsWith("…")).toBe(true);
     const cut = content.slice(0, -1);
-    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cut)).toBe(false);
-    expect(cut.endsWith("😀")).toBe(false);
+    // The emoji is dropped whole; nothing of it (and no replacement) remains.
+    expect(cut.endsWith("\u{1F600}")).toBe(false);
+    expect(cut.includes("\u{1F600}")).toBe(false);
+    expect(SPLIT.test(cut)).toBe(false);
+    expect(cut.endsWith("a")).toBe(true);
   });
 });

@@ -382,7 +382,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - `working`（§5.2 ●）= 范围内按 §3.1 排在第 3 档（live 且 activity 为 working/draining，或 activity 未分类）的会话数，子会话也计；
 - `doneToday`（§5.2 今日完成）= 范围内「最近一次结算的根回合结束时间」（`instances.turn_end_at`，与 ◉ 的 `turn_end_seq` 同一事务写入）落在 owner 本地日内的会话数。选根回合而不选任务，因为任务行没有完成时间戳。客户端用 `tzOffsetMinutes`（`-Date().getTimezoneOffset()`，UTC 以东分钟数，服务端夹到 ±14 h）告诉 Hub 本地日从哪开始。
 
-**行。** `waiting` 与 `working` 各按会话一行，各至多 50 行，溢出的数量在 `more.waiting` / `more.working`。每行一句 headline：等待行取待处理交互的 kind 加它的提问摘录，工作中行取最近一条助手文本的首行，没有文本时退回最近一次回合结果，再没有就是会话标题。headline 复用 digest 的脱敏与截断，Hub 不调模型。等待行按最近的交互从新到旧，工作中行按 `updatedAt` 从新到旧，id 作并列时的次序。客户端把 headline 用作台账行的正文；glance 里没有行的会话（idle/exited）不再逐行读 journal。
+**行。** `waiting` 与 `working` 各按会话一行，各至多 50 行，溢出的数量在 `more.waiting` / `more.working`。每行一句 headline：等待行取待处理交互的 kind 加它的提问摘录；工作中行取**结构化短语** `phrase`，没有短语时退回最近一次回合结果，再没有就是会话标题。`phrase` 用的是原先客户端逐行读 journal 时的同一套规则（`liveSummary`）：正在运行的 workflow 加它当前 running 的 phase，写成 `Workflow <native run id> · phase <label>`（排队中的下一个 phase 不算），否则是最近一条助手文本的首行；两者都没有时 `phrase` 缺省，不会退回标题。headline 与 phrase 都复用 digest 的脱敏与截断，Hub 不调模型。等待行按最近的交互从新到旧，工作中行按 `updatedAt` 从新到旧，id 作并列时的次序。台账行（`/sessions` 与 `/m`）的「下一步」仍走 `nextStep` 的优先级：状态待确认、待处理交互自己的摘要、等待处理、正在拉起，然后才是工作中行的短语（先取 glance 的 `phrase`，再取正在跟随的会话自己的短语），都没有时是「运行中…」；idle 与已结束的行不读短语。headline 只给 ⑥ 与 `remuda glance` 用，从不当作行的「下一步」。glance 里没有行的会话（idle/exited）不再逐行读 journal。
 
 **授权。** 只有 owner 自己的 Human 设备能读：Agent、Bot、以及带 `x-remuda-instance-id` 被降级成 Agent 的 Human 凭据都得到 403。
 

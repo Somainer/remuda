@@ -682,6 +682,80 @@ pub(crate) fn last_turn_result(events: &[Value]) -> Option<String> {
     scan_tail(events).turn.map(|(status, _)| status)
 }
 
+/// A `{state, value}` knowledge field's value, when known.
+fn known_str(field: Option<&Value>) -> Option<String> {
+    let field = field?;
+    (field.get("state").and_then(Value::as_str) == Some("known"))
+        .then(|| {
+            field
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
+/// A working row's structured live phrase (ui-spec D-038 §2.1, home.md
+/// §5.3), by the SAME rules as the client's `liveSummary`
+/// (`web/src/features/session/liveSummary.ts`), so moving the journal read to
+/// the Hub keeps the row's sentence:
+///
+/// - the newest `workflow.run` that is not completed/failed/cancelled, plus
+///   the label of that workflow's newest RUNNING phase, reads
+///   `Workflow <native run id> · phase <label>` (the run id falls back to the
+///   workflow id's first 8 characters; without a phase, `Workflow <id>`);
+/// - otherwise the last root assistant line;
+/// - otherwise `None` — never a title or a turn status, so the row keeps its
+///   own constant.
+pub(crate) fn live_phrase(events: &[Value]) -> Option<String> {
+    let mut run: Option<(String, Option<String>)> = None;
+    let mut phase: Option<String> = None;
+    for event in events {
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("workflow.run") => {
+                // A finished workflow no longer says what the row is doing.
+                if matches!(
+                    payload.get("state").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled")
+                ) {
+                    run = None;
+                    phase = None;
+                    continue;
+                }
+                let id = payload
+                    .get("workflowId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                run = Some((id, known_str(payload.get("nativeRunId"))));
+            }
+            Some("workflow.phase") => {
+                // The phase the run is IN: a queued next phase never replaces it.
+                if let Some((id, _)) = &run
+                    && payload.get("workflowId").and_then(Value::as_str) == Some(id.as_str())
+                    && payload.get("state").and_then(Value::as_str) == Some("running")
+                {
+                    phase = known_str(payload.get("label"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((workflow_id, native)) = run {
+        let id = native
+            .filter(|native| !native.is_empty())
+            .unwrap_or_else(|| workflow_id.chars().take(8).collect());
+        return Some(match phase {
+            Some(label) if !label.is_empty() => format!("Workflow {id} · phase {label}"),
+            _ => format!("Workflow {id}"),
+        });
+    }
+    last_assistant_text(events).filter(|text| !text.trim().is_empty())
+}
+
 // ── pending interaction ────────────────────────────────────────────────────
 
 /// The kind and the question of one interaction row, as the digest shows

@@ -9086,6 +9086,16 @@ class HubStore {
     return this.glanceRowOf(instanceId)?.headline;
   }
 
+  /**
+   * r6 item 2: a working session's structured live phrase from the glance
+   * (`Workflow <run> · phase <label>`, else the last assistant line), or
+   * undefined. The list-row sentence reads THIS, not the headline: the
+   * headline falls back to the title, which a row already shows.
+   */
+  glancePhraseOf(instanceId: Id): string | undefined {
+    return this.glanceRowOf(instanceId)?.phrase ?? undefined;
+  }
+
   private glanceIndex: {
     glance: NonNullable<HubState["glance"]>;
     index: Map<string, import("../types/generated").OwnerGlanceRow>;

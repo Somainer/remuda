@@ -15765,7 +15765,7 @@
       "description": "One session row of an [`OwnerGlance`].\n\nEvery string that came from a worker, a tool or a session is untrusted\ndata; `headline` is already redacted the way the worker digest redacts.",
       "properties": {
         "headline": {
-          "description": "ONE deterministic sentence for the row, built from the worker digest's\nfields (pending kind and its question, the last turn result, the head\nof the last assistant text) — never a model call, never a secret.",
+          "description": "ONE deterministic sentence for the row, built from the worker digest's\nfields (pending kind and its question, the live phrase, the last turn\nresult) — never a model call, never a secret. It always has text: a\nworking row with nothing in its tail falls back to the title.",
           "type": "string"
         },
         "instanceId": {
@@ -15775,6 +15775,13 @@
         "kind": {
           "description": "What the session is doing: a pending interaction kind\n(`approval`/`question`/`plan-review`/`elicitation`) or `working`.",
           "type": "string"
+        },
+        "phrase": {
+          "description": "A working row's structured live phrase, by the client's list-row\nrules: `Workflow <run> · phase <label>` for a running workflow, else\nthe last assistant line, redacted and clipped like `headline`. Absent\nwhen the tail has neither, so a list row keeps its own constant rather\nthan repeating the title.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "since": {
           "description": "Seconds since the row's evidence last moved (the pending interaction's\ncreation for a waiting row, the session's update for a working row).",

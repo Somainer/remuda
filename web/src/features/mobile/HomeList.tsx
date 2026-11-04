@@ -105,7 +105,11 @@ function selectHome(snapshot: HubState, prefs: SpacePrefs, nowMs: number): HomeS
     // home-glance-d060 §5.3: the row body's phrase is the owner glance's one
     // deterministic headline. The per-row journal read that used to project it
     // is gone; the poll reads one glance instead.
-    summaryOf: (instanceId) => hubStore.glanceHeadlineOf(instanceId as Id),
+    // The working row's phrase: the glance's structured one (a running
+    // workflow and its phase, else the last assistant line), then a followed
+    // session's own summary — the same precedence as SessionList.
+    summaryOf: (instanceId) =>
+      hubStore.glancePhraseOf(instanceId as Id) ?? hubStore.summaryOf(instanceId as Id),
     eventsOf: (instanceId) => snapshot.events[instanceId],
     childLiveOf: (instanceId) => childLiveIds.has(instanceId),
     nowMs,

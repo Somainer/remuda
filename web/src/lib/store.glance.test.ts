@@ -13,7 +13,8 @@ const GLANCE: OwnerGlance = {
     { instanceId: "ins_wait", kind: "approval", headline: "approval: run it?", title: "waiting" },
   ],
   working: [
-    { instanceId: "ins_work", kind: "working", headline: "pushing the fix", title: "working" },
+    { instanceId: "ins_work", kind: "working", headline: "pushing the fix", phrase: "pushing the fix", title: "working" },
+    { instanceId: "ins_bare", kind: "working", headline: "bare title", title: "bare title" },
   ],
   more: { waiting: 0, working: 0 },
 };
@@ -47,6 +48,11 @@ it("sends the local-day offset and stores the projection", async () => {
   expect(ownerGlance).toHaveBeenCalledWith(-new Date().getTimezoneOffset());
   expect(hubStore.getSnapshot().glance).toEqual(GLANCE);
   expect(hubStore.glanceHeadlineOf(id("ins_work"))).toBe("pushing the fix");
+  // r6 item 2: the row sentence's phrase — absent when the Hub had none, even
+  // though the headline then falls back to the title.
+  expect(hubStore.glancePhraseOf(id("ins_work"))).toBe("pushing the fix");
+  expect(hubStore.glanceHeadlineOf(id("ins_bare"))).toBe("bare title");
+  expect(hubStore.glancePhraseOf(id("ins_bare"))).toBeUndefined();
   expect(hubStore.glanceRowOf(id("ins_wait"))?.kind).toBe("approval");
   // The glance read is the only request this path makes: no per-row journal.
   expect(api.eventsRead).not.toHaveBeenCalled();

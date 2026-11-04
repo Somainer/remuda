@@ -774,6 +774,7 @@ fn render_owner_glance(
                 since: since_secs(&pending.record.created_at, now),
                 kind,
                 headline,
+                phrase: None,
                 task_id: snapshot
                     .instances
                     .iter()
@@ -794,8 +795,12 @@ fn render_owner_glance(
         .take(OWNER_GLANCE_ROW_CAP)
         .map(|row| {
             let tail = snapshot.journals.get(&row.instance_id);
-            let last_text = tail
-                .and_then(|events| crate::digest::last_assistant_text(events))
+            // r6 item 2: the list row's structured phrase (a running workflow
+            // and its phase, else the last assistant line) — the same rules
+            // the client's per-row journal read used, now read here once.
+            let phrase = tail
+                .and_then(|events| crate::digest::live_phrase(events))
+                .map(|text| headline_text(&text))
                 .filter(|text| !text.trim().is_empty());
             let turn = tail.and_then(|events| crate::digest::last_turn_result(events));
             let title = row.title.as_deref().map(|title| {
@@ -804,8 +809,8 @@ fn render_owner_glance(
                     TITLE_CHARS,
                 )
             });
-            let headline = match (last_text, turn) {
-                (Some(text), _) => headline_text(&text),
+            let headline = match (&phrase, turn) {
+                (Some(text), _) => text.clone(),
                 (None, Some(result)) => headline_text(&format!("turn: {result}")),
                 (None, None) => title.clone().unwrap_or_else(|| "运行中".to_string()),
             };
@@ -815,6 +820,7 @@ fn render_owner_glance(
                 since: since_secs(&row.updated_at, now),
                 kind: "working".to_string(),
                 headline,
+                phrase,
                 task_id: row.task_id.clone(),
             }
         })
@@ -1182,6 +1188,82 @@ mod tests {
         );
         let glance = render(snap);
         assert_eq!(glance.working[0].headline, "turn: turn_done");
+    }
+
+    /// [r6 item 2] The list row's structured phrase, by the client's
+    /// `liveSummary` rules: a running workflow and its RUNNING phase win over
+    /// an assistant line (a queued next phase never replaces it); a finished
+    /// workflow hands back to the assistant line; with neither, no phrase —
+    /// the headline falls back to the title, the phrase never does.
+    #[test]
+    fn a_working_row_carries_the_structured_live_phrase() {
+        let assistant = |text: &str| {
+            json!({ "kind": "message", "payload": { "operation": "open", "messageId": "m1",
+                "role": "assistant", "parentToolCallId": null,
+                "blocks": [{ "type": "text", "text": text }] } })
+        };
+        let run = |state: &str| {
+            json!({ "kind": "workflow.run", "payload": { "workflowId": "wfl_0123456789",
+                "state": state, "nativeRunId": { "state": "known", "value": "wf-native-demo" } } })
+        };
+        let phase = |label: &str, state: &str| {
+            json!({ "kind": "workflow.phase", "payload": { "workflowId": "wfl_0123456789",
+                "state": state, "label": { "state": "known", "value": label } } })
+        };
+        let mut snap = snapshot(vec![
+            instance("ins_wf", "running", "working"),
+            instance("ins_done", "running", "working"),
+            instance("ins_text", "running", "working"),
+            instance("ins_bare", "running", "working"),
+        ]);
+        snap.journals.insert(
+            "ins_wf".into(),
+            vec![
+                assistant("reading the diff"),
+                run("running"),
+                phase("Review", "running"),
+                phase("Verify", "queued"),
+            ],
+        );
+        snap.journals.insert(
+            "ins_done".into(),
+            vec![
+                run("running"),
+                phase("Review", "running"),
+                assistant("all green"),
+                run("completed"),
+            ],
+        );
+        snap.journals
+            .insert("ins_text".into(), vec![assistant("pushing\n the fix")]);
+        let glance = render(snap);
+        let row = |id: &str| {
+            glance
+                .working
+                .iter()
+                .find(|row| row.instance_id == id)
+                .unwrap_or_else(|| panic!("{id} listed"))
+        };
+        assert_eq!(
+            row("ins_wf").phrase.as_deref(),
+            Some("Workflow wf-native-demo · phase Review")
+        );
+        assert_eq!(
+            row("ins_wf").headline,
+            "Workflow wf-native-demo · phase Review"
+        );
+        assert_eq!(row("ins_done").phrase.as_deref(), Some("all green"));
+        assert_eq!(row("ins_text").phrase.as_deref(), Some("pushing the fix"));
+        assert_eq!(row("ins_bare").phrase, None, "no phrase, never the title");
+        assert_eq!(row("ins_bare").headline, "session ins_bare");
+        // Without a native run id: the workflow id's first 8 characters.
+        let events = vec![json!({ "kind": "workflow.run", "payload": {
+            "workflowId": "wfl_0123456789", "state": "running",
+            "nativeRunId": { "state": "unknown" } } })];
+        assert_eq!(
+            crate::digest::live_phrase(&events).as_deref(),
+            Some("Workflow wfl_0123")
+        );
     }
 
     /// §5.1: ① needYou is the ④ header's / OS badge's count — derived over

@@ -795,13 +795,18 @@ export function SessionList({
               const worktree = workspace?.worktreeLabel ?? workspace?.label;
               const branch = workspace?.branch;
               const slot = slotById.get(instance.id) ?? 0;
-              // home-glance-d060: the body's phrase is the owner glance's one
-              // headline; a followed session's own summary is the fallback.
+              // nextStep keeps its own precedence (unknown, the pending
+              // interaction's summary, blocked, starting, then a working row's
+              // phrase, else 运行中…). The phrase is the glance's structured
+              // one — a running workflow and its phase, else the last
+              // assistant line, by the rules the per-row journal read used —
+              // with a followed session's own summary below it. Never the
+              // headline: that falls back to the title.
               const step = nextStep(
                 instance,
                 pending ?? null,
                 screen,
-                hubStore.glanceHeadlineOf(instance.id) ?? hubStore.summaryOf(instance.id),
+                hubStore.glancePhraseOf(instance.id) ?? hubStore.summaryOf(instance.id),
               );
               const exit = exitLabel(instance);
               const sheetOpen = actionFor === instance.id;

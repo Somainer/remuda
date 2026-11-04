@@ -267,9 +267,17 @@ pub struct OwnerGlanceRow {
     /// (`approval`/`question`/`plan-review`/`elicitation`) or `working`.
     pub kind: String,
     /// ONE deterministic sentence for the row, built from the worker digest's
-    /// fields (pending kind and its question, the last turn result, the head
-    /// of the last assistant text) — never a model call, never a secret.
+    /// fields (pending kind and its question, the live phrase, the last turn
+    /// result) — never a model call, never a secret. It always has text: a
+    /// working row with nothing in its tail falls back to the title.
     pub headline: String,
+    /// A working row's structured live phrase, by the client's list-row
+    /// rules: `Workflow <run> · phase <label>` for a running workflow, else
+    /// the last assistant line, redacted and clipped like `headline`. Absent
+    /// when the tail has neither, so a list row keeps its own constant rather
+    /// than repeating the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<String>,
     /// Bound task (`tsk_…`), when the session carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,

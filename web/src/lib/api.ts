@@ -1307,6 +1307,7 @@ function createMockApi(): HubApi {
           title: mockDb.titles.get(row.id) ?? null,
           kind: "working",
           headline: mockDb.summaries.get(row.id) ?? mockDb.titles.get(row.id) ?? "运行中",
+          phrase: mockDb.summaries.get(row.id) ?? null,
           taskId: row.taskId ?? null,
         }));
       // ◉ and ⑤ are one set: the count is this list's length (newest first).

@@ -3535,6 +3535,7 @@ export type OwnerGlanceRow = ({
   "headline": (string);
   "instanceId": (string);
   "kind": (string);
+  "phrase"?: (string | null);
   "since"?: (number | null);
   "taskId"?: (string | null);
   "title"?: (string | null);

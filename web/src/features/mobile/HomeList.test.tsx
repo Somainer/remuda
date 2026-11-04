@@ -65,6 +65,11 @@ function setGlance(
 const resumeMock = vi.fn();
 const listeners = new Set<() => void>();
 /** The per-row reads the home used to issue; home-glance-d060 retires the journal one. */
+/** The glance's per-row phrase and headline (r6 item 2). */
+const glanceRows = vi.hoisted(() => ({
+  phrases: {} as Record<string, string>,
+  headlines: {} as Record<string, string>,
+}));
 const rowReads = vi.hoisted(() => ({
   refreshScreens: vi.fn(() => Promise.resolve(undefined)),
   hydrateRowSummaries: vi.fn(() => Promise.resolve(undefined)),
@@ -105,9 +110,11 @@ vi.mock("../../lib/store", async (importOriginal) => {
       hostName: () => "alpha",
       usageRollupOf: () => null,
       summaryOf: () => undefined,
-      // home-glance-d060: the row body's phrase is the glance's headline, and
-      // the ① row owns the shared glance poll (§5.3).
-      glanceHeadlineOf: () => undefined,
+      // home-glance-d060: the row body's phrase is the glance's structured
+      // phrase (r6: never its title-falling headline), and the ① row owns the
+      // shared glance poll (§5.3).
+      glanceHeadlineOf: (id: string) => glanceRows.headlines[id],
+      glancePhraseOf: (id: string) => glanceRows.phrases[id],
       refreshGlance: () => Promise.resolve(undefined),
       resume: (...args: unknown[]) => resumeMock(...args),
       refreshScreens: rowReads.refreshScreens,
@@ -172,6 +179,8 @@ beforeEach(() => {
   refreshMock.mockClear();
   rowReads.refreshScreens.mockClear();
   rowReads.hydrateRowSummaries.mockClear();
+  glanceRows.phrases = {};
+  glanceRows.headlines = {};
   hub.glance = null;
   health.lastOkAt = Date.now();
   health.failingSince = null;
@@ -853,6 +862,47 @@ describe("the home poll", () => {
     // that used to feed each body is gone — one glance carries every headline
     // (home.md §5.3); the tty screen read is a different source and stays.
     expect(rowReads.hydrateRowSummaries).not.toHaveBeenCalled();
+  });
+});
+
+describe("the phone row's next step", () => {
+  /**
+   * [r6 item 2] The same precedence as /sessions: a pending interaction's own
+   * summary, a turn error verbatim, then a working row's glance phrase (the
+   * workflow phase), else the constant. The title-falling headline never
+   * becomes the body.
+   */
+  it("keeps the structured sources ahead of the glance phrase, and never paints the headline", async () => {
+    hub.instances = [
+      row("ins-wf", { activity: known("working") }),
+      row("ins-appr", { activity: known("waiting-interaction") }),
+      row("ins-fail", { lastTurnError: { at: "2026-09-19T10:00:00.000Z", text: "overloaded" } }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    hub.interactions = [
+      queueInteraction({ id: "int_appr" as Id, instanceId: "ins-appr" as Id, hostId: "host-a" }),
+    ];
+    for (const instance of hub.instances) {
+      glanceRows.headlines[instance.id] = `title ${instance.id}`;
+      glanceRows.phrases[instance.id] = `assistant line ${instance.id}`;
+    }
+    glanceRows.phrases["ins-wf"] = "Workflow wf-native-demo · phase Review";
+    delete glanceRows.phrases["ins-work"];
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    // The turn-failed row is idle: open the idle fold it sits behind.
+    const idleFold = screen.queryByTestId("home-idle-fold");
+    if (idleFold) await userEvent.click(idleFold);
+    const bodyOf = (id: string) =>
+      screen
+        .getAllByTestId("home-row")
+        .find((el) => el.querySelector(`a[href="/s/${id}"]`))
+        ?.querySelector("[data-testid='home-row-body']")?.textContent;
+    expect(bodyOf("ins-wf")).toBe("Workflow wf-native-demo · phase Review");
+    expect(bodyOf("ins-appr")).not.toContain("assistant line");
+    expect(bodyOf("ins-appr")).not.toContain("title ins-appr");
+    expect(bodyOf("ins-fail")).toBe("overloaded");
+    expect(bodyOf("ins-work")).toBe("运行中…");
   });
 });
 

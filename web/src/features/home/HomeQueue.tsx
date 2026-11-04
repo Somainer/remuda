@@ -24,7 +24,7 @@ import {
   type Receipt,
 } from "./homeQueue";
 import { noticeStore, noticeVoice, useOwnerNotices } from "./notices";
-import { handToMain, handToMainText } from "./handToMain";
+import { HUB_HAND_OFF_STORE, handToMain, handToMainText, reconcileHandOff, type HandOffOutcome } from "./handToMain";
 import css from "./homeQueue.module.css";
 
 /**
@@ -86,18 +86,23 @@ export function HomeQueue({
   const queue = useMemo(() => deriveHomeQueue(source, notices, main), [source, notices, main]);
   // §6.4: a QUESTION or PLAN card may quote itself to Main. The quote never
   // answers the interaction, so the card stays pending until a real answer.
+  // The outcome is the command's SETTLED state, not the outbox enqueue: a
+  // paused/fenced Main must never read as 「已交给 Main」 (§6.4 r2).
   const handMain = useCallback(
-    async (item: Interaction) => {
-      if (!main) return;
+    async (item: Interaction): Promise<HandOffOutcome> => {
+      if (!main) return { kind: "rejected", reason: null, commandId: null };
       const text = handToMainText({
         item,
         sessionTitle: hubStore.titleOf(item.instanceId),
         hostLabel: hubStore.hostName(item.hostId),
       });
-      const ok = await handToMain(main.instance.id, text);
-      if (!ok) throw new Error("发送失败");
+      return handToMain(HUB_HAND_OFF_STORE, main.instance.id, text);
     },
     [main],
+  );
+  const reconcileHand = useCallback(
+    (commandId: string) => reconcileHandOff(HUB_HAND_OFF_STORE, commandId),
+    [],
   );
   // §5.1: the header N is the count row's N, read from the one derivation.
   const needYou = useMemo(() => glanceCounts(source).needYou, [source]);
@@ -330,7 +335,14 @@ export function HomeQueue({
               displayKey={card.type === "task" ? displayKeyOf(tasks, card.task.id) : null}
               projectLabel={card.type === "task" ? projectName(card.task.projectId) ?? null : null}
               mainAsking={card.type === "interaction" ? card.mainAsking === true : false}
-              handToMain={main ? handMain : null}
+              // §6.4: never Main's own question back to Main, and only while
+              // Main is live (a paused/ended chapter would never receive it).
+              handToMain={
+                main && main.live && !(card.type === "interaction" && card.mainAsking)
+                  ? handMain
+                  : null
+              }
+              reconcileHandOff={main ? reconcileHand : null}
               nowMs={nowMs}
               onRespond={respond}
             />
@@ -411,6 +423,7 @@ function QueueCard({
   projectLabel,
   mainAsking,
   handToMain,
+  reconcileHandOff,
   nowMs,
   onRespond,
 }: {
@@ -426,8 +439,10 @@ function QueueCard({
   projectLabel: string | null;
   /** This interaction is Main's own pending question on its live chapter. */
   mainAsking: boolean;
-  /** §6.4 交给 Main; null when no Main resolves. */
-  handToMain: ((item: Interaction) => Promise<void>) | null;
+  /** §6.4 交给 Main; null when no live Main resolves or this is its own card. */
+  handToMain: ((item: Interaction) => Promise<HandOffOutcome>) | null;
+  /** 核对 for an unknown hand-off command. */
+  reconcileHandOff: ((commandId: string) => Promise<HandOffOutcome>) | null;
   nowMs: number;
   onRespond: (item: Interaction, answer: InteractionAnswer) => Promise<void>;
 }) {
@@ -466,6 +481,7 @@ function QueueCard({
       screenLines: screenLines ?? [],
       mainAsking,
       handToMain,
+      reconcileHandOff,
     };
     return <DecisionCard view={view} mode="home" onRespond={onRespond} home={home} />;
   }

@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import { DecisionCard, type DecisionView, type HomeCardState } from "./ApprovalCard";
+import type { HandOffOutcome } from "../home/handToMain";
 import type { Interaction } from "../../types/interaction";
 import { APPROVAL, PLAN, field, interaction, question } from "../home/queueTestData";
 
@@ -137,8 +138,10 @@ describe('DecisionCard mode="home" (§4.2, §4.3)', () => {
 /* ------------------------------------------------------------------ */
 
 describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
+  const accepted = { kind: "accepted" as const, commandId: "cmd_1" };
+
   it("offers 交给 Main on a QUESTION card, without answering it", async () => {
-    const run = vi.fn().mockResolvedValue(undefined);
+    const run = vi.fn().mockResolvedValue(accepted);
     const onRespond = renderCard(
       interaction({ id: "int_q", instanceId: "ins_a", request: question() }),
       { handToMain: run },
@@ -154,10 +157,11 @@ describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
     // The card stays on the home with its own controls.
     expect(screen.getAllByTestId("home-card-chip").length).toBeGreaterThan(0);
     expect(await screen.findByTestId("home-card-hand-receipt")).toHaveTextContent("已交给 Main");
+    expect(screen.getByTestId("home-card-hand-receipt")).toHaveAttribute("data-state", "accepted");
   });
 
   it("offers 交给 Main on a PLAN card", () => {
-    const run = vi.fn().mockResolvedValue(undefined);
+    const run = vi.fn().mockResolvedValue(accepted);
     renderCard(interaction({ id: "int_p", instanceId: "ins_a", kind: "plan-review", request: PLAN }), {
       handToMain: run,
     });
@@ -166,9 +170,27 @@ describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
   });
 
   it("never offers it on an approval card, even when a handler exists", () => {
-    renderCard(interaction({ id: "int_a", instanceId: "ins_a" }), { handToMain: vi.fn() });
+    renderCard(interaction({ id: "int_a", instanceId: "ins_a" }), { handToMain: vi.fn(async () => ({ kind: "accepted" as const, commandId: null })) });
     expect(screen.queryByTestId("home-card-more")).toBeNull();
     expect(screen.queryByTestId("home-card-hand-main")).toBeNull();
+  });
+
+  it("never offers it on Main's own question (r2)", () => {
+    const run = vi.fn().mockResolvedValue(accepted);
+    renderCard(interaction({ id: "int_m", instanceId: "ins_main", request: question() }), {
+      handToMain: run,
+      mainAsking: true,
+    });
+    expect(screen.queryByTestId("home-card-more")).toBeNull();
+    expect(screen.queryByTestId("home-card-hand-main")).toBeNull();
+  });
+
+  it("never offers it on Main's own plan either", () => {
+    renderCard(interaction({ id: "int_mp", instanceId: "ins_main", kind: "plan-review", request: PLAN }), {
+      handToMain: vi.fn(async () => accepted),
+      mainAsking: true,
+    });
+    expect(screen.queryByTestId("home-card-more")).toBeNull();
   });
 
   it("hides it when no Main resolves", () => {
@@ -178,10 +200,65 @@ describe('DecisionCard mode="home" 交给 Main (§6.4)', () => {
 
   it("greys the trigger while the queue is stale (§8)", () => {
     renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), {
-      handToMain: vi.fn(),
+      handToMain: vi.fn(async () => ({ kind: "accepted" as const, commandId: null })),
       stale: true,
     });
     expect(screen.getByTestId("home-card-more")).toBeDisabled();
   });
-});
 
+  it("shows 发送中… while the command is in flight, and the outcome after", async () => {
+    let release: (outcome: HandOffOutcome) => void = () => undefined;
+    const run = vi.fn(() => new Promise<HandOffOutcome>((resolve) => { release = resolve; }));
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), { handToMain: run });
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    expect(await screen.findByTestId("home-card-hand-receipt")).toHaveTextContent("发送中…");
+    expect(screen.queryByText("已交给 Main")).toBeNull();
+    release(accepted);
+    expect(await screen.findByTestId("home-card-hand-receipt")).toHaveTextContent("已交给 Main");
+  });
+
+  it("never reports 已交给 Main for a rejection; it offers 发送给当前 Main (r2)", async () => {
+    const run = vi.fn()
+      .mockResolvedValueOnce({ kind: "rejected", reason: "章节已被取代", commandId: "cmd_1" })
+      .mockResolvedValueOnce(accepted);
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), { handToMain: run });
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    const receipt = await screen.findByTestId("home-card-hand-receipt");
+    expect(receipt).toHaveTextContent("未送达 · 章节已被取代");
+    expect(receipt).toHaveAttribute("data-state", "rejected");
+    expect(screen.queryByText("已交给 Main")).toBeNull();
+    // The retry is a NEW send (a fresh commandId in the store), never a replay.
+    fireEvent.click(screen.getByTestId("home-card-hand-retry"));
+    expect(await screen.findByText("已交给 Main")).toBeInTheDocument();
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a queued row honestly instead of 已交给 Main (r2)", async () => {
+    const run = vi.fn().mockResolvedValue({ kind: "queued", commandId: "cmd_1" });
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), { handToMain: run });
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    const receipt = await screen.findByTestId("home-card-hand-receipt");
+    expect(receipt).toHaveTextContent("已排队 · 主机上线后送达");
+    expect(screen.queryByText("已交给 Main")).toBeNull();
+  });
+
+  it("reconciles an unknown outcome through 核对 (a read, never a re-send) (r2)", async () => {
+    const run = vi.fn().mockResolvedValue({ kind: "unknown", commandId: "cmd_1" });
+    const reconcile = vi.fn().mockResolvedValue({ kind: "accepted", commandId: "cmd_1" });
+    renderCard(interaction({ id: "int_q", instanceId: "ins_a", request: question() }), {
+      handToMain: run,
+      reconcileHandOff: reconcile,
+    });
+    fireEvent.click(screen.getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    expect(await screen.findByTestId("home-card-hand-reconcile")).toBeInTheDocument();
+    expect(screen.getByTestId("home-card-hand-receipt")).toHaveTextContent("状态待确认");
+    fireEvent.click(screen.getByTestId("home-card-hand-reconcile"));
+    expect(await screen.findByText("已交给 Main")).toBeInTheDocument();
+    expect(reconcile).toHaveBeenCalledWith("cmd_1");
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+});

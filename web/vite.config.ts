@@ -1,5 +1,6 @@
 /// <reference types="vitest/config" />
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import { serviceWorkerPlugin } from "./sw-build.ts";
 
@@ -9,6 +10,12 @@ const hub = process.env.VITE_HUB_URL;
 // `max_user_watches` it fails the whole e2e run with ENOSPC before the first
 // request. `watch: null` disables it entirely (Vite ≥ 5).
 const noWatch = process.env.VITE_NO_WATCH === "1";
+
+const webRoot = fileURLToPath(new URL(".", import.meta.url));
+// The redaction tests import the ONE shared secret-shape list and its
+// agreement corpus from the repo's scripts/ci/ (never a second copy). Vite
+// only serves files under its root by default; allow the repo root beside it.
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 export default defineConfig(({ mode }) => ({
   // c-unboundresume r4 item 1: compile-time gate for the e2e test handle.
@@ -20,6 +27,7 @@ export default defineConfig(({ mode }) => ({
   },
   plugins: [react(), serviceWorkerPlugin()],
   server: {
+    fs: { allow: [webRoot, repoRoot] },
     ...(hub
       ? {
           proxy: {

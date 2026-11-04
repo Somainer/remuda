@@ -45,6 +45,8 @@ vi.mock("../../lib/store", () => ({
     titleOf: (id: string) => id,
     hostName: () => "forge",
     getSnapshot: () => fake.state,
+    subscribe: () => () => undefined,
+    reconcileSend: async () => "unknown",
     respond: fake.respond,
     refresh: fake.refresh,
     markSeen: fake.markSeen,
@@ -81,6 +83,7 @@ function hub(overrides: Partial<HubState> = {}): HubState {
     hosts: [host({ id: "hst_1" })],
     workspaces: [{ id: "wsp_1", label: "remuda" }],
     answering: {},
+    bubbles: [],
     screens: {},
     ...overrides,
   } as unknown as HubState;
@@ -262,6 +265,47 @@ describe("HomeQueue (§4.1)", () => {
     fake.main = null;
     fake.state = hub({
       instances: [inst({ id: "ins_a" })],
+      interactions: [interaction({ id: "int_ask", instanceId: "ins_a", request: question() })],
+    });
+    renderQueue("phone");
+    const card = cards()[0];
+    expect(within(card).queryByTestId("home-card-more")).toBeNull();
+  });
+
+  it("never offers 交给 Main on Main's own pinned question (r2)", () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_main" }), inst({ id: "ins_a" })],
+      interactions: [
+        interaction({ id: "int_main", instanceId: "ins_main", createdAt: T2, request: question() }),
+        interaction({ id: "int_other", instanceId: "ins_a", createdAt: T1, request: PLAN }),
+      ],
+    });
+    renderQueue("phone");
+    const pinned = cards().find((card) => card.getAttribute("data-card-id") === "int_main")!;
+    expect(pinned).toHaveAttribute("data-main-asking", "1");
+    expect(within(pinned).queryByTestId("home-card-more")).toBeNull();
+    // Another session's question still carries it.
+    const other = cards().find((card) => card.getAttribute("data-card-id") === "int_other")!;
+    expect(within(other).getByTestId("home-card-more")).toBeInTheDocument();
+  });
+
+  it("offers nothing while Main is not live (r2)", () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: false,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_main" }), inst({ id: "ins_a" })],
       interactions: [interaction({ id: "int_ask", instanceId: "ins_a", request: question() })],
     });
     renderQueue("phone");

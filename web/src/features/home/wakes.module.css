@@ -1,0 +1,240 @@
+/* @tokens strict */
+/*
+ * ⑩ 定时 / 今天 (home.md §1 ⑩, §6.2, §2.2): the Main card's third line and
+ * the sheet / 「今天」 card that list Main's wake-ups. Role tokens only;
+ * controls follow the single-line rule (visual-system §8.1).
+ */
+
+/* The Main card's third line: ◷ 下次 HH:MM <name> · 共 N 个 › */
+.line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  min-height: var(--control-h-sm);
+  margin: 0;
+  padding: 0 var(--space-2) 0 var(--space-5);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  text-align: left;
+  cursor: pointer;
+}
+
+.line:hover {
+  color: var(--fg-body);
+}
+
+.line:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: var(--focus-offset);
+}
+
+.line[data-stale="1"] {
+  color: var(--fg-faint);
+  cursor: default;
+}
+
+.lineText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lineChevron {
+  flex: none;
+  color: var(--fg-faint);
+}
+
+/* ── the sheet ─────────────────────────────────────────────────────────── */
+
+.title {
+  margin: 0;
+  padding: var(--space-3) var(--space-3) 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+}
+
+.empty {
+  margin: 0;
+  padding: var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+}
+
+.list {
+  margin: 0;
+  padding: var(--space-2);
+  list-style: none;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--divider);
+}
+
+.row:last-child {
+  border-bottom: 0;
+}
+
+.rowText {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+}
+
+.detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.state {
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.cancel {
+  flex: none;
+  height: var(--control-h-sm);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.cancel:disabled {
+  color: var(--fg-faint);
+  cursor: default;
+}
+
+.close {
+  composes: btnGhost from "../../styles/ui.module.css";
+  margin: var(--space-2) var(--space-3) var(--space-3);
+}
+
+.error {
+  margin: 0 var(--space-3) var(--space-2);
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+/* ── 「今天」 card (≥1440 right column, §2.2) ───────────────────────────── */
+
+.today {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 var(--space-4) var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.today[data-stale="1"] {
+  opacity: 0.6;
+}
+
+.todayHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.todayTitle {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
+}
+
+.todayCount {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.todayRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.todayRow:hover {
+  color: var(--fg-strong);
+}
+
+.todayRow:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: var(--focus-offset);
+}
+
+.todayClock {
+  flex: none;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+.todayName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todayMore {
+  composes: btnGhost from "../../styles/ui.module.css";
+  align-self: flex-start;
+}

@@ -34,17 +34,23 @@ const fake = vi.hoisted(() => ({
   markSeen: vi.fn(),
   notices: [] as OwnerNotice[],
   ack: vi.fn(),
+  main: null as unknown,
+  send: vi.fn(),
 }));
 
 vi.mock("../../lib/store", () => ({
   useHub: () => fake.state,
+  useMainEntry: () => fake.main,
   hubStore: {
     titleOf: (id: string) => id,
     hostName: () => "forge",
     getSnapshot: () => fake.state,
+    subscribe: () => () => undefined,
+    reconcileSend: async () => "unknown",
     respond: fake.respond,
     refresh: fake.refresh,
     markSeen: fake.markSeen,
+    send: fake.send,
   },
 }));
 
@@ -77,6 +83,7 @@ function hub(overrides: Partial<HubState> = {}): HubState {
     hosts: [host({ id: "hst_1" })],
     workspaces: [{ id: "wsp_1", label: "remuda" }],
     answering: {},
+    bubbles: [],
     screens: {},
     ...overrides,
   } as unknown as HubState;
@@ -110,6 +117,8 @@ beforeEach(() => {
   fake.markSeen.mockReset().mockResolvedValue(null);
   fake.notices = [];
   fake.ack.mockReset();
+  fake.main = null;
+  fake.send.mockReset().mockResolvedValue(true);
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -186,6 +195,122 @@ describe("HomeQueue (§4.1)", () => {
     fake.state = fiveCards();
     renderQueue("phone", "/m", true);
     expect(screen.queryByTestId("home-queue")).toBeNull();
+  });
+
+  it("pins Main's own question first, labelled, and counts it once (§4.1 item 1)", () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_main" }), inst({ id: "ins_a" })],
+      interactions: [
+        // Newer, but not Main's: it comes second.
+        interaction({ id: "int_other", instanceId: "ins_a", createdAt: T2, request: question() }),
+        // Older, Main's own: pinned to the front and labelled.
+        interaction({ id: "int_main", instanceId: "ins_main", createdAt: T0, request: question() }),
+      ],
+    });
+    renderQueue("phone");
+    expect(cards().map((card) => card.getAttribute("data-card-id"))).toEqual(["int_main", "int_other"]);
+    expect(cards()[0]).toHaveTextContent("Main 在问你");
+    expect(cards()[0]).toHaveAttribute("data-main-asking", "1");
+    expect(cards()[1]).not.toHaveAttribute("data-main-asking");
+    // The pinned card is one of the same queue rows: N = 2, never 3.
+    expect(screen.getByTestId("home-queue-title")).toHaveTextContent("需要你 · 2");
+  });
+
+  it("hands a question or plan card to Main from its ⋯ menu and leaves it pending (§6.4)", async () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_a" }), inst({ id: "ins_p" }), inst({ id: "ins_approval" })],
+      interactions: [
+        interaction({ id: "int_ask", instanceId: "ins_a", createdAt: T2, request: question() }),
+        interaction({ id: "int_plan", instanceId: "ins_p", createdAt: T1, request: PLAN }),
+        interaction({ id: "int_approval", instanceId: "ins_approval", createdAt: T0 }),
+      ],
+    });
+    renderQueue("phone");
+    // An approval card carries no ⋯ at all.
+    const approval = cards().find((card) => card.getAttribute("data-card-id") === "int_approval")!;
+    expect(within(approval).queryByTestId("home-card-more")).toBeNull();
+
+    const ask = cards().find((card) => card.getAttribute("data-card-id") === "int_ask")!;
+    fireEvent.click(within(ask).getByTestId("home-card-more"));
+    fireEvent.click(screen.getByTestId("home-card-hand-main"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fake.send).toHaveBeenCalledTimes(1);
+    const [target, text] = fake.send.mock.calls[0] as [string, string];
+    expect(target).toBe("ins_main");
+    expect(text).toContain("untrusted: ");
+    expect(text).toContain("旧迁移 0042 删掉还是保留？");
+    // Sending never answers: no interaction POST was made.
+    expect(fake.respond).not.toHaveBeenCalled();
+    // The card is still in the queue, pending.
+    expect(cards().some((card) => card.getAttribute("data-card-id") === "int_ask")).toBe(true);
+  });
+
+  it("hides 交给 Main when no Main resolves", () => {
+    fake.main = null;
+    fake.state = hub({
+      instances: [inst({ id: "ins_a" })],
+      interactions: [interaction({ id: "int_ask", instanceId: "ins_a", request: question() })],
+    });
+    renderQueue("phone");
+    const card = cards()[0];
+    expect(within(card).queryByTestId("home-card-more")).toBeNull();
+  });
+
+  it("never offers 交给 Main on Main's own pinned question (r2)", () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_main" }), inst({ id: "ins_a" })],
+      interactions: [
+        interaction({ id: "int_main", instanceId: "ins_main", createdAt: T2, request: question() }),
+        interaction({ id: "int_other", instanceId: "ins_a", createdAt: T1, request: PLAN }),
+      ],
+    });
+    renderQueue("phone");
+    const pinned = cards().find((card) => card.getAttribute("data-card-id") === "int_main")!;
+    expect(pinned).toHaveAttribute("data-main-asking", "1");
+    expect(within(pinned).queryByTestId("home-card-more")).toBeNull();
+    // Another session's question still carries it.
+    const other = cards().find((card) => card.getAttribute("data-card-id") === "int_other")!;
+    expect(within(other).getByTestId("home-card-more")).toBeInTheDocument();
+  });
+
+  it("offers nothing while Main is not live (r2)", () => {
+    fake.main = {
+      instance: { id: "ins_main", hostId: "hst_1", grants: ["address-owner"] },
+      lineageId: "ins_main",
+      generation: 1,
+      live: false,
+      chapterIds: ["ins_main"],
+    };
+    fake.state = hub({
+      instances: [inst({ id: "ins_main" }), inst({ id: "ins_a" })],
+      interactions: [interaction({ id: "int_ask", instanceId: "ins_a", request: question() })],
+    });
+    renderQueue("phone");
+    const card = cards()[0];
+    expect(within(card).queryByTestId("home-card-more")).toBeNull();
   });
 
   it("greys 知道了 with 数据可能过期 while the queue is stale (§8)", () => {

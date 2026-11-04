@@ -142,9 +142,15 @@ export function Composer({
   placeholder,
   primaryOverride = null,
   draftScope,
+  suggestions,
 }: {
   /** The instance sends and uploads go to. */
   instanceId: string;
+  /**
+   * Ask variant only (home.md §6.3): the quick-ask chips, shown ONLY while
+   * the input holds focus. A tap fills the input with `text` and never sends.
+   */
+  suggestions?: readonly { id: string; label: string; text: string }[];
   /**
    * Where the draft and the staged attachments live; defaults to
    * `instanceId`. The 问 Main input scopes them to the Main LINEAGE, so a
@@ -273,6 +279,8 @@ export function Composer({
   const ask = variant === "ask";
   const scope = draftScope ?? instanceId;
   const [text, setText] = useState(() => readDraft(scope));
+  // home.md §6.3: the quick-ask chips appear only while the input has focus.
+  const [inputFocused, setInputFocused] = useState(false);
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
   // and the Sheet that replaces both window.confirm calls.
@@ -307,6 +315,38 @@ export function Composer({
   // previous insert just produced rather than a stale React closure.
   const textRef = useRef(text);
   textRef.current = text;
+
+  /**
+   * home.md §6.3: a quick-ask tap writes the question into the draft and never
+   * sends. It must never lose typed text (r2): an empty draft becomes the
+   * question, anything else receives it at the caret (the chip row keeps the
+   * textarea focused), or appended when no caret is available.
+   */
+  const applySuggestion = (value: string) => {
+    const current = textRef.current;
+    const area = inputRef.current;
+    let next: string;
+    let caret: number;
+    if (current.length === 0) {
+      next = value;
+      caret = value.length;
+    } else if (area && document.activeElement === area) {
+      const at = area.selectionStart ?? current.length;
+      next = `${current.slice(0, at)}${value}${current.slice(at)}`;
+      caret = at + value.length;
+    } else {
+      const separator = /[\s　]$/.test(current) ? "" : " ";
+      next = `${current}${separator}${value}`;
+      caret = next.length;
+    }
+    textRef.current = next;
+    setText(next);
+    writeDraft(scope, next);
+    area?.focus();
+    // The controlled value lands on the next render; place the caret after
+    // the inserted question then.
+    queueMicrotask(() => inputRef.current?.setSelectionRange(caret, caret));
+  };
 
   // ── §4.8 voice input (m-voice) ──────────────────────────────────────────
   // Platform keyboard dictation is the primary path and needs no code. The
@@ -1560,6 +1600,26 @@ export function Composer({
         onRetry={images.retry}
       />
       <CodeQuoteChips quotes={codeQuotes.quotes} unreferenced={unreferencedCode} onRemove={removeCodeQuote} />
+      {/* home.md §6.3: quick-ask chips, only while the 问 Main input focused.
+          A tap fills the draft through the SAME path as typing and never
+          sends; mousedown is swallowed so the textarea keeps focus. */}
+      {ask && inputFocused && suggestions && suggestions.length > 0 ? (
+        <div className={css.askChips} data-testid="composer-suggestions" role="group" aria-label="快捷提问">
+          {suggestions.map((suggestion) => (
+            <button
+              key={suggestion.id}
+              type="button"
+              className={css.askChip}
+              data-testid="composer-suggestion"
+              data-suggestion-id={suggestion.id}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => applySuggestion(suggestion.text)}
+            >
+              {suggestion.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
       {images.notice ? (
         <div className={css.attachNotice} data-testid="attachment-notice">
           {images.notice}
@@ -1597,6 +1657,8 @@ export function Composer({
             setText(e.target.value);
             writeDraft(scope, e.target.value);
           }}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
           onPaste={(event) => {
             // Swallow the paste only when a file was actually taken: otherwise
             // plain-text pasting and the iOS caret both break.

@@ -23,10 +23,14 @@
 //!   its child until the child's first turn ends. At boot every `running` run
 //!   becomes `interrupted` and is never replayed (its fact stays consumed
 //!   even if the batch is later released); the next occurrence is computed
-//!   from the schedule as usual. The one exception is a run whose result is
-//!   already queued in `wake_outcomes` (its write kept failing): that result
-//!   is evidence the run ended, so the run stays `running` until a later pass
-//!   writes it.
+//!   from the schedule as usual. Boot first applies what the previous
+//!   process left queued (check reports in `wake_check_reports`, then results
+//!   in `wake_outcomes`). The exception is a run with a result or a check
+//!   report still queued after that (its write kept failing): that is
+//!   evidence the run ended or its check answered, so the run stays
+//!   `running` until a later drain writes it. A run whose check was claimed
+//!   and never answered is `interrupted` with its check, and never asked
+//!   again.
 //! * **Missed (skipped) occurrences.** An `every` wake-up whose occurrences
 //!   passed while the Hub was down fires once, for the latest one, and
 //!   reports how many it skipped. An occurrence that comes due while the
@@ -2601,11 +2605,12 @@ fn notify_run(
     ))
 }
 
-/// At open, before any job: apply the results the previous process left
-/// queued, then mark every run still `running` whose result is not already
-/// queued as `interrupted` (a queued result is evidence the run ended; it is
-/// applied on a later pass). An interrupted run is never replayed; its
-/// wake-up's next occurrence is computed from the schedule as usual.
+/// At open, before any job: apply the check reports and then the results the
+/// previous process left queued, then mark every run still `running` that
+/// has neither queued as `interrupted`, its check too (a queued result or
+/// report is evidence; it is applied on a later pass). An interrupted run is
+/// never replayed; its wake-up's next occurrence is computed from the
+/// schedule as usual.
 pub(crate) fn boot(conn: &mut Connection) {
     drain_check_reports(conn, OffsetDateTime::now_utc());
     drain_outcomes(conn, OffsetDateTime::now_utc());

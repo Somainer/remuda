@@ -1,5 +1,5 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import corpusRaw from "../../../scripts/ci/secret-shapes-corpus.txt?raw";
 import { SECRET_REDACTED, redactSecretShapes } from "./secrets";
 import { SECRET_SHAPE_RULES } from "./secretShapes.generated";
 
@@ -20,7 +20,7 @@ function expand(line: string): string {
   });
 }
 
-const lines = corpusRaw
+const lines = readFileSync(`${import.meta.dirname}/../../../scripts/ci/secret-shapes-corpus.txt`, "utf8")
   .split("\n")
   .map((line: string) => line.trimEnd())
   .filter((line: string) => line.length > 0 && !line.startsWith("#"));

@@ -1,5 +1,5 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import shapesRaw from "../../../scripts/ci/secret-shapes.json?raw";
 import {
   SECRET_SHAPE_DUMMY_PART,
   SECRET_SHAPE_MASK,
@@ -13,7 +13,9 @@ import {
  * Hub's one source) and fails if a regenerate is due.
  */
 
-const shapes = JSON.parse(shapesRaw) as {
+const shapes = JSON.parse(
+  readFileSync(`${import.meta.dirname}/../../../scripts/ci/secret-shapes.json`, "utf8"),
+) as {
   rules: { name: string; pattern: string; minPayload: number }[];
   mask: string;
   placeholder: string;

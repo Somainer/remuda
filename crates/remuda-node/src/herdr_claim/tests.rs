@@ -1062,3 +1062,32 @@ async fn the_node_refuses_a_non_human_write_to_a_claimed_pane() {
     .expect("a human write passes");
     harness.wait_call("terminal.input", "w1:p1").await;
 }
+
+#[tokio::test]
+async fn a_lost_contact_flips_back_to_ok_after_a_node_restart() {
+    let harness = Harness::new().await;
+    let id = harness
+        .claim(harness.target("w1", "w1:t1", None))
+        .await
+        .expect("claim")
+        .meta
+        .id;
+    let away = harness.socket.with_extension("away");
+    std::fs::rename(&harness.socket, &away).expect("hide socket");
+    harness.wait_contact(&id, &["lost"]).await;
+    harness.node.shutdown().await.expect("node shutdown");
+    // The server answers again while the Node is down.
+    std::fs::rename(&away, &harness.socket).expect("restore socket");
+    let own_dir = harness.root.path().join("sessions/mine");
+    let restarted = node(&harness.store, harness.data.path(), &own_dir);
+    restarted.set_herdr_claim_root(harness.root.path().to_path_buf());
+    restarted
+        .reconcile_herdr()
+        .await
+        .expect("startup reconcile");
+    harness.wait_contact(&id, &["lost", "ok"]).await;
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Ready
+    );
+}

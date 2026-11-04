@@ -157,7 +157,9 @@ In every case the pane is never touched.
 them as they were. At start, before any command is served, the Node checks
 each live claim: pane present and process alive → re-attach (watcher, TTY
 bridge, command queue); pane gone or process gone → end with evidence as
-above; server unreachable → re-attach in the contact-lost state. The Hub sees
+above; server unreachable → re-attach in the contact-lost state. Either way the
+re-attach journals the contact it observes (`ok` or `lost`), so a `lost` that
+survived the restart flips back to `ok` once the server answers. The Hub sees
 the re-attached instances as live in the hello inventory.
 
 ## 7. Wire

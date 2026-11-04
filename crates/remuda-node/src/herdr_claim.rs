@@ -435,7 +435,7 @@ impl DevNode {
             kind = ?resolution.kind,
             "herdr pane claimed"
         );
-        self.start_claimed(&instance_id, resolution.claim, resolution.kind)
+        self.start_claimed(&instance_id, resolution.claim, resolution.kind, false)
             .await;
         self.inner.store.get_instance(&instance_id)
     }
@@ -483,9 +483,23 @@ impl DevNode {
                         &evidence,
                     );
                 }
-                Probe::Alive { .. } | Probe::Unreachable(_) => {
+                probe @ (Probe::Alive { .. } | Probe::Unreachable(_)) => {
                     tracing::info!(instance = %id.as_id(), pane = %claim.pane_id, "re-attaching claimed herdr pane");
-                    self.start_claimed(&id, claim, instance.kind).await;
+                    // D-062 r2 item 3: a contact state journaled before the
+                    // restart is stale; journal what this Node sees now, so a
+                    // `lost` that survived the restart flips back to `ok`.
+                    let (lost, error) = match &probe {
+                        Probe::Unreachable(error) => (true, error.clone()),
+                        _ => (false, String::new()),
+                    };
+                    journal_contact(
+                        self.inner.store.as_ref(),
+                        &id,
+                        &claim,
+                        if lost { "lost" } else { "ok" },
+                        &error,
+                    );
+                    self.start_claimed(&id, claim, instance.kind, lost).await;
                 }
             }
         }
@@ -508,7 +522,13 @@ impl DevNode {
         self.tty().stop(id).await;
     }
 
-    async fn start_claimed(&self, id: &InstanceId, claim: HerdrClaim, kind: AgentKind) {
+    async fn start_claimed(
+        &self,
+        id: &InstanceId,
+        claim: HerdrClaim,
+        kind: AgentKind,
+        contact_lost: bool,
+    ) {
         let poll = self
             .inner
             .herdr_claims
@@ -532,7 +552,7 @@ impl DevNode {
             poll,
             detached: AtomicBool::new(false),
             gone: AtomicBool::new(false),
-            contact_lost: AtomicBool::new(false),
+            contact_lost: AtomicBool::new(contact_lost),
             watcher: std::sync::Mutex::new(None),
         });
         let handle = pane.spawn_watcher();

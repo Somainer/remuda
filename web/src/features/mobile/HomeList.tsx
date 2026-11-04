@@ -267,13 +267,16 @@ export const HomeList = memo(function HomeList() {
   // Mirror SessionList's screen hydration cadence exactly: /screen reads go to
   // tty-attachable rows only (the store skips exited/failed rows, so the phone
   // home issues no screen traffic for dead sessions — c-mobilenew's
-  // no-/screen-500 contract). home-glance-d060: the per-row JOURNAL read that
-  // used to feed each row's body is gone — the poll's one `GET /v1/owner/glance`
-  // carries every headline (home.md §5.3).
+  // no-/screen-500 contract). Child rows are rendered here (nested under their
+  // parent), so they are hydrated too: r4 item 4, after mapInstance began
+  // carrying `parent` and a top-level-only filter silently starved them.
+  // home-glance-d060: the per-row JOURNAL read that used to feed each row's
+  // body is gone — the poll's one `GET /v1/owner/glance` carries every headline
+  // (home.md §5.3).
   const screenIds = useMemo(
     () =>
       instances
-        .filter((instance) => instance.parent == null && uiMode(instance) === "tty-attachable")
+        .filter((instance) => uiMode(instance) === "tty-attachable")
         .map((instance) => instance.id),
     [instances],
   );

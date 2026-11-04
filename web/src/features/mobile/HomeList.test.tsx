@@ -26,6 +26,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
+import { uiMode } from "../../lib/status";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
 import { LONG_PRESS_MS } from "../home/RowActions";
@@ -852,6 +853,38 @@ describe("the home poll", () => {
     // that used to feed each body is gone — one glance carries every headline
     // (home.md §5.3); the tty screen read is a different source and stays.
     expect(rowReads.hydrateRowSummaries).not.toHaveBeenCalled();
+  });
+});
+
+describe("the home poll's screen reads", () => {
+  /**
+   * [r4 item 4] The ledger renders child rows (nested under their parent), and
+   * their next-step sentence reads the tty screen like any other row. Once
+   * mapInstance carried `parent`, a top-level-only filter starved them.
+   */
+  it("hydrates a child row's /screen like its parent's", async () => {
+    const tty = mockDb.instances.find((instance) => uiMode(instance) === "tty-attachable")!;
+    const ttyRow = (id: string, patch: Partial<Instance> = {}) =>
+      row(id, {
+        driver: tty.driver,
+        kind: tty.kind,
+        capabilities: tty.capabilities,
+        activity: known("working"),
+        ...patch,
+      });
+    hub.instances = [
+      ttyRow("ins-parent"),
+      ttyRow("ins-child", {
+        parent: { instanceId: "ins-parent", runId: null, commandId: null },
+        creatorOrigin: "agent",
+      }),
+    ];
+    expect(hub.instances.every((instance) => uiMode(instance) === "tty-attachable")).toBe(true);
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    await waitFor(() => expect(rowReads.refreshScreens).toHaveBeenCalled());
+    const lastCall = rowReads.refreshScreens.mock.calls.at(-1) as unknown[] | undefined;
+    expect(lastCall?.[0]).toEqual(["ins-parent", "ins-child"]);
   });
 });
 

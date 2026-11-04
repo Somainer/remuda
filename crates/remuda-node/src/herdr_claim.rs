@@ -363,6 +363,9 @@ impl DevNode {
             },
             kind,
             agent_status: status_word(status).to_owned(),
+            remuda_workspace_id: self
+                .registered_workspace_for_cwd(pane.cwd.as_deref())
+                .map(|id| id.as_id().to_string()),
             cwd: pane.cwd.clone(),
         })
     }
@@ -699,17 +702,19 @@ impl DevNode {
     /// The registered workspace holding the pane's cwd, else a fresh id that
     /// occupies no registered workspace.
     fn workspace_for_cwd(&self, cwd: Option<&str>) -> WorkspaceId {
-        let Some(cwd) = cwd.map(Path::new).filter(|cwd| cwd.is_absolute()) else {
-            return WorkspaceId::new();
-        };
+        self.registered_workspace_for_cwd(cwd)
+            .unwrap_or_else(WorkspaceId::new)
+    }
+
+    /// The registered workspace whose root contains the pane's cwd.
+    fn registered_workspace_for_cwd(&self, cwd: Option<&str>) -> Option<WorkspaceId> {
+        let cwd = cwd.map(Path::new).filter(|cwd| cwd.is_absolute())?;
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         self.workspaces()
-            .ok()
-            .and_then(|workspaces| {
-                workspaces
-                    .into_iter()
-                    .find(|workspace| cwd.starts_with(&workspace.root_path))
-            })
-            .map_or_else(WorkspaceId::new, |workspace| workspace.meta.id)
+            .ok()?
+            .into_iter()
+            .find(|workspace| cwd.starts_with(&workspace.root_path))
+            .map(|workspace| workspace.meta.id)
     }
 }
 

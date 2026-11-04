@@ -22,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const SOCKET: &str = "/run/user/herdr/sessions/work/herdr.sock";
+/// The registered workspace the scripted Node resolves the pane's cwd to.
+const WORKSPACE: &str = "wsp_01993ab0-0000-7000-8000-0000000000a1";
 
 /// Scripted Node answering the claim RPCs the way `remuda-node` does,
 /// recording every method and its params.
@@ -70,6 +72,7 @@ fn resolution(params: &Value) -> Value {
         },
         "kind": "claude",
         "agentStatus": "idle",
+        "remudaWorkspaceId": WORKSPACE,
     }})
 }
 
@@ -321,6 +324,10 @@ async fn human_claims_a_pane_and_the_record_says_herdr_claimed() -> Result<()> {
     assert_eq!(instance["launchedBy"], "user");
     assert_eq!(instance["permissionMode"], "external");
     assert_eq!(instance["name"], "human claude");
+    assert_eq!(
+        instance["workspaceId"], WORKSPACE,
+        "the row files under the workspace holding the pane, not 其他"
+    );
     assert_eq!(instance["herdrClaim"]["session"], "work");
     assert_eq!(instance["herdrClaim"]["workspaceId"], "w1");
     assert_eq!(instance["herdrClaim"]["tabId"], "w1:t1");

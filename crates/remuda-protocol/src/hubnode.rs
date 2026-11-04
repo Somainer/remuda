@@ -811,6 +811,10 @@ pub struct HerdrClaimResolution {
     /// Pane cwd herdr reports, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The registered Remuda workspace containing `cwd`, which the claimed
+    /// instance files under (D-062 r2 item 6); absent when none contains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remuda_workspace_id: Option<String>,
 }
 
 /// `instance.claim` params (D-062).

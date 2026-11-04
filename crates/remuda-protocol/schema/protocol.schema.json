@@ -6835,6 +6835,13 @@
         "kind": {
           "$ref": "#/$defs/AgentKind",
           "description": "Resolved agent kind (`claude`, …, `generic`, `terminal`)."
+        },
+        "remudaWorkspaceId": {
+          "description": "The registered Remuda workspace containing `cwd`, which the claimed\ninstance files under (D-062 r2 item 6); absent when none contains it.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -75,6 +75,11 @@ At claim time the Node records, on the instance (`herdrClaim`):
     foreground job the human starts in it is fine; the shell being replaced
     (another pid, or the same pid with another start time) ends the claim.
 
+The claimed instance files under the registered Remuda workspace whose root
+contains the pane's cwd (`herdr.resolve` reports it as `remudaWorkspaceId`, and
+the Hub indexes the row with it), so it appears under that project; a pane
+outside every registered workspace gets no workspace.
+
 The Node's **own** herdr session is never claimable (400, `own-session`) and
 is not listed by discovery: its panes already are Remuda instances.
 

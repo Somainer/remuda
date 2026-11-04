@@ -1482,6 +1482,7 @@ export type HerdrClaimResolution = ({
   "claim": HerdrClaim;
   "cwd"?: (string | null);
   "kind": AgentKind;
+  "remudaWorkspaceId"?: (string | null);
   [key: string]: unknown;
 });
 

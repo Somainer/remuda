@@ -371,7 +371,8 @@ async fn claim(
         .store
         .insert_instance_delegated(
             host_id.clone(),
-            None,
+            // D-062 r2 item 6: file under the workspace holding the pane.
+            resolution.remuda_workspace_id.clone(),
             kind.clone(),
             DRIVER.to_owned(),
             title,

@@ -1091,3 +1091,47 @@ async fn a_lost_contact_flips_back_to_ok_after_a_node_restart() {
         InstanceLifecycle::Ready
     );
 }
+
+#[tokio::test]
+async fn a_claim_files_under_the_registered_workspace_holding_the_pane() {
+    let harness = Harness::new().await;
+    let registered = harness.node.workspaces().expect("workspaces");
+    let root = registered.first().expect("a registered workspace").clone();
+    let tab = harness
+        .client()
+        .tab_create(TabCreateParams {
+            workspace_id: Some("w2".into()),
+            cwd: Some(root.root_path.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("tab in the workspace");
+    let target = HerdrClaimTarget {
+        kind: Some("shell".into()),
+        ..harness.target("w2", &tab.tab.tab_id, None)
+    };
+    let resolution = harness
+        .node
+        .herdr_resolve(&target, None)
+        .await
+        .expect("resolve");
+    assert_eq!(
+        resolution.remuda_workspace_id.as_deref(),
+        Some(root.meta.id.as_id().as_str())
+    );
+    let claimed = harness.claim(target).await.expect("claim");
+    assert_eq!(claimed.workspace_id, root.meta.id);
+    // A pane outside every registered workspace reports none.
+    let outside = harness
+        .node
+        .herdr_resolve(
+            &HerdrClaimTarget {
+                kind: Some("shell".into()),
+                ..harness.target("w2", "w2:t3", None)
+            },
+            None,
+        )
+        .await
+        .expect("resolve");
+    assert_eq!(outside.remuda_workspace_id, None);
+}

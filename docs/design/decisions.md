@@ -2418,8 +2418,9 @@ pane, its process or its server.
    instance stays live with `herdrClaim.contact = "lost"` until the server
    answers again. A Node restart re-attaches every live claim whose pane still
    exists in the recorded workspace and tab with its process alive.
-7. **No transcript in this cut.** A claimed instance has screen, TTY, activity
-   from herdr's agent status, and lifecycle events. No structured journal.
+7. **No agent-output transcript in this cut.** A claimed instance has screen,
+   TTY, activity from herdr's agent status, lifecycle events and a user-message
+   row per send; nothing the agent prints is journaled.
 8. **Audit.** Claim and release write Hub audit rows (device, host, session,
    socket, workspace, tab, pane, kind; claim adds pid and command name). Logs
    never carry pane content; discovery never reads pane content.

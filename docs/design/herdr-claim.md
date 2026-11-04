@@ -125,10 +125,12 @@ Remuda does **not** own the claimed process.
 | screen snapshot (`tty.screen`) | `pane.read` (visible viewport, text) | Used by the stall fallback (herdr-claimed is a screen carrier) and by the 结构 (screen) view on `/s/:id`, which re-reads it every 2 s while shown; the journal never stores it. |
 | activity | `session.snapshot` agent status | herdr `working` → working, `blocked` → waiting on input, `idle`/`done` → idle. |
 
-There is **no journal transcript** in this cut: the journal holds lifecycle,
-agent-status and contact events only, and the session page shows the screen
-and the TTY. Binding a claimed claude pane to its native session JSONL is out
-of scope (§10).
+There is **no agent-output transcript** in this cut. The journal holds
+lifecycle, agent-status and contact events, plus a user-message row for each
+`instance send` (the PTY prompt queue records what was typed, as for any PTY
+instance); nothing the agent prints is journaled. The session page shows the
+live screen and the TTY. Binding a claimed claude pane to its native session
+JSONL is out of scope (§10).
 
 All calls go to the socket recorded in the claim, and every one names the
 claimed pane id: nothing reaches another pane, tab or workspace.
@@ -211,8 +213,10 @@ The Hub writes an audit row for every claim (`instance.claim`) and release
 (`instance.release`, including a close on a claimed instance): the device
 that did it, host, session, socket, workspace, tab, pane and kind; a claim also
 records the pid and command name. Logs and audit rows never carry pane
-content: discovery never calls `pane.read` or `agent.read`, and the only screen
-read is the stall fallback's, whose text is not logged.
+content. Discovery never calls `pane.read` or `agent.read`. The Node reads a
+claimed pane's visible screen in three places, never logging the text: once at
+claim and at each re-attach, only to size the TTY bridge (the widest visible
+line); for `tty.screen` (the stall fallback); and for the `/s/:id` screen view.
 
 ## 10. Threat model
 

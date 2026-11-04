@@ -19,6 +19,8 @@ export type HostStripChip = {
   offline: boolean;
   /** How long ago this host was last seen; null when it was never seen. */
   age: string | null;
+  /** Main's seat runs here (home.md §1 ②): the chip paints ★. */
+  main?: boolean;
 };
 
 export type HostStripModel = {
@@ -50,9 +52,15 @@ function lastSeenMs(host: HostStripHost): number {
 /**
  * Ordering: offline first (longest away first, since that is the one worth
  * noticing), then online hosts by label. An empty host list is not collapsed:
- * the component offers 「添加主机 ›」 instead.
+ * the component offers 「添加主机 ›」 instead. `mainHostId` marks the host Main
+ * runs on (★, home.md §1 ②, task home-main-extras); it is absent for a host
+ * list with no Main.
  */
-export function hostStrip(hosts: readonly HostStripHost[], nowMs: number): HostStripModel {
+export function hostStrip(
+  hosts: readonly HostStripHost[],
+  nowMs: number,
+  mainHostId: string | null = null,
+): HostStripModel {
   const online: HostStripChip[] = [];
   const offline: HostStripChip[] = [];
   for (const host of hosts) {
@@ -61,6 +69,7 @@ export function hostStrip(hosts: readonly HostStripHost[], nowMs: number): HostS
       label: host.label,
       offline: !hostIsOnline(host),
       age: null,
+      main: mainHostId !== null && host.id === mainHostId,
     };
     if (chip.offline) {
       chip.age = offlineAge(host.lastSeenAt, nowMs);

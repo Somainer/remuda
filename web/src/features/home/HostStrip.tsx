@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { useHub } from "../../lib/store";
+import { useHub, useMainEntry } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import { readPushStatus, type PushStatus } from "../../lib/push";
 import { useHomeFreshness } from "./freshness";
@@ -43,7 +43,10 @@ export function HostStrip({
   // but the band (and its 「空间 ▸」 toggle) must stay — it shows 「–」 rather
   // than guessing 添加主机 while the list may still be arriving.
   const unknown = freshness.state === "unknown";
-  const model = hostStrip(hub.hosts, nowMs);
+  // §1 ②: ★ marks the host Main's seat runs on (the same Main resolution
+  // every other Main surface reads).
+  const main = useMainEntry();
+  const model = hostStrip(hub.hosts, nowMs, main?.instance.hostId ?? null);
   // A fresh verdict is the only one without a Hub chip; recovering and
   // unreachable both name what the operator would tap. Nothing is claimed
   // while the snapshot is still unknown.
@@ -84,6 +87,11 @@ export function HostStrip({
               title={chip.label}
             >
               <span className={css.name}>{chip.label}</span>
+              {chip.main ? (
+                <span className={css.mainMark} data-testid="host-main-star" title="Main 所在主机" aria-label="Main 所在主机">
+                  ★
+                </span>
+              ) : null}
               {chip.offline ? (
                 <span className={css.offline}>
                   ┄离线{chip.age ? ` ${chip.age}` : ""}

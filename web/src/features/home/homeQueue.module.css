@@ -223,3 +223,68 @@
   border-radius: var(--radius-md);
   background: var(--bg-inset);
 }
+
+/* §6.4 交给 Main: the card's ⋯ trigger, and the one-item menu it opens. */
+.cardMore {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--touch);
+  height: var(--control-h-sm);
+  margin-left: var(--space-1);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cardMore:hover {
+  color: var(--fg-body);
+}
+
+.cardMore:disabled {
+  color: var(--fg-faint);
+  cursor: default;
+}
+
+.menuTitle {
+  margin: 0;
+  padding: var(--space-3) var(--space-3) 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.menu {
+  margin: 0;
+  padding: var(--space-2);
+  list-style: none;
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--touch);
+  margin: 0;
+  padding: 0 var(--space-3);
+  border: 0;
+  background: transparent;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.menuItem:disabled {
+  color: var(--fg-faint);
+  cursor: default;
+}

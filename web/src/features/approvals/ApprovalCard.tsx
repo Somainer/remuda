@@ -1,5 +1,6 @@
 import { memo, useState } from "react";
 import { Link } from "react-router-dom";
+import { Sheet } from "../../components/Sheet";
 import { RootTurnTag } from "../../components/RootTurnTag";
 import { RequestedByNote } from "../../components/RequestedByNote";
 import { StateDot } from "../../components/StateDot";
@@ -29,6 +30,7 @@ import {
   lastLines,
   type HomeCardKind,
 } from "../home/homeQueue";
+import type { HandOffOutcome } from "../home/handToMain";
 import css from "./decision.module.css";
 import homeCss from "../home/homeQueue.module.css";
 
@@ -49,6 +51,17 @@ export type HomeCardState = {
   inert?: boolean;
   /** The tty card's last screen lines (§4.2 终端提示); empty = request text. */
   screenLines?: readonly string[];
+  /** This card is Main's own pending interaction on its live chapter (§4.1). */
+  mainAsking?: boolean;
+  /**
+   * 交给 Main (home.md §6.4): rendered in the ⋯ menu of QUESTION and PLAN
+   * cards only, never on Main's own question, and absent when no LIVE Main
+   * resolves. The handler quotes the interaction to Main; it never answers
+   * it, and its promise settles to the command's real outcome.
+   */
+  handToMain?: ((item: Interaction) => Promise<HandOffOutcome>) | null;
+  /** 核对 for an unknown hand-off command (a GET, never a re-send). */
+  reconcileHandOff?: ((commandId: string) => Promise<HandOffOutcome>) | null;
 };
 
 /**
@@ -426,11 +439,16 @@ function sameHome(a: HomeCardState | undefined, b: HomeCardState | undefined): b
     && a.stale === b.stale
     && (a.inert ?? false) === (b.inert ?? false)
     && (a.screenLines ?? []).join("\n") === (b.screenLines ?? []).join("\n")
+    && (a.mainAsking ?? false) === (b.mainAsking ?? false)
+    && a.handToMain === b.handToMain
+    && a.reconcileHandOff === b.reconcileHandOff
   );
 }
 
 /** The kind label on a home card's first line (home.md §2.1 wireframe). */
-function homeLabel(item: Interaction, kind: HomeCardKind): string {
+function homeLabel(item: Interaction, kind: HomeCardKind, mainAsking = false): string {
+  // §4.1 item 1: Main's own question is pinned first and says so.
+  if (mainAsking) return "Main 在问你";
   if (kind === "approval") {
     return item.request.kind === "approval" ? `需要你授权 · ${item.request.title}` : "需要你授权";
   }
@@ -488,6 +506,97 @@ function lastLinesHead(text: string, count: number): string {
  * POST is in flight; the queue owns the receipt (「已提交」 / 「已在其他设备处理」),
  * and any other error is shown under the buttons, which re-enable.
  */
+/** The card's local hand-off state: idle, in flight, or the settled outcome. */
+type HandState = { kind: "idle" } | { kind: "sending" } | HandOffOutcome;
+
+/**
+ * 交给 Main's settled receipt/outcome. Only `accepted` reads 已交给 Main; the
+ * others name what actually happened (r2), and rejection/unknown offer the
+ * ⑨-style next step instead of a false success.
+ */
+const HAND_UNAVAILABLE_TEXT = "Main 已暂停或已结束，恢复后再交";
+
+function HandReceipt({
+  hand,
+  canRetry,
+  canReconcile,
+  onRetry,
+  onReconcile,
+}: {
+  hand: HandState;
+  /** A live Main still resolves, so the retry would target a real chapter. */
+  canRetry: boolean;
+  /** A reconcile handler is mounted. */
+  canReconcile: boolean;
+  onRetry: () => void;
+  onReconcile: (commandId: string) => void;
+}) {
+  if (hand.kind === "idle") return null;
+  if (hand.kind === "sending") {
+    return (
+      <p className={homeCss.hint} role="status" data-testid="home-card-hand-receipt" data-state="sending">
+        发送中…
+      </p>
+    );
+  }
+  if (hand.kind === "accepted") {
+    return (
+      <p className={homeCss.hint} role="status" data-testid="home-card-hand-receipt" data-state="accepted">
+        已交给 Main
+      </p>
+    );
+  }
+  if (hand.kind === "queued") {
+    return (
+      <p className={homeCss.hint} role="status" data-testid="home-card-hand-receipt" data-state="queued">
+        已排队 · 主机上线后送达
+      </p>
+    );
+  }
+  if (hand.kind === "rejected") {
+    return (
+      <p className={homeCss.hint} role="alert" data-testid="home-card-hand-receipt" data-state="rejected">
+        未送达{hand.reason ? ` · ${hand.reason}` : ""}{" "}
+        <button
+          type="button"
+          className={homeCss.chip}
+          data-testid="home-card-hand-retry"
+          disabled={!canRetry}
+          title={canRetry ? undefined : HAND_UNAVAILABLE_TEXT}
+          onClick={onRetry}
+        >
+          发送给当前 Main
+        </button>
+        {canRetry ? null : (
+          <span className={homeCss.hint} data-testid="home-card-hand-unavailable">
+            {HAND_UNAVAILABLE_TEXT}
+          </span>
+        )}
+      </p>
+    );
+  }
+  return (
+    <p className={homeCss.hint} role="status" data-testid="home-card-hand-receipt" data-state="unknown">
+      状态待确认{" "}
+      <button
+        type="button"
+        className={homeCss.chip}
+        data-testid="home-card-hand-reconcile"
+        disabled={!canReconcile || !hand.commandId}
+        title={canReconcile ? undefined : HAND_UNAVAILABLE_TEXT}
+        onClick={() => hand.commandId && onReconcile(hand.commandId)}
+      >
+        核对
+      </button>
+      {canReconcile ? null : (
+        <span className={homeCss.hint} data-testid="home-card-hand-unavailable">
+          {HAND_UNAVAILABLE_TEXT}
+        </span>
+      )}
+    </p>
+  );
+}
+
 function HomeDecision({
   view,
   home,
@@ -504,6 +613,44 @@ function HomeDecision({
   const answering = uiState === "answering";
   const paused = uiState === "paused";
   const inert = home.inert === true;
+  // §6.4 交给 Main: only a QUESTION or PLAN card carries it, never an
+  // approval and never Main's own question (r2), and it is absent when no
+  // LIVE Main resolves. A stale read greys the ⋯ like every other home
+  // control (§8).
+  const handMenu =
+    (kind === "question" || kind === "simple-question" || kind === "plan")
+    && home.mainAsking !== true
+    && home.handToMain != null;
+  const [menuOpen, setMenuOpen] = useState(false);
+  // The hand-off's settled outcome: 「已交给 Main」 is reserved for accepted
+  // (r2); sending, queued, rejected and unknown each say what is true.
+  const [hand, setHand] = useState<HandState>({ kind: "idle" });
+  /** The ⋯ is offered only before the first hand-off settles. */
+  const handTriggers = handMenu && (hand.kind === "idle" || hand.kind === "sending");
+  const runHand = () => {
+    const run = home.handToMain;
+    if (!run) return;
+    setMenuOpen(false);
+    setHand({ kind: "sending" });
+    void run(item).then(
+      (outcome) => setHand(outcome ?? { kind: "unknown", commandId: null }),
+      (reason: unknown) =>
+        setHand({
+          kind: "rejected",
+          reason: reason instanceof Error ? reason.message : String(reason),
+          commandId: null,
+        }),
+    );
+  };
+  const reconcileHand = (commandId: string) => {
+    const reconcile = home.reconcileHandOff;
+    if (!reconcile) return;
+    setHand({ kind: "sending" });
+    void reconcile(commandId).then(
+      (outcome) => setHand(outcome),
+      () => setHand({ kind: "unknown", commandId }),
+    );
+  };
   // §8: a stale queue greys every answer control; answering, paused and the
   // receipt keep them off too. Links stay live — they only navigate.
   const disabled = answering || paused || home.stale || inert || home.receipt !== null || !item.answerable;
@@ -589,19 +736,34 @@ function HomeDecision({
       data-interaction-id={item.id}
       data-kind={item.kind}
       data-home-kind={kind}
+      data-main-asking={home.mainAsking ? "1" : undefined}
       data-state={uiState}
       data-focus={focused ? "true" : "false"}
       data-receipt={home.receipt ?? undefined}
       data-stale={inert ? "1" : undefined}
     >
       <header className={homeCss.head}>
-        <span className={homeCss.label} title={homeLabel(item, kind)}>
-          {homeLabel(item, kind)}
+        <span className={homeCss.label} title={homeLabel(item, kind, home.mainAsking)}>
+          {homeLabel(item, kind, home.mainAsking)}
         </span>
         {where ? (
           <span className={homeCss.where} title={where}>
             {where}
           </span>
+        ) : null}
+        {handTriggers ? (
+          <button
+            type="button"
+            className={homeCss.cardMore}
+            data-testid="home-card-more"
+            aria-label="更多操作"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            disabled={home.stale || inert || answering}
+            onClick={() => setMenuOpen(true)}
+          >
+            ⋯
+          </button>
         ) : null}
       </header>
       {kind === "plan" && item.request.kind === "plan-review" ? (
@@ -647,6 +809,40 @@ function HomeDecision({
         <p className={css.planError} role="alert" data-testid="home-card-error">
           {submitError}
         </p>
+      ) : null}
+      <HandReceipt
+        hand={hand}
+        canRetry={home.handToMain != null}
+        canReconcile={home.reconcileHandOff != null}
+        onRetry={() => runHand()}
+        onReconcile={reconcileHand}
+      />
+      {handTriggers ? (
+        <Sheet
+          open={menuOpen}
+          onClose={() => setMenuOpen(false)}
+          labelledBy={`home-card-menu-title-${item.id}`}
+          testId="home-card-menu"
+          variant={home.placement === "phone" ? "sheet" : "popover"}
+        >
+          <h2 id={`home-card-menu-title-${item.id}`} className={homeCss.menuTitle}>
+            更多
+          </h2>
+          <ul className={homeCss.menu} role="menu">
+            <li>
+              <button
+                type="button"
+                role="menuitem"
+                className={homeCss.menuItem}
+                data-testid="home-card-hand-main"
+                disabled={home.stale || inert || hand.kind === "sending"}
+                onClick={() => runHand()}
+              >
+                {hand.kind === "sending" ? "交给 Main…" : "交给 Main"}
+              </button>
+            </li>
+          </ul>
+        </Sheet>
       ) : null}
     </article>
   );

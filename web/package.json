@@ -17,7 +17,8 @@
     "coverage:ui": "node ./scripts/coverage-ui.mjs",
     "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
     "preview": "vite preview",
-    "gen:api": "node ./scripts/gen-api.mjs"
+    "gen:api": "node ./scripts/gen-api.mjs",
+    "gen:secret-shapes": "node ./scripts/gen-secret-shapes.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",

@@ -13,6 +13,7 @@ import { TOP_LEVEL_WORKING } from "../features/home/glance";
 import { HostStrip } from "../features/home/HostStrip";
 import { scrollToQueue } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
+import { TodayCard } from "../features/home/TodayCard";
 import { HomeQueue } from "../features/home/HomeQueue";
 import { JustDone } from "../features/home/JustDone";
 import { WorkingList } from "../features/home/WorkingList";
@@ -169,6 +170,9 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
         {showMain && mainAside ? (
           <aside className={css.aside} aria-label="Main 与工作中" data-testid="sessions-aside">
             <MainCard placement="desktop" />
+            {/* ⑩ 「今天」 (home.md §2.2, §9): between ③/⑨ and ⑥, hidden when
+                Main has no wake-up. */}
+            <TodayCard />
             <WorkingList />
           </aside>
         ) : null}

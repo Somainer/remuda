@@ -479,9 +479,48 @@
    No options trigger renders in this variant. */
 .askRoot {
   flex-direction: row;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   min-height: var(--composer-row);
+}
+
+/* home.md §6.3 快捷提问: the chips take their own 32px row ABOVE the input,
+   only while the input has focus. The row scrolls sideways rather than
+   wrapping, so the dock keeps its one-line budget. */
+.askChips {
+  display: flex;
+  flex: 1 0 100%;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+
+.askChips::-webkit-scrollbar {
+  display: none;
+}
+
+.askChip {
+  flex: none;
+  height: var(--control-h-sm);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.askChip:hover {
+  color: var(--fg-body);
 }
 
 .askRoot .composer {

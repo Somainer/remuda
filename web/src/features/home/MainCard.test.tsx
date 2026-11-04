@@ -25,18 +25,36 @@ const resume = vi.fn();
 const reconcileSend = vi.fn();
 const eventsRead = vi.fn();
 const objectUpload = vi.fn();
+const wakesFake = vi.hoisted(() => ({ walks: [] as unknown[], loaded: true }));
 
 vi.mock("../../lib/store", () => ({
   useHub: () => hub,
   useMainEntry: () => main,
+  resolveMain: () => null,
   hubStore: {
     hostName: () => "devbox",
     send: (...args: unknown[]) => send(...args),
     resume: (...args: unknown[]) => resume(...args),
     reconcileSend: (...args: unknown[]) => reconcileSend(...args),
     refreshLineage: vi.fn().mockResolvedValue(null),
+    getRefreshHealth: () => ({ lastOkAt: 1, failingSince: null }),
+    subscribeRefreshHealth: () => () => undefined,
+    subscribe: () => () => undefined,
+    getSnapshot: () => hub,
   },
 }));
+
+vi.mock("../tasks/taskLedger", () => ({
+  useTaskLedger: () => ({ tasks: [], projectName: () => null }),
+}));
+
+vi.mock("./wakes", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./wakes")>();
+  return {
+    ...actual,
+    useMainWakes: () => ({ lineageId: "ins_main", wakes: wakesFake.walks, loaded: wakesFake.loaded }),
+  };
+});
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
@@ -94,6 +112,8 @@ beforeEach(() => {
   hub.instances = [];
   resetMainRepliesForTest();
   hub.connection = "live";
+  wakesFake.walks = [];
+  wakesFake.loaded = true;
   main = { instance: chapter(), lineageId: "ins_main" as Id, generation: 1, live: true, chapterIds: ["ins_main" as Id] };
   send.mockReset().mockResolvedValue(true);
   localStorage.clear();
@@ -495,5 +515,89 @@ describe("重试 in flight (r2 item 8)", () => {
     expect(action).toBeDisabled();
     await act(async () => settle(true));
     expect(screen.getByTestId("main-card-retry")).toBeEnabled();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* ⑩ wake-ups and ⑨ quick-ask chips (home.md §6.2, §6.3).              */
+/* ------------------------------------------------------------------ */
+
+function wake(overrides: Record<string, unknown> = {}) {
+  return {
+    wakeId: "wak_1",
+    lineageId: "ins_main",
+    name: "每日汇总",
+    text: "汇总",
+    trigger: { kind: "every", everySecs: 86400, startAt: null },
+    mode: "persistent",
+    notify: "always",
+    state: "active",
+    nextFireAt: "2026-11-04T09:00:00Z",
+    missedCount: 0,
+    createdAt: "2026-11-01T00:00:00Z",
+    updatedAt: "2026-11-01T00:00:00Z",
+    creator: { origin: "agent" },
+    ...overrides,
+  };
+}
+
+describe("⑩ the Main card's wake line", () => {
+  it("is absent when no wake-up can still fire", () => {
+    renderCard();
+    expect(screen.queryByTestId("main-wake-line")).toBeNull();
+  });
+
+  it("names the next fire and opens the sheet on a tap", () => {
+    wakesFake.walks = [wake()];
+    renderCard();
+    const line = screen.getByTestId("main-wake-line");
+    expect(line.textContent).toMatch(/^◷下次 \d{2}:\d{2} 每日汇总 · 共 1 个›$/);
+    expect(screen.queryByTestId("wakes-sheet")).toBeNull();
+    fireEvent.click(line);
+    expect(screen.getByTestId("wakes-sheet")).toBeInTheDocument();
+    expect(screen.getByTestId("wakes-row")).toHaveTextContent("每日汇总");
+  });
+
+  it("gives way to the 「今天」 card at ≥1440", () => {
+    // The aside query answers true: the right column owns ⑩.
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query.includes("1440px"),
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    })) as unknown as typeof window.matchMedia;
+    wakesFake.walks = [wake()];
+    renderCard();
+    expect(screen.queryByTestId("main-wake-line")).toBeNull();
+  });
+});
+
+describe("⑨ quick-ask chips on the 问 Main input", () => {
+  it("appear only on focus, and a tap fills the draft without sending", async () => {
+    renderCard("desktop");
+    const input = screen.getByTestId("composer-input");
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
+    fireEvent.focus(input);
+    const chips = screen.getAllByTestId("composer-suggestion");
+    // Fake node state: no interactions, so no number is invented (§0.3).
+    expect(chips.map((chip) => chip.textContent)).toEqual(["谁在等我", "昨晚跑完了什么", "哪些卡住了"]);
+    fireEvent.mouseDown(chips[0]);
+    fireEvent.click(chips[0]);
+    expect((input as HTMLTextAreaElement).value).toBe("谁在等我");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("lists 今天落地了什么 only for a seat holding land", () => {
+    main = {
+      instance: chapter({ grants: ["address-owner", "land"] }),
+      lineageId: "ins_main" as Id,
+      generation: 1,
+      live: true,
+      chapterIds: ["ins_main" as Id],
+    };
+    renderCard("desktop");
+    fireEvent.focus(screen.getByTestId("composer-input"));
+    expect(screen.getAllByTestId("composer-suggestion").map((chip) => chip.textContent)).toContain(
+      "今天落地了什么",
+    );
   });
 });

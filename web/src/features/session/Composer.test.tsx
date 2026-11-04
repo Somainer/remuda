@@ -1474,3 +1474,79 @@ describe("Composer ask variant (ma-main-ui 问 Main)", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 });
+
+describe("Composer ask suggestions (home.md §6.3)", () => {
+  const suggestions = [
+    { id: "who-waits", label: "谁在等我 2", text: "谁在等我" },
+    { id: "stuck", label: "哪些卡住了", text: "哪些卡住了" },
+  ];
+
+  it("shows the chips ONLY while the input has focus", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_ask_suggest" mobile={false} variant="ask" onSend={vi.fn()} suggestions={suggestions} />,
+    );
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
+    const area = screen.getByTestId("composer-input");
+    await user.click(area);
+    expect(screen.getByTestId("composer-suggestions")).toBeInTheDocument();
+    expect(screen.getAllByTestId("composer-suggestion").map((chip) => chip.textContent)).toEqual([
+      "谁在等我 2",
+      "哪些卡住了",
+    ]);
+    await user.click(screen.getByTestId("composer-bar"));
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
+  });
+
+  it("a tap fills the input and never sends", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    render(
+      <Composer instanceId="ins_ask_fill" mobile={false} variant="ask" onSend={onSend} suggestions={suggestions} />,
+    );
+    const area = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await user.click(area);
+    await user.click(screen.getAllByTestId("composer-suggestion")[0]);
+    expect(area.value).toBe("谁在等我");
+    expect(onSend).not.toHaveBeenCalled();
+    // The chips stay up: the tap kept focus in the input.
+    expect(screen.getByTestId("composer-suggestions")).toBeInTheDocument();
+  });
+
+  it("renders no chips without suggestions", async () => {
+    const user = userEvent.setup();
+    render(<Composer instanceId="ins_ask_none" mobile variant="ask" onSend={vi.fn()} />);
+    await user.click(screen.getByTestId("composer-input"));
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
+  });
+
+  it("never loses a typed draft: the chip goes in at the caret (r2)", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    render(
+      <Composer instanceId="ins_ask_keep" mobile={false} variant="ask" onSend={onSend} suggestions={suggestions} />,
+    );
+    const area = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await user.click(area);
+    await user.type(area, "看一下 ");
+    // The caret sits at the end of the typed text.
+    await user.click(screen.getAllByTestId("composer-suggestion")[0]);
+    expect(area.value).toBe("看一下 谁在等我");
+    expect(onSend).not.toHaveBeenCalled();
+    // The typed text survives in the persisted draft too.
+    expect(localStorage.getItem("runtime.draft.ins_ask_keep")).toBe("看一下 谁在等我");
+  });
+
+  it("appends at the caret when the draft continues after it (r2)", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_ask_caret" mobile={false} variant="ask" onSend={vi.fn()} suggestions={suggestions} />,
+    );
+    const area = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await user.click(area);
+    await user.type(area, "先问问然后再记一笔");
+    area.setSelectionRange(2, 2);
+    await user.click(screen.getAllByTestId("composer-suggestion")[1]);
+    expect(area.value).toBe("先问哪些卡住了问然后再记一笔");
+  });
+});

@@ -2,6 +2,7 @@ import type { Instance } from "../../types/instance";
 import type { DecisionOption, Interaction, InteractionAnswer } from "../../types/interaction";
 import type { Task } from "../../types/generated";
 import { HubHttpError } from "../../lib/httpError";
+import type { MainEntry } from "../../lib/store";
 import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { ownerBlockedTasks, type GlanceSource } from "./glance";
 import type { OwnerNotice } from "./notices";
@@ -102,7 +103,14 @@ export function lastLines(lines: readonly string[], count = 3): string[] {
 }
 
 export type HomeQueueCard =
-  | { type: "interaction"; id: string; entry: InboxQueueItem; kind: HomeCardKind }
+  | {
+      type: "interaction";
+      id: string;
+      entry: InboxQueueItem;
+      kind: HomeCardKind;
+      /** Main's own pending interaction on its live chapter (§4.1 item 1). */
+      mainAsking?: boolean;
+    }
   | {
       type: "task";
       id: string;
@@ -176,11 +184,16 @@ export function noticeCards(notices: readonly OwnerNotice[]): HomeQueueCard[] {
 }
 
 /**
- * Build the ④ queue (home.md §4.1). Main's question pin (home-main-extras)
- * is just an interaction here; 「告诉你」 cards come from `notices` and sit
- * after 任务待你, uncounted.
+ * Build the ④ queue (home.md §4.1). Main's own pending interactions on its
+ * live chapter come first, labelled 「Main 在问你」 and still counted exactly
+ * once (they are the same queue rows, moved, never duplicated). 「告诉你」
+ * cards come from `notices` and sit after 任务待你, uncounted.
  */
-export function deriveHomeQueue(source: GlanceSource, notices: readonly OwnerNotice[] = []): HomeQueue {
+export function deriveHomeQueue(
+  source: GlanceSource,
+  notices: readonly OwnerNotice[] = [],
+  main: MainEntry | null = null,
+): HomeQueue {
   const queue = deriveInboxQueue({
     interactions: [...source.interactions],
     instances: [...source.instances],
@@ -189,9 +202,22 @@ export function deriveHomeQueue(source: GlanceSource, notices: readonly OwnerNot
     deviceId: source.deviceId,
     nowMs: source.nowMs,
   });
-  const interactionCards: HomeQueueCard[] = [...queue]
+  const allInteractionCards: HomeQueueCard[] = [...queue]
     .sort((a, b) => byRecency(a.item, b.item))
     .map((entry) => ({ type: "interaction", id: entry.item.id, entry, kind: homeCardKind(entry.item) }));
+  // §4.1 item 1: Main's live chapter's own pending interactions lead the
+  // queue. Order within each group stays the inbox order (newest first).
+  const mainChapterId = main?.live ? main.instance.id : null;
+  const asking: HomeQueueCard[] = [];
+  const rest: HomeQueueCard[] = [];
+  for (const card of allInteractionCards) {
+    if (mainChapterId !== null && card.type === "interaction" && card.entry.item.instanceId === mainChapterId) {
+      asking.push({ ...card, mainAsking: true });
+    } else {
+      rest.push(card);
+    }
+  }
+  const interactionCards = [...asking, ...rest];
   const taskCards: HomeQueueCard[] = ownerBlockedTasks(source.tasks, source.instances, queue).map((task) => ({
     type: "task",
     id: task.id,

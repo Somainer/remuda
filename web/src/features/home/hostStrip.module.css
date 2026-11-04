@@ -85,6 +85,15 @@
   color: var(--attention-fg);
 }
 
+/* ★ Main's host (home.md §1 ②). It is the attention voice — Main is the seat
+   the owner talks to — never a status colour. */
+.mainMark {
+  flex: none;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  line-height: 1;
+}
+
 .trailing {
   flex: none;
   display: flex;

@@ -215,3 +215,80 @@ it("mounts the ④ queue in the main column and hides it while the list search h
   await screen.findByTestId("session-list");
   expect(screen.queryByTestId("home-queue")).toBeNull();
 });
+
+/**
+ * [r3 item 3] The same tap, driven THROUGH mapInstance: a raw wire row carries
+ * `parentInstanceId`, and the mapped `parent` is what the board's child rule
+ * reads. Before the mapping every row read as a root, so the child never
+ * appeared under a rank filter.
+ */
+it("maps parentInstanceId and filters the rank-tap board through mapInstance", async () => {
+  const host = {
+    ...mockDb.hosts[0],
+    id: "host-wire",
+    workspaces: [{ workspaceId: "wsp-wire", hostId: "host-wire", root: "/home/dev/ws" }],
+  };
+  const wire = (instanceId: string, parentInstanceId: string | null) => ({
+    instanceId,
+    hostId: "host-wire",
+    workspaceId: "wsp-wire",
+    kind: "claude",
+    driver: "shell-pty",
+    lifecycle: "running",
+    activity: "working",
+    connectivity: "connected",
+    createdAt: "2026-10-30T09:00:00Z",
+    updatedAt: "2026-10-30T10:00:00Z",
+    title: instanceId,
+    journalId: `obj_${instanceId}`,
+    durableSeq: "1",
+    exit: { state: "not-applicable" },
+    parentInstanceId,
+  });
+  const records = [wire("ins_wire_parent", null), wire("ins_wire_child", "ins_wire_parent")];
+  const realFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+    const url = String(input);
+    if (/\/v1\/instances(\?|$)/.test(url)) {
+      return Response.json({ items: records, nextCursor: null });
+    }
+    return Response.json({});
+  });
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(glance({ working: 2 }));
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+
+  try {
+    await hubStore.bootstrap();
+    await hubStore.refresh();
+    await hubStore.refreshGlance();
+    const mapped = hubStore.getSnapshot().instances;
+    expect(mapped.find((row) => row.id === "ins_wire_parent")?.parent).toBeNull();
+    expect(mapped.find((row) => row.id === "ins_wire_child")?.parent?.instanceId).toBe(
+      "ins_wire_parent",
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/sessions?scope=all"]}>
+        <SessionsPage />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("session-list");
+    // Unfiltered: the child is not a plain desktop row.
+    expect(screen.getAllByTestId("board-card")).toHaveLength(1);
+    // The ● tap counts the owner's world (child included) and the board now
+    // shows exactly those rows.
+    await userEvent.click(await screen.findByTestId("glance-working"));
+    await waitFor(() => expect(screen.getAllByTestId("board-card")).toHaveLength(2));
+  } finally {
+    vi.stubGlobal("fetch", realFetch);
+  }
+});

@@ -46,7 +46,12 @@ export type Instance = EntityMeta & {
   capabilities: CapabilitySnapshot;
   ownerFence: U64;
   activeRunIds: Id[];
-  parent: { instanceId: Id; runId: Id; commandId: Id } | null;
+  /**
+   * Creator edge (home.md §3.1 / §5.3). `instanceId` is the Hub's stamped
+   * `parentInstanceId`; `runId`/`commandId` are only known on optimistic
+   * client rows (a local resume), so a wire row carries nulls.
+   */
+  parent: { instanceId: Id; runId: Id | null; commandId: Id | null } | null;
   journalId: Id;
   durableSeq: U64;
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;

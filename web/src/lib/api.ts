@@ -345,7 +345,13 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     capabilities,
     ownerFence: "1",
     activeRunIds: [],
-    parent: null,
+    // home-glance-d060 r3 item 3: the Hub stamps the creator instance on every
+    // Agent create; without this mapping every row read as a root and the
+    // child/rank rules were dead code.
+    parent:
+      typeof rec.parentInstanceId === "string" && rec.parentInstanceId
+        ? { instanceId: rec.parentInstanceId as Id, runId: null, commandId: null }
+        : null,
     journalId: rec.journalId as Id,
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },

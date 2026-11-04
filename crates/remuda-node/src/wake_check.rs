@@ -1246,6 +1246,62 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// r3: with no workspace id, a check that names the lineage's chapter on
+    /// this Node runs in the workspace that instance runs in (here the second
+    /// one, so a first-workspace fallback would show), in the given cwd.
+    #[tokio::test]
+    async fn a_chapter_instance_id_resolves_its_own_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let extra = root.path().join("extra");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(extra.join("src")).unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(project.clone())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf())
+            .with_workspaces(vec![extra.clone()]);
+        let node = DevNode::new(&config).unwrap();
+        let workspaces = node.workspaces().unwrap();
+        let second = workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == extra.canonicalize().unwrap())
+            .or_else(|| workspaces.get(1))
+            .unwrap()
+            .meta
+            .id
+            .clone();
+        assert_ne!(workspaces[0].meta.id, second, "not the first workspace");
+        let created = crate::transport::hubnode::dispatch_method(
+            &node,
+            "instance.create",
+            serde_json::json!({"spec": {"workspaceId": second, "driver": "claude-print"}}),
+        )
+        .await
+        .unwrap();
+        let instance = created["instance"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            created["instance"]["workspaceId"],
+            serde_json::json!(second)
+        );
+        let result = crate::transport::hubnode::dispatch_method(
+            &node,
+            METHOD_WAKE_CHECK,
+            serde_json::json!({"runId": "wrn_7", "command": "pwd; exit 2", "timeoutSecs": 30,
+                               "instanceId": instance, "cwd": "src"}),
+        )
+        .await
+        .unwrap();
+        let result: WakeCheckResult = serde_json::from_value(result).unwrap();
+        assert_eq!(result.exit_code, Some(2), "{result:?}");
+        assert_eq!(
+            Path::new(result.stdout.trim()).canonicalize().unwrap(),
+            extra.join("src").canonicalize().unwrap()
+        );
+        node.shutdown().await.unwrap();
+    }
+
     #[test]
     fn the_environment_is_the_named_subset_and_the_run_variables() {
         let node: BTreeMap<String, String> = [

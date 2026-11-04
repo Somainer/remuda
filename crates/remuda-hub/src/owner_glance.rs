@@ -671,10 +671,10 @@ fn render_owner_glance(
         .count();
     let need_you = live_pending.len() + blocked_without_interaction;
 
-    let mut done_unseen = 0;
     let mut working = 0;
     let mut done_today = 0;
     let mut working_rows: Vec<&ScopeInstance> = Vec::new();
+    let mut done_rows: Vec<&ScopeInstance> = Vec::new();
     for instance in &snapshot.instances {
         if instance.done_today {
             done_today += 1;
@@ -683,9 +683,21 @@ fn render_owner_glance(
             working += 1;
             working_rows.push(instance);
         } else if rank_done_unseen(instance) && shows_done_unseen(instance, &snapshot) {
-            done_unseen += 1;
+            done_rows.push(instance);
         }
     }
+    // ◉ and ⑤ are one set (home.md §7): the count is these rows, and ⑤ lists
+    // their ids, newest first (deterministic id tiebreak).
+    done_rows.sort_by(|a, b| {
+        (b.updated_at.as_str(), a.instance_id.as_str())
+            .cmp(&(a.updated_at.as_str(), b.instance_id.as_str()))
+    });
+    let done_unseen = u32::try_from(done_rows.len()).unwrap_or(u32::MAX);
+    let done_unseen_ids: Vec<String> = done_rows
+        .iter()
+        .take(OWNER_GLANCE_ROW_CAP)
+        .map(|row| row.instance_id.clone())
+        .collect();
 
     // Waiting rows: one per SESSION IN THE OWNER SCOPE with a live pending
     // interaction, newest interaction first (the inbox queue's order). The
@@ -804,6 +816,7 @@ fn render_owner_glance(
             working: u32::try_from(working).unwrap_or(u32::MAX),
             done_today: u32::try_from(done_today).unwrap_or(u32::MAX),
         },
+        done_unseen_ids,
         more: GlanceMore {
             waiting: u32::try_from(waiting_total.saturating_sub(waiting.len())).unwrap_or(u32::MAX),
             working: u32::try_from(working_total.saturating_sub(working_out.len()))
@@ -964,6 +977,38 @@ mod tests {
         // ◉ counts the Main chapter and the ordinary session, never the failed
         // turn nor Main's fenced predecessor (§7).
         assert_eq!(glance.counts.done_unseen, 2);
+        // ⑤ lists exactly that set (same updated_at: id order).
+        assert_eq!(glance.done_unseen_ids, ["ins_opened", "ins_unseen"]);
+    }
+
+    /// [r4 item 3] ⑤ lists exactly what ◉ counts: newest first, a child
+    /// included, capped at the row cap while the count stays the total.
+    #[test]
+    fn done_unseen_ids_are_the_counted_set_newest_first() {
+        let mut rows = Vec::new();
+        for index in 0..(OWNER_GLANCE_ROW_CAP + 2) {
+            let mut row = instance(&format!("ins_{index:03}"), "running", "idle");
+            row.unseen = true;
+            row.updated_at = format!("2026-10-29T00:{:02}:00.000Z", index % 60);
+            rows.push(row);
+        }
+        // Not ◉: seen, or still working.
+        rows.push(instance("ins_seen", "running", "idle"));
+        let mut working = instance("ins_working", "running", "working");
+        working.unseen = true;
+        rows.push(working);
+        let glance = render(snapshot(rows));
+        let total = OWNER_GLANCE_ROW_CAP + 2;
+        assert_eq!(glance.counts.done_unseen as usize, total);
+        assert_eq!(glance.done_unseen_ids.len(), OWNER_GLANCE_ROW_CAP);
+        let newest = format!("ins_{:03}", total - 1);
+        assert_eq!(glance.done_unseen_ids[0], newest);
+        assert!(
+            !glance
+                .done_unseen_ids
+                .iter()
+                .any(|id| id == "ins_seen" || id == "ins_working")
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ const GLANCE: OwnerGlance = {
   generatedAt: "2026-10-30T10:09:00.000Z",
   timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
   counts: { needYou: 2, doneUnseen: 1, working: 3, doneToday: 4 },
+  doneUnseenIds: ["ins_done"],
   waiting: [
     { instanceId: "ins_wait", kind: "approval", headline: "approval: run it?", title: "waiting" },
   ],

@@ -15679,6 +15679,13 @@
           "$ref": "#/$defs/OwnerGlanceCounts",
           "description": "The §5.1/§5.2 count segments."
         },
+        "doneUnseenIds": {
+          "description": "The sessions `counts.doneUnseen` counted (◉), newest first, at most\n[`OWNER_GLANCE_ROW_CAP`]. ⑤ 刚完成 lists exactly these, so the section\nand the segment are one set at every width (home.md §7).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "generatedAt": {
           "description": "When the glance was rendered (UTC RFC3339).",
           "type": "string"
@@ -15711,6 +15718,7 @@
         "generatedAt",
         "timezoneOffsetMinutes",
         "counts",
+        "doneUnseenIds",
         "waiting",
         "working",
         "more"

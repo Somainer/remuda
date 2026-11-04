@@ -4,7 +4,6 @@ import type { Task } from "../../types/generated";
 import { resolveMain } from "../../lib/store";
 import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
 import { liveChildParents, rank } from "../mobile/homeRows";
-import { dispatchedChild } from "../../lib/dispatched";
 
 /**
  * The ① count row (home.md §5.2). Everything here is pure so the phone head,
@@ -27,12 +26,6 @@ export type GlanceSource = {
   deviceId: string;
   nowMs: number;
 };
-
-/**
- * The rows the unfiltered `/sessions` board lists: every session except the
- * ones an Agent dispatched (`dispatchedChild`); a resume stays on the board.
- */
-export const TOP_LEVEL_WORKING = (instance: Instance): boolean => !dispatchedChild(instance);
 
 export type GlanceCounts = {
   /** §5.1 N = A (interactions really waiting on the owner) + B (owner-blocked tasks with no such interaction). */
@@ -61,15 +54,7 @@ export type GlanceCounts = {
  * Notices and failed turns are deliberately absent: a failed turn is a queue
  * card, never ◉.
  */
-export function glanceCounts(
-  source: GlanceSource,
-  /**
-   * The instances the calling surface actually LISTS for 工作中 (default: all
-   * of them). Desktop passes top-level sessions; the phone ledger includes
-   * child sessions, so it keeps the default.
-   */
-  workingInstances: readonly Instance[] = source.instances,
-): GlanceCounts {
+export function glanceCounts(source: GlanceSource): GlanceCounts {
   const queue = deriveInboxQueue({
     interactions: [...source.interactions],
     instances: [...source.instances],
@@ -84,7 +69,7 @@ export function glanceCounts(
   const seen = new Set<string>();
   let working = 0;
   let doneUnseen = 0;
-  for (const instance of workingInstances) {
+  for (const instance of source.instances) {
     if (seen.has(instance.id)) continue;
     seen.add(instance.id);
     const homeRank = rank(instance, childLive.has(instance.id));

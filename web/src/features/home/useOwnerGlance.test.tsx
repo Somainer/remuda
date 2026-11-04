@@ -16,6 +16,7 @@ const GLANCE: OwnerGlance = {
   generatedAt: "2026-10-30T10:09:00.000Z",
   timezoneOffsetMinutes: 0,
   counts: { needYou: 1, doneUnseen: 0, working: 2, doneToday: 3 },
+  doneUnseenIds: [],
   waiting: [],
   working: [],
   more: { waiting: 0, working: 0 },

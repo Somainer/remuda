@@ -55,6 +55,7 @@ function glanceOf(ids: string[], working = ids.length): OwnerGlance {
     generatedAt: "2026-10-30T10:09:00.000Z",
     timezoneOffsetMinutes: 0,
     counts: { needYou: 0, doneUnseen: 0, working, doneToday: 0 },
+    doneUnseenIds: [],
     waiting: [],
     working: rows,
     more: { waiting: 0, working: Math.max(0, working - ids.length) },

@@ -1064,6 +1064,26 @@ export function seenUnseen(turnEndSeq?: U64, seenSeq?: U64): boolean {
   return turnEndSeq != null && BigInt(turnEndSeq) > (seenSeq == null ? -1n : BigInt(seenSeq));
 }
 
+/**
+ * The glance without `ids` in its ◉ set: the list and `counts.doneUnseen`
+ * shrink together, so ⑤ and ◉ stay one set (home.md §7). Returns `glance`
+ * itself when none of them is listed.
+ */
+export function withoutDoneUnseen<G extends { counts: { doneUnseen: number }; doneUnseenIds?: string[] }>(
+  glance: G,
+  ids: ReadonlySet<string>,
+): G {
+  const listed = glance.doneUnseenIds;
+  if (!Array.isArray(listed) || ids.size === 0) return glance;
+  const kept = listed.filter((id) => !ids.has(id));
+  if (kept.length === listed.length) return glance;
+  return {
+    ...glance,
+    doneUnseenIds: kept,
+    counts: { ...glance.counts, doneUnseen: Math.max(0, glance.counts.doneUnseen - (listed.length - kept.length)) },
+  };
+}
+
 function maxSeq(a?: U64, b?: U64): U64 | undefined {
   if (a == null) return b;
   if (b == null) return a;
@@ -1709,6 +1729,7 @@ class HubStore {
         glanceFailed: false,
       });
       this.glanceIndex = null;
+      this.seenMarks.clear();
     }
     this.disposeOutboxForAuthChange();
   }
@@ -6136,7 +6157,10 @@ class HubStore {
         ? { instances: [], glance: null, glanceAt: null, glanceFailed: false }
         : {}),
     });
-    if (identityChanged) this.glanceIndex = null;
+    if (identityChanged) {
+      this.glanceIndex = null;
+      this.seenMarks.clear();
+    }
     // Gate 49 item 6 (low): recheck the issuing epoch AFTER every
     // publication-bearing helper too — a subscriber invoked synchronously by
     // the emit above (or the earlier applyAuthIdentityChange) may have logged
@@ -8294,14 +8318,23 @@ class HubStore {
     const optimistic = row && BigInt(durableSeq) > BigInt(row.durableSeq) ? row.durableSeq : durableSeq;
     const previous = row?.seenSeq;
     this.applySeenView({ instanceId, unseen: false, seenSeq: optimistic });
+    // ◉ and ⑤ read one glance: the mark leaves both at once, and no glance
+    // read that began before the write commits may paint it back.
+    this.seenMarks.set(instanceId, Number.POSITIVE_INFINITY);
+    this.stripGlanceNow();
     let view: SeenView;
     try {
       view = await api.instanceSeen(instanceId, durableSeq, options.visible);
       this.applySeenView(view);
     } catch (error) {
+      this.seenMarks.delete(instanceId);
       this.rollbackSeen(instanceId, optimistic, previous);
       throw error;
     }
+    // Committed: a read that STARTS after now is the Hub's truth. A still-
+    // unseen answer (a newer turn end) needs no strip at all.
+    if (view.unseen) this.seenMarks.delete(instanceId);
+    else this.seenMarks.set(instanceId, this.glanceReadSeq);
     // A turn end that committed just before this report's lease reads unseen
     // in the answer although the page is showing it: cover it once, at the
     // answer's own turn end (the Hub clamps to its journal). Bounded — the
@@ -9053,6 +9086,36 @@ class HubStore {
   private glanceInFlight: Promise<void> | null = null;
 
   /**
+   * r4 item 3: seen writes the glance has not caught up with yet, as instance
+   * id → the glance-read sequence at the write's commit (∞ while it is in
+   * flight). A glance read that began at or before that sequence predates the
+   * commit, so the id is stripped from its ◉ list AND its count together; the
+   * first read that began after it is the Hub's truth and retires the mark.
+   */
+  private seenMarks = new Map<string, number>();
+  private glanceReadSeq = 0;
+
+  private stripSeen(
+    glance: NonNullable<HubState["glance"]>,
+    readSeq: number,
+  ): NonNullable<HubState["glance"]> {
+    const drop = new Set<string>();
+    for (const [id, committedAt] of this.seenMarks) {
+      if (readSeq <= committedAt) drop.add(id);
+      else this.seenMarks.delete(id);
+    }
+    return withoutDoneUnseen(glance, drop);
+  }
+
+  /** Apply the pending marks to the glance already painted. */
+  private stripGlanceNow() {
+    const glance = this.state.glance;
+    if (!glance) return;
+    const next = withoutDoneUnseen(glance, new Set(this.seenMarks.keys()));
+    if (next !== glance) this.emit({ glance: next });
+  }
+
+  /**
    * home-glance-d060: one `GET /v1/owner/glance` per poll. Coalesced — every
    * mounted home reader shares the in-flight read — and epoch-guarded, so a
    * response that lands after logout cannot repaint the next identity's row.
@@ -9069,6 +9132,7 @@ class HubStore {
     const boot = this.bootGen;
     const ext = this.extEpoch;
     const live = () => boot === this.bootGen && ext === this.extEpoch;
+    const readSeq = ++this.glanceReadSeq;
     const job = (async () => {
       try {
         // The owner's local-day offset, east of UTC (the Hub clamps it).
@@ -9085,7 +9149,7 @@ class HubStore {
           this.emit({ glanceFailed: true });
           return;
         }
-        this.emit({ glance, glanceAt: Date.now(), glanceFailed: false });
+        this.emit({ glance: this.stripSeen(glance, readSeq), glanceAt: Date.now(), glanceFailed: false });
       } catch {
         if (!live()) return;
         this.emit({ glanceFailed: true });

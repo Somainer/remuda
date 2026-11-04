@@ -1309,15 +1309,21 @@ function createMockApi(): HubApi {
           headline: mockDb.summaries.get(row.id) ?? mockDb.titles.get(row.id) ?? "运行中",
           taskId: row.taskId ?? null,
         }));
+      // ◉ and ⑤ are one set: the count is this list's length (newest first).
+      const doneUnseenIds = mockDb.instances
+        .filter((row) => row.unseen === true)
+        .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0) || (a.id < b.id ? -1 : 1))
+        .map((row) => row.id as string);
       return {
         generatedAt: new Date().toISOString(),
         timezoneOffsetMinutes: tzOffsetMinutes,
         counts: {
           needYou: pending.length,
-          doneUnseen: mockDb.instances.filter((row) => row.unseen === true).length,
+          doneUnseen: doneUnseenIds.length,
           working: working.length,
           doneToday: 0,
         },
+        doneUnseenIds,
         waiting,
         working,
         more: { waiting: 0, working: 0 },

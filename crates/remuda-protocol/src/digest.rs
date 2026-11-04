@@ -287,6 +287,10 @@ pub struct OwnerGlance {
     pub timezone_offset_minutes: i32,
     /// The §5.1/§5.2 count segments.
     pub counts: OwnerGlanceCounts,
+    /// The sessions `counts.doneUnseen` counted (◉), newest first, at most
+    /// [`OWNER_GLANCE_ROW_CAP`]. ⑤ 刚完成 lists exactly these, so the section
+    /// and the segment are one set at every width (home.md §7).
+    pub done_unseen_ids: Vec<String>,
     /// Owner-scope sessions waiting on someone, at most
     /// [`OWNER_GLANCE_ROW_CAP`].
     pub waiting: Vec<OwnerGlanceRow>,

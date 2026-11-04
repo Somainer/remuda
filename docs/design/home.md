@@ -378,7 +378,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 
 **各段计数。** 计数分两种范围，**`needYou` 不分范围**：
 - `needYou`（§5.1 N）= **所有** owner 能看到的 `state=pending` 且截止时间未过的交互数 A（与 ④ 的标题、OS 角标同一来源：`/v1/interactions` 合并页），加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计；去重覆盖整个 fleet）。只有 `waiting`/`working` 的**行**按上面的 owner 范围收窄。§5.1 要求 ①、④ 标题和角标是同一个定义，所以三者同数；一条落在私有血缘上的待办会计入 ① 和 ④，但不会出现在 glance 的行里。
-- `doneUnseen`（§5.2 ◉）= 范围内按 §3.1 排在第 2 档（idle、owner 未看、最近回合未失败）的会话数；Main 血缘内只有 `resolveMain` 指向的现行章节计入（§7）；
+- `doneUnseen`（§5.2 ◉）= 范围内按 §3.1 排在第 2 档（idle、owner 未看、最近回合未失败）的会话数；Main 血缘内只有 `resolveMain` 指向的现行章节计入（§7）。被计入的会话 id 同时放在 `doneUnseenIds`（从新到旧，`updatedAt` 再按 id，至多 50 个），⑤ 正好列这一组；
 - `working`（§5.2 ●）= 范围内按 §3.1 排在第 3 档（live 且 activity 为 working/draining，或 activity 未分类）的会话数，子会话也计；
 - `doneToday`（§5.2 今日完成）= 范围内「最近一次结算的根回合结束时间」（`instances.turn_end_at`，与 ◉ 的 `turn_end_seq` 同一事务写入）落在 owner 本地日内的会话数。选根回合而不选任务，因为任务行没有完成时间戳。客户端用 `tzOffsetMinutes`（`-Date().getTimezoneOffset()`，UTC 以东分钟数，服务端夹到 ±14 h）告诉 Hub 本地日从哪开始。
 
@@ -450,10 +450,11 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - **本地与其他设备：** 本设备乐观更新。其他设备在下一个轮询周期（`GET /v1/instances`）里看到 ◉ 消失。
 - **恢复与章节：** 恢复出来的实例、以及 Main 的后继章节都是新的实例 id，没有 seen 行；它们要等自己的回合结束之后才可能出现 ◉。首页只对 Main 的现行章节显示 ◉。
 - **⑤ 刚完成：**
-  - 手机最多 3 行，桌面最多 3 个行内项，超出写成「+N」；
+  - 列的**正好是 ◉ 计数的那一组**：owner glance（§5.3）的 `doneUnseenIds`，从新到旧，标题数字就是 `counts.doneUnseen`。手机和桌面读同一组，桌面不再另外去掉子会话，也不在实例列表上再推一遍（实例列表比 owner 范围大）；
+  - 手机最多 3 行，桌面最多 3 个行内项，超出写成「+N」。`doneUnseenIds` 至多 50 个，计数照常是总数，展开后超出列表的部分写成不可点的「+N」；
   - 行标题加粗，用 ◉ 标记；
-  - 操作是「打开」（同时标为已看）、「标为已看」、「全部看过」；
-  - 没有 ◉ 的行时，整段隐藏。
+  - 操作是「打开」（同时标为已看）、「标为已看」、「全部看过」。本设备乐观更新：标为已看的行同时离开列表和 ◉ 计数，在 seen 写入提交之前就已发出的 glance 读取也不会把它画回来；
+  - 没有 ◉ 的行时、glance 还没到或已过期时，整段隐藏。
 
 ## 8 新鲜度
 

@@ -44,13 +44,20 @@ const hub = {
   answering: {} as Record<string, true>,
   connection: "live",
   // home-glance-d060: ① reads this, never the instance list.
-  glance: null as { counts: { needYou: number; doneUnseen: number; working: number; doneToday: number } } | null,
+  glance: null as {
+    counts: { needYou: number; doneUnseen: number; working: number; doneToday: number };
+    doneUnseenIds?: string[];
+  } | null,
 };
 
-/** The owner glance the row's ① reads (the Hub's numbers, verbatim). */
-function setGlance(counts: { needYou?: number; doneUnseen?: number; working?: number } = {}) {
+/** The owner glance the row's ① and ⑤ read (the Hub's numbers, verbatim). */
+function setGlance(
+  counts: { needYou?: number; doneUnseen?: number; working?: number } = {},
+  doneUnseenIds: string[] = [],
+) {
   hub.glance = {
     counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...counts },
+    doneUnseenIds,
   };
 }
 
@@ -751,6 +758,8 @@ describe("① 工作中 filter and the group header", () => {
 describe("⑤ 刚完成", () => {
   it("lists the unseen finished rows under the queue", async () => {
     hub.instances = [row("ins-done", { activity: known("idle"), unseen: true })];
+    // ⑤ lists the glance's ◉ set, not a re-derivation over the instances.
+    setGlance({ doneUnseen: 1 }, ["ins-done"]);
     renderHome();
     const section = await screen.findByTestId("home-just-done");
     expect(section).toHaveTextContent("title ins-done");

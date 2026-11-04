@@ -7094,6 +7094,7 @@
           "generatedAt",
           "timezoneOffsetMinutes",
           "counts",
+          "doneUnseenIds",
           "waiting",
           "working",
           "more"

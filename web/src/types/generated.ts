@@ -3512,6 +3512,7 @@ export type OutstandingWork = ({
 /** `GET /v1/owner/glance`: the owner's world as one read-only projection — Main's lineage subtree plus the sessions the owner opened by hand. */
 export type OwnerGlance = ({
   "counts": OwnerGlanceCounts;
+  "doneUnseenIds": (((string))[]);
   "generatedAt": (string);
   "more": GlanceMore;
   "timezoneOffsetMinutes": (number);

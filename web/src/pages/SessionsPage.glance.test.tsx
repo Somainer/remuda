@@ -32,10 +32,11 @@ function glance(counts: Partial<OwnerGlance["counts"]> = {}): OwnerGlance {
     generatedAt: "2026-10-30T10:09:00.000Z",
     timezoneOffsetMinutes: 0,
     counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...counts },
+    doneUnseenIds: [],
     waiting: [],
     working: [],
     more: { waiting: 0, working: 0 },
-  } as unknown as OwnerGlance;
+  } as OwnerGlance;
 }
 
 it("paints the owner glance's 工作中 count, and the rank tap shows the same rows it counted", async () => {
@@ -168,10 +169,15 @@ it("mounts ⑤ under the queue", async () => {
   vi.spyOn(api, "interactionList").mockResolvedValue([]);
   vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
   vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue({
+    ...glance({ doneUnseen: 1 }),
+    doneUnseenIds: ["ins-done"],
+  });
   vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
   vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
   await hubStore.bootstrap();
   await hubStore.refresh();
+  await hubStore.refreshGlance();
 
   render(
     <MemoryRouter initialEntries={["/sessions"]}>

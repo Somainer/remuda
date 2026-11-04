@@ -45,6 +45,7 @@ function glance(overrides: Partial<OwnerGlance["counts"]> = {}): OwnerGlance {
     generatedAt: "2026-10-31T08:00:00.000Z",
     timezoneOffsetMinutes: 480,
     counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...overrides },
+    doneUnseenIds: [],
     waiting: [],
     working: [],
     more: { waiting: 0, working: 0 },

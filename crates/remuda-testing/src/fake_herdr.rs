@@ -1031,6 +1031,9 @@ struct State {
     /// `fake.set_pane_process`, so `pane.process_info` can report a real pid
     /// the test controls.
     pane_process: HashMap<String, (u32, String)>,
+    /// D-062 r2: per-pane shell pid override (`fake.set_pane_process` with
+    /// `shell_pid`), so a claim test can replace the pane's shell.
+    pane_shell: HashMap<String, u32>,
     /// JSONL append target recording the `env` map every `workspace.create`
     /// and `pane.split` actually received — the only place a driver test can
     /// assert on the pane environment the launch produced (the recipe's
@@ -1094,6 +1097,7 @@ impl State {
             server_generation: 1,
             call_log: None,
             pane_process: HashMap::new(),
+            pane_shell: HashMap::new(),
         }
     }
 
@@ -1392,6 +1396,13 @@ fn set_pane_process(st: &mut State, params: &Value) -> Result<Value, (&'static s
         .unwrap_or("process")
         .to_string();
     st.pane_process.insert(pane_id.to_string(), (pid, name));
+    if let Some(shell) = params
+        .get("shell_pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        st.pane_shell.insert(pane_id.to_string(), shell);
+    }
     ok()
 }
 
@@ -1439,6 +1450,7 @@ fn handle_rpc(
         "fake.clear_pane_process" => {
             if let Some(pane_id) = req.params.get("pane_id").and_then(Value::as_str) {
                 st.pane_process.remove(pane_id);
+                st.pane_shell.remove(pane_id);
             }
             ok()
         }
@@ -2017,11 +2029,12 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
             argv: Some(vec!["fake-herdr".into()]),
         }]
     };
+    let shell_pid = st.pane_shell.get(&pane_id).copied().unwrap_or(4242);
     serde_json::to_value(PaneProcessInfoResult {
         kind: "pane_process_info".into(),
         process_info: Some(PaneProcessInfo {
             pane_id,
-            shell_pid: Some(4242),
+            shell_pid: Some(shell_pid),
             foreground_process_group_id: foreground_processes.first().map(|process| process.pid),
             foreground_processes,
         }),

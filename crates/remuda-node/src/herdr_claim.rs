@@ -27,11 +27,11 @@ use remuda_herdr::{
     ReadSource, SessionSnapshot,
 };
 use remuda_protocol::hubnode::{
-    HERDR_CLAIM_AMBIGUOUS, HERDR_CLAIM_CONFLICT, HERDR_CLAIM_INVALID, HERDR_CLAIM_OWN_SESSION,
-    HERDR_UNREACHABLE, HerdrClaimResolution, HerdrClaimTarget, HerdrDiscoverParams,
-    HerdrDiscoverResult, HerdrPaneListing, HerdrSessionListing, HerdrTabListing,
-    HerdrWorkspaceListing, InstanceClaimParams, METHOD_HERDR_DISCOVER, METHOD_HERDR_RESOLVE,
-    METHOD_INSTANCE_CLAIM,
+    HERDR_CLAIM_AMBIGUOUS, HERDR_CLAIM_CONFLICT, HERDR_CLAIM_INVALID, HERDR_CLAIM_NOT_READY,
+    HERDR_CLAIM_OWN_SESSION, HERDR_UNREACHABLE, HerdrClaimResolution, HerdrClaimTarget,
+    HerdrDiscoverParams, HerdrDiscoverResult, HerdrPaneListing, HerdrSessionListing,
+    HerdrTabListing, HerdrWorkspaceListing, InstanceClaimParams, METHOD_HERDR_DISCOVER,
+    METHOD_HERDR_RESOLVE, METHOD_INSTANCE_CLAIM,
 };
 use remuda_protocol::{
     Activity, AgentKind, Completeness, DriverKind, HerdrClaim, HerdrClaimProcess, Instance,
@@ -331,9 +331,16 @@ impl DevNode {
             .await
             .map_err(|error| unreachable_error(&addr, &error))?
             .process_info;
-        let mut process = info.as_ref().and_then(|info| claim_process(info, kind));
-        if let Some(process) = process.as_mut() {
-            process.start_ticks = kernel_start_ticks(process.pid).map(U64);
+        let process = info.as_ref().and_then(|info| claimed_process(info, kind));
+        if process.is_none() {
+            return Err(NodeError::Conflict(format!(
+                "{HERDR_CLAIM_NOT_READY}: pane {pane_id} runs no {} process yet (herdr reports only its shell); start it, then claim again",
+                if kind == AgentKind::Terminal {
+                    "shell"
+                } else {
+                    "agent"
+                }
+            )));
         }
         let socket_path = canonical_string(&addr.socket);
         if let Some(owner) = self.live_claim_of(&socket_path, &pane_id, claiming)? {
@@ -465,7 +472,7 @@ impl DevNode {
                 continue;
             };
             let client = Client::connect(&claim.socket_path).with_timeout(RPC_TIMEOUT);
-            match probe(&client, &claim).await {
+            match probe(&client, &claim, instance.kind).await {
                 Probe::Gone { reason, evidence } => {
                     tracing::info!(instance = %id.as_id(), reason, "claimed herdr pane ended while the Node was down");
                     end_claim(
@@ -739,7 +746,7 @@ impl ClaimedPane {
     async fn watch(&self) {
         let mut last_status: Option<AgentStatus> = None;
         loop {
-            match probe(&self.client(), &self.claim).await {
+            match probe(&self.client(), &self.claim, self.kind).await {
                 Probe::Unreachable(error) => {
                     if !self.contact_lost.swap(true, Ordering::SeqCst) {
                         tracing::warn!(instance = %self.instance_id.as_id(), "claimed herdr server unreachable; contact lost");
@@ -1064,7 +1071,7 @@ async fn pane_listing(
         .await
         .ok()
         .and_then(|result| result.process_info)
-        .and_then(|info| claim_process(&info, AgentKind::Generic));
+        .and_then(|info| listing_process(&info));
     HerdrPaneListing {
         pane_id: pane.pane_id.clone(),
         agent,
@@ -1117,7 +1124,7 @@ async fn pane_geometry(client: &Client, pane_id: &str) -> (u16, u16) {
 
 /// Probe a claim: pane present in its recorded workspace and tab, process
 /// alive, current agent status.
-async fn probe(client: &Client, claim: &HerdrClaim) -> Probe {
+async fn probe(client: &Client, claim: &HerdrClaim, kind: AgentKind) -> Probe {
     let snapshot = match client.session_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return Probe::Unreachable(short_error(&error)),
@@ -1153,22 +1160,35 @@ async fn probe(client: &Client, claim: &HerdrClaim) -> Probe {
         && let Ok(result) = client.pane_process_info(Some(claim.pane_id.clone())).await
         && let Some(info) = result.process_info
     {
-        let listed = info.shell_pid == Some(process.pid)
-            || info
-                .foreground_processes
-                .iter()
-                .any(|candidate| candidate.pid == process.pid);
-        // Both witnesses are required: an agent that hands the terminal to an
-        // editor or a child drops out of the foreground list while alive.
-        if !listed
-            && kernel_alive(process.pid, process.start_ticks.map(|ticks| ticks.0)) == Some(false)
-        {
-            return Probe::Gone {
-                reason: REASON_PROCESS_GONE,
-                evidence: format!(
+        let now = current_claimed_pid(&info, kind);
+        let ticks = now.and_then(kernel_start_ticks);
+        if !same_process(process, now, ticks) {
+            let role = if kind == AgentKind::Terminal {
+                "shell"
+            } else {
+                "foreground agent"
+            };
+            let evidence = match now {
+                Some(pid) if pid == process.pid && ticks.is_none() => format!(
                     "process {} (pid {}) in pane {} has exited",
                     process.command, process.pid, claim.pane_id
                 ),
+                Some(pid) if pid == process.pid => format!(
+                    "pid {} in pane {} was reused by another process (start time changed)",
+                    process.pid, claim.pane_id
+                ),
+                Some(pid) => format!(
+                    "the claimed {} (pid {}) is no longer the {role} of pane {}: pid {pid} is",
+                    process.command, process.pid, claim.pane_id
+                ),
+                None => format!(
+                    "the claimed {} (pid {}) left pane {}; it has no {role} now",
+                    process.command, process.pid, claim.pane_id
+                ),
+            };
+            return Probe::Gone {
+                reason: REASON_PROCESS_GONE,
+                evidence,
             };
         }
     }
@@ -1323,41 +1343,74 @@ fn claim_kind(explicit: Option<&str>, agent: Option<&str>) -> Result<AgentKind, 
 
 /// The process a claim watches: the pane's shell for a `terminal` claim, else
 /// its foreground process-group leader.
-fn claim_process(info: &PaneProcessInfo, kind: AgentKind) -> Option<HerdrClaimProcess> {
-    let named = |pid: u32| {
-        info.foreground_processes
-            .iter()
-            .find(|process| process.pid == pid)
-            .map(|process| base_name(process.argv0.as_deref().unwrap_or(&process.name)))
-            .or_else(|| kernel_comm(pid))
-            .unwrap_or_else(|| "shell".to_owned())
-    };
-    if kind == AgentKind::Terminal
-        && let Some(pid) = info.shell_pid
-    {
-        return Some(HerdrClaimProcess {
-            pid,
-            command: named(pid),
-            start_ticks: None,
-        });
+/// The pane's foreground process-group leader, if it is not the shell.
+fn agent_leader(info: &PaneProcessInfo) -> Option<&remuda_herdr::PaneProcessInfoProcess> {
+    let leader = info.foreground_process_group_id?;
+    if Some(leader) == info.shell_pid {
+        return None;
     }
-    let leader = info
-        .foreground_processes
+    info.foreground_processes
         .iter()
-        .find(|process| Some(process.pid) == info.foreground_process_group_id)
-        .or_else(|| info.foreground_processes.first());
-    match leader {
-        Some(process) => Some(HerdrClaimProcess {
-            pid: process.pid,
-            command: base_name(process.argv0.as_deref().unwrap_or(&process.name)),
-            start_ticks: None,
-        }),
-        None => info.shell_pid.map(|pid| HerdrClaimProcess {
-            pid,
-            command: named(pid),
-            start_ticks: None,
-        }),
+        .find(|process| process.pid == leader)
+}
+
+fn process_name(info: &PaneProcessInfo, pid: u32) -> String {
+    info.foreground_processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .map(|process| base_name(process.argv0.as_deref().unwrap_or(&process.name)))
+        .or_else(|| kernel_comm(pid))
+        .unwrap_or_else(|| "shell".to_owned())
+}
+
+/// What discovery shows for a pane: its agent leader, else its shell.
+fn listing_process(info: &PaneProcessInfo) -> Option<HerdrClaimProcess> {
+    let pid = agent_leader(info)
+        .map(|process| process.pid)
+        .or(info.shell_pid)?;
+    Some(HerdrClaimProcess {
+        pid,
+        command: process_name(info, pid),
+        start_ticks: None,
+    })
+}
+
+/// D-062 r2: the process a claim watches, with its kernel start time.
+///
+/// * an agent kind claims the pane's foreground process-group leader, which
+///   must not be the shell: with no such leader the pane runs no agent yet
+///   and the claim is refused (`None`), never pinned to the shell;
+/// * `terminal` (`--kind shell`) claims the pane's shell itself. A different
+///   foreground job is allowed; the shell's own replacement ends the claim.
+fn claimed_process(info: &PaneProcessInfo, kind: AgentKind) -> Option<HerdrClaimProcess> {
+    let pid = if kind == AgentKind::Terminal {
+        info.shell_pid?
+    } else {
+        agent_leader(info)?.pid
+    };
+    Some(HerdrClaimProcess {
+        pid,
+        command: process_name(info, pid),
+        start_ticks: kernel_start_ticks(pid).map(U64),
+    })
+}
+
+/// The process now in the claimed role (agent leader or shell).
+fn current_claimed_pid(info: &PaneProcessInfo, kind: AgentKind) -> Option<u32> {
+    if kind == AgentKind::Terminal {
+        info.shell_pid
+    } else {
+        agent_leader(info).map(|process| process.pid)
     }
+}
+
+/// Whether `pid` is still the recorded process: same pid AND, when a start
+/// time was recorded, the same kernel start time (a reused pid fails).
+fn same_process(recorded: &HerdrClaimProcess, pid: Option<u32>, ticks_now: Option<u64>) -> bool {
+    pid == Some(recorded.pid)
+        && recorded
+            .start_ticks
+            .is_none_or(|ticks| ticks_now == Some(ticks.0))
 }
 
 /// Executable base name only; argv is never collected (it may carry secrets).
@@ -1446,39 +1499,6 @@ fn kernel_start_ticks(pid: u32) -> Option<u64> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
-        None
-    }
-}
-
-/// The kernel's answer for "is this the claimed process": `Some(false)` only
-/// on positive evidence (no such pid, or a different start time).
-fn kernel_alive(pid: u32, start_ticks: Option<u64>) -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(_) => match (start_ticks, kernel_start_ticks(pid)) {
-                (Some(recorded), Some(now)) => Some(recorded == now),
-                _ => Some(true),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
-            Err(_) => None,
-        }
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        let _ = start_ticks;
-        let Ok(pid) = i32::try_from(pid) else {
-            return None;
-        };
-        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-            Ok(()) | Err(nix::errno::Errno::EPERM) => Some(true),
-            Err(nix::errno::Errno::ESRCH) => Some(false),
-            Err(_) => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, start_ticks);
         None
     }
 }

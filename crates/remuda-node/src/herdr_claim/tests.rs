@@ -86,6 +86,16 @@ impl Harness {
             })
             .await
             .expect("human claude");
+        // D-062 r2: the agent is a real foreground process (this test
+        // process: alive throughout, with a real kernel start time), never the
+        // pane's shell.
+        client
+            .call_raw(
+                "fake.set_pane_process",
+                json!({"pane_id": "w1:p1", "pid": std::process::id(), "name": "claude"}),
+            )
+            .await
+            .expect("claude is the pane's foreground");
         let tab = client
             .tab_create(TabCreateParams {
                 workspace_id: Some("w1".into()),
@@ -450,7 +460,11 @@ async fn claim_validates_the_id_chain_and_the_single_pane_rule() {
     let process = claim.process.expect("process info recorded at claim time");
     assert_eq!(
         (process.pid, process.command.as_str()),
-        (4242, "fake-herdr")
+        (std::process::id(), "claude")
+    );
+    assert!(
+        process.start_ticks.is_some(),
+        "the kernel start time is recorded"
     );
     let explicit = harness
         .claim(HerdrClaimTarget {
@@ -651,60 +665,211 @@ async fn pane_gone_ends_the_instance_with_evidence_and_never_touches_it() {
     );
 }
 
-#[tokio::test]
-async fn process_gone_needs_both_herdr_and_the_kernel() {
-    let harness = Harness::new().await;
-    let mut child = std::process::Command::new("sleep")
+fn sleeper() -> std::process::Child {
+    std::process::Command::new("sleep")
         .arg("600")
         .spawn()
-        .expect("stand-in agent process");
-    let pid = child.id();
+        .expect("stand-in process")
+}
+
+async fn set_process(harness: &Harness, pane: &str, pid: u32, name: &str, shell: Option<u32>) {
+    let mut params = json!({"pane_id": pane, "pid": pid, "name": name});
+    if let Some(shell) = shell {
+        params["shell_pid"] = json!(shell);
+    }
     harness
         .client()
-        .call_raw(
-            "fake.set_pane_process",
-            json!({"pane_id": "w1:p2", "pid": pid, "name": "codex"}),
-        )
+        .call_raw("fake.set_pane_process", params)
         .await
-        .expect("pane runs the child");
-    let claimed = harness
+        .expect("set pane process");
+}
+
+async fn claim_codex_on_p2(harness: &Harness) -> Instance {
+    harness
         .claim(HerdrClaimTarget {
             kind: Some("codex".into()),
             ..harness.target("w1", "w1:t2", Some("w1:p2"))
         })
         .await
-        .expect("claim");
+        .expect("claim")
+}
+
+#[tokio::test]
+async fn an_agent_claim_needs_a_foreground_agent_not_the_shell() {
+    let harness = Harness::new().await;
+    // w1:p2 runs only its shell: an agent claim is not ready, never pinned to
+    // the shell pid.
+    let refused = error_text(
+        harness
+            .claim(HerdrClaimTarget {
+                kind: Some("claude".into()),
+                ..harness.target("w1", "w1:t2", Some("w1:p2"))
+            })
+            .await,
+    );
+    assert!(refused.contains(HERDR_CLAIM_NOT_READY), "{refused}");
+    assert!(harness.store.list_instances().expect("rows").is_empty());
+}
+
+#[tokio::test]
+async fn a_different_program_in_the_claimed_pane_ends_the_claim() {
+    let harness = Harness::new().await;
+    let mut agent = sleeper();
+    set_process(&harness, "w1:p2", agent.id(), "codex", None).await;
+    let claimed = claim_codex_on_p2(&harness).await;
     let id = claimed.meta.id.clone();
-    let process = claimed
+    let recorded = claimed
         .herdr_claim
         .and_then(|claim| claim.process)
         .expect("process");
-    assert_eq!((process.pid, process.command.as_str()), (pid, "codex"));
-
-    // herdr stops listing the process while it is alive (it handed the
-    // terminal to a child): the kernel says alive, so the claim stays live.
-    harness
-        .client()
-        .call_raw("fake.clear_pane_process", json!({"pane_id": "w1:p2"}))
-        .await
-        .expect("foreground moves");
-    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
-        harness.store.get_instance(&id).expect("instance").lifecycle,
-        InstanceLifecycle::Ready,
-        "absent from the foreground list alone is not process end"
+        (recorded.pid, recorded.command.as_str()),
+        (agent.id(), "codex")
     );
-
-    child.kill().expect("process exits");
-    child.wait().expect("reaped");
+    assert!(recorded.start_ticks.is_some());
+    // A different program takes the pane's foreground, and the agent exits.
+    let mut other = sleeper();
+    set_process(&harness, "w1:p2", other.id(), "vim", None).await;
+    agent.kill().expect("agent exits");
+    agent.wait().expect("reaped");
     harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
     let journal = harness.journal(&id);
     assert!(journal.contains(REASON_PROCESS_GONE), "{journal}");
     assert!(
-        harness.destructive_calls().is_empty(),
-        "{:?}",
-        harness.calls()
+        journal.contains("is no longer the foreground agent"),
+        "{journal}"
     );
+    // Nothing more is written to the pane.
+    harness.clear_calls();
+    let wire = id.as_id().to_string();
+    let _ = crate::transport::hubnode::dispatch_method(
+        &harness.node,
+        "instance.send",
+        json!({"instanceId": wire, "input": {"type": "prompt", "text": "x"}, "origin": "human"}),
+    )
+    .await;
+    let _ = crate::transport::hubnode::dispatch_method(
+        &harness.node,
+        "instance.keys",
+        json!({"instanceId": wire, "keys": ["enter"], "origin": "human"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let writes: Vec<Value> = harness
+        .calls()
+        .into_iter()
+        .filter(|call| {
+            matches!(
+                call["method"].as_str(),
+                Some("pane.send_text" | "pane.send_keys" | "agent.prompt" | "terminal.input")
+            )
+        })
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "a write reached the replaced program: {writes:?}"
+    );
+    other.kill().expect("cleanup");
+    let _ = other.wait();
+}
+
+#[tokio::test]
+async fn the_agent_leaving_the_foreground_ends_the_claim() {
+    let harness = Harness::new().await;
+    let mut agent = sleeper();
+    set_process(&harness, "w1:p2", agent.id(), "codex", None).await;
+    let id = claim_codex_on_p2(&harness).await.meta.id;
+    // The pane is back at its shell prompt (no foreground agent at all).
+    harness
+        .client()
+        .call_raw("fake.clear_pane_process", json!({"pane_id": "w1:p2"}))
+        .await
+        .expect("back to the shell");
+    harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
+    assert!(harness.journal(&id).contains(REASON_PROCESS_GONE));
+    agent.kill().expect("cleanup");
+    let _ = agent.wait();
+}
+
+#[tokio::test]
+async fn a_reused_pid_with_a_different_start_time_ends_the_claim() {
+    let harness = Harness::new().await;
+    let mut agent = sleeper();
+    set_process(&harness, "w1:p2", agent.id(), "codex", None).await;
+    let id = claim_codex_on_p2(&harness).await.meta.id;
+    harness.node.shutdown().await.expect("node shutdown");
+    // The same pid now names a process that started at another time.
+    let mut row = harness.store.get_instance(&id).expect("row");
+    let process = row
+        .herdr_claim
+        .as_mut()
+        .and_then(|claim| claim.process.as_mut())
+        .expect("process");
+    process.start_ticks = process.start_ticks.map(|ticks| U64(ticks.0 + 1));
+    harness.store.remove_instance(&id).expect("remove");
+    harness.store.insert_instance(row).expect("reinsert");
+    let own_dir = harness.root.path().join("sessions/mine");
+    let restarted = node(&harness.store, harness.data.path(), &own_dir);
+    restarted.set_herdr_claim_root(harness.root.path().to_path_buf());
+    restarted
+        .reconcile_herdr()
+        .await
+        .expect("startup reconcile");
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Exited
+    );
+    let journal = harness.journal(&id);
+    assert!(journal.contains(REASON_PROCESS_GONE), "{journal}");
+    assert!(journal.contains("was reused"), "{journal}");
+    agent.kill().expect("cleanup");
+    let _ = agent.wait();
+}
+
+#[tokio::test]
+async fn a_shell_claim_survives_a_foreground_job_but_not_the_shell_replaced() {
+    let harness = Harness::new().await;
+    let mut shell = sleeper();
+    let mut job = sleeper();
+    set_process(&harness, "w1:p3", job.id(), "vim", Some(shell.id())).await;
+    let claimed = harness
+        .claim(HerdrClaimTarget {
+            kind: Some("shell".into()),
+            ..harness.target("w1", "w1:t2", Some("w1:p3"))
+        })
+        .await
+        .expect("claim");
+    let id = claimed.meta.id.clone();
+    let recorded = claimed
+        .herdr_claim
+        .and_then(|claim| claim.process)
+        .expect("process");
+    assert_eq!(recorded.pid, shell.id(), "a shell claim watches the shell");
+    // Another foreground job is fine.
+    let mut other_job = sleeper();
+    set_process(&harness, "w1:p3", other_job.id(), "top", Some(shell.id())).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Ready,
+        "a different foreground job does not end a shell claim"
+    );
+    // The shell itself is replaced.
+    let mut new_shell = sleeper();
+    set_process(
+        &harness,
+        "w1:p3",
+        other_job.id(),
+        "top",
+        Some(new_shell.id()),
+    )
+    .await;
+    harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
+    assert!(harness.journal(&id).contains("is no longer the shell"));
+    for child in [&mut shell, &mut job, &mut other_job, &mut new_shell] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 #[tokio::test]

@@ -62,10 +62,18 @@ At claim time the Node records, on the instance (`herdrClaim`):
 - `session` (as the operator wrote it) and the resolved `socketPath`;
 - `workspaceId`, `tabId`, `paneId`;
 - `agent`: herdr's detected agent kind for the pane, if any;
-- `process`: the pane's foreground process from `pane.process_info` — its
-  `pid`, its `command` (the executable's base name only; full argv is never
-  read into Remuda, it may carry secrets) and, on Linux, the kernel start
-  time of that pid, so a recycled pid is never mistaken for the original.
+- `process`: the claimed process from `pane.process_info` — its `pid`, its
+  `command` (the executable's base name only; full argv is never read into
+  Remuda, it may carry secrets) and, on Linux, the kernel start time of that
+  pid (`/proc/<pid>/stat` field 22), so a recycled pid is never mistaken for
+  the original. Which process that is depends on the kind (round 2):
+  - an **agent** kind claims the pane's **foreground process-group leader**,
+    which must not be the shell. While herdr reports only the shell in the
+    foreground the pane runs no agent yet, and the claim is refused with 409
+    `not-ready` (`herdr-claim-not-ready`); it never falls back to the shell;
+  - **`--kind shell`** (`terminal`) claims the pane's **shell itself**. Any
+    foreground job the human starts in it is fine; the shell being replaced
+    (another pid, or the same pid with another start time) ends the claim.
 
 The Node's **own** herdr session is never claimable (400, `own-session`) and
 is not listed by discovery: its panes already are Remuda instances.
@@ -129,11 +137,14 @@ The Node polls each claimed pane every 2 s (`session.snapshot` plus
 - **Pane gone** — the pane is no longer in the session snapshot. This is
   process-end evidence (OA6): the instance ends `exited` with reason code
   `herdr-pane-gone`, and the evidence names the session and pane.
-- **Process gone** — the recorded pid is neither the pane's shell nor among its
-  foreground processes **and** the kernel confirms that pid is dead (or now
-  belongs to a different process, by start time). Both are required: an agent
-  that hands the terminal to an editor or a child must not end the instance.
-  The instance ends `exited` with reason code `herdr-process-gone`.
+- **Process gone** — the process now in the claimed role (the foreground
+  leader for an agent claim, the shell for a shell claim) is not the recorded
+  one: a different pid, no such process, or the same pid with a different
+  kernel start time (a reused pid). For an agent claim a changed foreground
+  leader — the agent exited and the pane is back at its shell, or another
+  program now runs there — is process-gone, so send, keys and the TTY never
+  drive whatever replaced the claimed agent. The instance ends `exited` with
+  reason code `herdr-process-gone` and evidence naming both pids.
 - **Server unreachable** — the socket refuses, times out or answers
   `server_unavailable`. This is contact loss, never process end: the instance
   stays live, the journal gets a `herdr_claim_contact` = `lost` diagnostic, the

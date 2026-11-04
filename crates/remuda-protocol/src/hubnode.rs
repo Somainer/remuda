@@ -120,6 +120,9 @@ pub const HERDR_CLAIM_INVALID: &str = "herdr-claim-invalid";
 /// Stable prefix of a Node refusal for a multi-pane tab claimed without a
 /// pane id; the text lists the tab's pane ids (Hub: 400).
 pub const HERDR_CLAIM_AMBIGUOUS: &str = "herdr-claim-ambiguous";
+/// Stable prefix of a Node refusal for an agent claim whose pane has no
+/// foreground agent process yet (herdr reports only the shell) (Hub: 409).
+pub const HERDR_CLAIM_NOT_READY: &str = "herdr-claim-not-ready";
 /// Stable prefix of a Node refusal for the Node's own carrier session
 /// (Hub: 400).
 pub const HERDR_CLAIM_OWN_SESSION: &str = "herdr-claim-own-session";

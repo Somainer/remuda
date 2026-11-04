@@ -22,9 +22,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use remuda_protocol::InputOrigin;
 use remuda_protocol::hubnode::{
-    HERDR_CLAIM_AMBIGUOUS, HERDR_CLAIM_CONFLICT, HERDR_CLAIM_INVALID, HERDR_CLAIM_OWN_SESSION,
-    HERDR_UNREACHABLE, HerdrClaimResolution, METHOD_HERDR_DISCOVER, METHOD_HERDR_RESOLVE,
-    METHOD_INSTANCE_CLAIM,
+    HERDR_CLAIM_AMBIGUOUS, HERDR_CLAIM_CONFLICT, HERDR_CLAIM_INVALID, HERDR_CLAIM_NOT_READY,
+    HERDR_CLAIM_OWN_SESSION, HERDR_UNREACHABLE, HerdrClaimResolution, METHOD_HERDR_DISCOVER,
+    METHOD_HERDR_RESOLVE, METHOD_INSTANCE_CLAIM,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -166,6 +166,15 @@ fn claim_error(error: HubError) -> HubError {
             .find(prefix)
             .map_or_else(|| message.clone(), |at| message[at..].to_owned())
     };
+    if message.contains(HERDR_CLAIM_NOT_READY) {
+        return HubError::Conflict(detail(HERDR_CLAIM_NOT_READY)).with_next(
+            "not-ready",
+            NextStep::new(
+                action::RETRY_SAME_COMMAND,
+                "start the agent in the pane (herdr must report it in the foreground), then claim again",
+            ),
+        );
+    }
     if message.contains(HERDR_CLAIM_CONFLICT) {
         return HubError::Conflict(detail(HERDR_CLAIM_CONFLICT)).with_next(
             "already-claimed",

@@ -44,6 +44,11 @@ pub const WAKE_CHECK_TIMEOUT_MIN_SECS: i64 = 1;
 pub const WAKE_CHECK_TIMEOUT_MAX_SECS: i64 = 3600;
 /// Bytes of a check's stdout the Node keeps; the rest is read and dropped.
 pub const WAKE_CHECK_STDOUT_MAX_BYTES: usize = 4096;
+/// The most a Node may take, in seconds, beyond a check's own timeout to
+/// answer `wake.check` (its `sh -n` precheck, killing what the check started,
+/// draining its stdout). The Hub waits for the answer longer than the timeout
+/// plus this, so a check that ran its whole timeout is never taken as lost.
+pub const WAKE_CHECK_NODE_OVERHEAD_SECS: u64 = 30;
 /// The prefix of every environment variable the Hub may pass to a check.
 pub const WAKE_CHECK_ENV_PREFIX: &str = "REMUDA_WAKE_";
 

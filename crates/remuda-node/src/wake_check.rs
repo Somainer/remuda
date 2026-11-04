@@ -3,13 +3,22 @@
 //! A wake-up may carry a shell command that decides whether its run happens.
 //! The Hub admitted it (on the OA1 axis) and names this Node; the Node:
 //!
-//! 1. runs `sh -n -c <command>` first. A syntax error is reported as
-//!    `syntax` and nothing executes;
-//! 2. runs `sh -c <command>` in its own process group, in the lineage's
-//!    workspace (and cwd) on this host, under the mandatory timeout. On the
-//!    timeout the whole group is killed. Once the shell exits, whatever it
-//!    left running in its group is killed too: a check decides, it does not
-//!    start services, and no process of it outlives the report;
+//! 1. gives the command to `sh -n` on stdin first (dash runs a `-c` string
+//!    even under `-n`). A syntax error is reported as `syntax` and nothing
+//!    executes;
+//! 2. runs it under an outer `sh` ([`OUTER`]) in the lineage's workspace
+//!    (and cwd) on this host, under the mandatory timeout. The outer shell is
+//!    contained so that every process the check starts can be found and
+//!    killed, `setsid`, a double fork and `nohup … &` included. In the order
+//!    tried: a cgroup v2 leaf when the Node's own cgroup is delegated and
+//!    writable (one `cgroup.kill`), and on Linux always a child subreaper
+//!    (`PR_SET_CHILD_SUBREAPER` on the outer shell, so every orphan below it is
+//!    reparented to it; the Node SIGKILLs every live descendant, re-walking
+//!    `/proc` until a walk finds none). On a non-Linux Node only the process
+//!    group is killed, and a check that leaves it can outlive the report.
+//!    The sweep runs on the timeout and after the check exits: a check
+//!    decides, it does not start services, and on Linux no process it
+//!    started outlives the report;
 //! 3. keeps at most [`WAKE_CHECK_STDOUT_MAX_BYTES`] of stdout (the rest is
 //!    read and dropped, so the check never blocks on a full pipe) and never
 //!    reads stderr: the report carries only an exit summary.
@@ -229,13 +238,185 @@ async fn parses(
     }
 }
 
-/// Run one check: `sh -n`, then the command under `timeout`.
+/// The outer shell a check runs under. It runs the check as its own child
+/// (`sh -c "$1"`, stdin and stderr `/dev/null`, stdout the Node's pipe),
+/// reports the exit status on its own stderr (the Node's control pipe), then
+/// waits on its stdin until the Node has killed every descendant and closes
+/// it. Being the subreaper, it adopts every orphan of the check meanwhile.
+const OUTER: &str =
+    "sh -c \"$1\" </dev/null 2>/dev/null; echo \"$?\" >&2; read _ 2>/dev/null; exit 0";
+/// How long the descendant sweep may keep finding processes.
+const SWEEP_LIMIT: Duration = Duration::from_secs(5);
+/// How long the outer shell may take to exit once released.
+const OUTER_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// The longest a `wake.check` call can take beyond the check's own timeout:
+/// the `sh -n` precheck, the descendant sweep, the outer shell's exit and the
+/// stdout drain. The Hub waits longer than the timeout plus this.
+pub(crate) const MAX_OVERHEAD: Duration = Duration::from_secs(
+    SYNTAX_TIMEOUT.as_secs()
+        + SWEEP_LIMIT.as_secs()
+        + OUTER_EXIT_GRACE.as_secs()
+        + STDOUT_GRACE.as_secs()
+        + 1,
+);
+
+// The Hub sizes its wait from the protocol's bound; the Node stays inside it.
+const _: () = assert!(MAX_OVERHEAD.as_secs() <= remuda_protocol::WAKE_CHECK_NODE_OVERHEAD_SECS);
+
+/// How a check's process tree is contained (cb-wake-check r2), in the order
+/// tried: a cgroup v2 leaf (Linux, when the Node's own cgroup is delegated and
+/// writable), and on Linux always a child subreaper as well; elsewhere only
+/// the process group.
+#[derive(Debug, Default)]
+struct Containment {
+    /// The cgroup v2 leaf the check runs in.
+    leaf: Option<std::path::PathBuf>,
+}
+
+impl Containment {
+    fn label(&self) -> &'static str {
+        if self.leaf.is_some() {
+            "cgroup+subreaper"
+        } else if cfg!(target_os = "linux") {
+            "subreaper"
+        } else {
+            "process-group"
+        }
+    }
+}
+
+/// A fresh cgroup v2 leaf under the Node's own cgroup, when that cgroup is
+/// delegated to the Node (cgroup2 mounted at `/sys/fs/cgroup`, the Node's
+/// directory writable, `cgroup.kill` supported). `None` otherwise.
+#[cfg(target_os = "linux")]
+fn cgroup_leaf() -> Option<std::path::PathBuf> {
+    let root = Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        return None;
+    }
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = own.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let base = root.join(relative.trim_start_matches('/'));
+    let leaf = base.join(format!("remuda-wake-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::create_dir(&leaf).ok()?;
+    if leaf.join("cgroup.kill").exists() {
+        Some(leaf)
+    } else {
+        let _ = std::fs::remove_dir(&leaf);
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_leaf() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The live (not zombie) descendants of `root`, from `/proc/*/stat`.
+#[cfg(target_os = "linux")]
+fn live_descendants(root: u32) -> Vec<i32> {
+    let mut children: BTreeMap<i32, Vec<(i32, bool)>> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The fields after the parenthesised command name: state, ppid, …
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let Some(ppid) = fields.next().and_then(|ppid| ppid.parse::<i32>().ok()) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push((pid, state != "Z"));
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![i32::try_from(root).unwrap_or(-1)];
+    while let Some(parent) = queue.pop() {
+        for (pid, live) in children.get(&parent).into_iter().flatten() {
+            if *live {
+                found.push(*pid);
+            }
+            queue.push(*pid);
+        }
+    }
+    found
+}
+
+/// Kill everything the check started, whatever `setsid`, a double fork or
+/// `nohup` did: `cgroup.kill` on its leaf, then, until a walk finds nothing
+/// live, SIGKILL every descendant of the outer shell (the subreaper adopts each
+/// orphan, so none is out of reach). The outer shell itself is left alive
+/// for its release: were it killed first, its orphans would go to init, out
+/// of the walk's reach. (`cgroup.kill` also ends the outer shell, but every
+/// process in the leaf goes with it.) Elsewhere: the process group.
+async fn sweep(containment: &Containment, outer: Option<u32>) {
+    if let Some(leaf) = &containment.leaf {
+        let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
+    }
+    #[cfg(not(target_os = "linux"))]
+    kill_group(outer);
+    #[cfg(target_os = "linux")]
+    if let Some(outer) = outer {
+        let deadline = tokio::time::Instant::now() + SWEEP_LIMIT;
+        loop {
+            let live = live_descendants(outer);
+            if live.is_empty() {
+                break;
+            }
+            for pid in live {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    category = "wake-check",
+                    "the descendant sweep hit its limit"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// Remove a cgroup leaf once nothing is left in it.
+fn remove_leaf(containment: &Containment) {
+    if let Some(leaf) = &containment.leaf {
+        for _ in 0..100 {
+            if std::fs::remove_dir(leaf).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::warn!(
+            category = "wake-check",
+            "a check's cgroup leaf could not be removed"
+        );
+    }
+}
+
+/// Run one check: `sh -n`, then the command under `timeout`, contained.
 pub(crate) async fn run_check(
     command: &str,
     cwd: &Path,
     env: &BTreeMap<String, String>,
     timeout: Duration,
 ) -> CheckRun {
+    use tokio::io::AsyncBufReadExt;
     match parses(command, cwd, env).await {
         Ok(true) => {}
         Ok(false) => {
@@ -248,32 +429,57 @@ pub(crate) async fn run_check(
             return CheckRun::without_output(WakeCheckOutcome::Unavailable, "could not start sh");
         }
     }
+    let containment = Containment {
+        leaf: cgroup_leaf(),
+    };
     let mut sh = shell(cwd, env);
-    sh.args(["-c", command]).stdout(Stdio::piped());
+    sh.args(["-c", OUTER, "sh", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    remuda_unix::ContainOnExec {
+        cgroup: containment
+            .leaf
+            .as_ref()
+            .map(|leaf| leaf.join("cgroup.procs")),
+        subreaper: true,
+    }
+    .install(sh.as_std_mut());
     let mut child = match sh.spawn() {
         Ok(child) => child,
         Err(_) => {
+            remove_leaf(&containment);
             return CheckRun::without_output(WakeCheckOutcome::Unavailable, "could not start sh");
         }
     };
-    let pgid = child.id();
+    let outer = child.id();
+    let release = child.stdin.take();
     let reader = child
         .stdout
         .take()
         .map(|pipe| tokio::spawn(read_bounded(pipe, WAKE_CHECK_STDOUT_MAX_BYTES)));
-    let waited = tokio::time::timeout(timeout, child.wait()).await;
-    // On the timeout this kills the whole check; after an exit, whatever the
-    // shell left behind in its group (which also closes the stdout pipe a
-    // straggler may hold).
-    kill_group(pgid);
-    let timed_out = waited.is_err();
-    let status = match waited {
-        Ok(status) => status.ok(),
-        Err(_) => {
-            let _ = child.wait().await;
-            None
-        }
+    // The outer shell's one line: the check's exit status.
+    let reported = async {
+        let mut line = String::new();
+        let control = child.stderr.take()?;
+        tokio::io::BufReader::new(control)
+            .read_line(&mut line)
+            .await
+            .ok()?;
+        line.trim().parse::<i32>().ok()
     };
+    let waited = tokio::time::timeout(timeout, reported).await;
+    sweep(&containment, outer).await;
+    // Released, the outer shell exits; it is killed if it does not.
+    drop(release);
+    if tokio::time::timeout(OUTER_EXIT_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    remove_leaf(&containment);
     let (stdout, cut) = match reader {
         Some(reader) => match tokio::time::timeout(STDOUT_GRACE, reader).await {
             Ok(Ok(read)) => read,
@@ -283,36 +489,43 @@ pub(crate) async fn run_check(
     };
     let (stdout, truncated) = bounded_text(&stdout, WAKE_CHECK_STDOUT_MAX_BYTES);
     let stdout_truncated = cut || truncated;
-    if timed_out {
-        return CheckRun {
-            outcome: WakeCheckOutcome::TimedOut,
-            exit_code: None,
-            signal: None,
-            stdout,
-            stdout_truncated,
-            summary: format!(
-                "timed out after {} s; its process group was killed",
-                timeout.as_secs()
-            ),
-        };
-    }
-    let Some(status) = status else {
-        return CheckRun::without_output(WakeCheckOutcome::Unavailable, "its exit was not seen");
+    tracing::debug!(
+        category = "wake-check",
+        containment = containment.label(),
+        "check contained"
+    );
+    let exit_code = match waited {
+        Err(_) => {
+            return CheckRun {
+                outcome: WakeCheckOutcome::TimedOut,
+                exit_code: None,
+                signal: None,
+                stdout,
+                stdout_truncated,
+                summary: format!(
+                    "timed out after {} s; every process it started was killed",
+                    timeout.as_secs()
+                ),
+            };
+        }
+        Ok(None) => {
+            return CheckRun::without_output(
+                WakeCheckOutcome::Unavailable,
+                "its exit was not seen",
+            );
+        }
+        Ok(Some(code)) => code,
     };
-    #[cfg(unix)]
-    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
-    #[cfg(not(unix))]
-    let signal = None;
-    let exit_code = status.code();
-    let summary = match (exit_code, signal) {
-        (Some(code), _) => format!("exit {code}"),
-        (None, Some(signal)) => format!("killed by signal {signal}"),
-        (None, None) => "ended without an exit code".to_owned(),
+    // A shell reports a command a signal ended as 128 + the signal.
+    let summary = if exit_code > 128 {
+        format!("exit {exit_code} (a signal ends a command with 128 + its number)")
+    } else {
+        format!("exit {exit_code}")
     };
     CheckRun {
         outcome: WakeCheckOutcome::Exited,
-        exit_code,
-        signal,
+        exit_code: Some(exit_code),
+        signal: None,
         stdout,
         stdout_truncated,
         summary,
@@ -488,6 +701,44 @@ mod tests {
             gone(pid_in(&pidfile)).await,
             "the background sleep survived"
         );
+    }
+
+    /// cb-wake-check r2: `setsid`, a double fork and `nohup … &` all leave
+    /// the shell's process group; none of them outlives the report, on the
+    /// timeout or after a clean exit.
+    #[tokio::test]
+    async fn no_escape_by_setsid_double_fork_or_nohup_outlives_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = |name: &str| dir.path().join(name);
+        let escapes = format!(
+            "setsid sleep 600 & echo $! > {a}; \
+             (setsid sh -c 'sleep 600 & echo $! > {b}') & \
+             nohup sleep 600 >/dev/null 2>&1 & echo $! > {c}; \
+             (sh -c 'setsid sh -c \"sleep 600 & echo \\$! > {d}\"' &) ; \
+             i=0; while [ ! -s {b} ] || [ ! -s {d} ]; do i=$((i+1)); [ $i -gt 500 ] && break; sleep 0.01; done",
+            a = pid_file("a").display(),
+            b = pid_file("b").display(),
+            c = pid_file("c").display(),
+            d = pid_file("d").display(),
+        );
+        for (tail, secs, outcome) in [
+            ("; exit 0", 30, WakeCheckOutcome::Exited),
+            ("; sleep 600", 2, WakeCheckOutcome::TimedOut),
+        ] {
+            for name in ["a", "b", "c", "d"] {
+                let _ = std::fs::remove_file(pid_file(name));
+            }
+            let checked = run(dir.path(), &format!("{escapes}{tail}"), secs).await;
+            assert_eq!(checked.outcome, outcome, "{tail}: {checked:?}");
+            for name in ["a", "b", "c", "d"] {
+                let pid = pid_in(&pid_file(name));
+                // Right after the report: no bounded wait here.
+                assert!(
+                    !alive(pid),
+                    "{tail}: the {name} escapee {pid} survived the report"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -128,3 +128,21 @@ it("a re-login under a different device clears the glance (the login path)", asy
   await hubStore.login("bootstrap", "code-b", "b");
   expect(hubStore.getSnapshot().glance).toBeNull();
 });
+
+it("a read in flight across a retirement cannot repaint the retired identity", async () => {
+  const { api, hubStore } = await fresh();
+  let release!: (value: OwnerGlance) => void;
+  vi.spyOn(api, "ownerGlance").mockImplementation(
+    () =>
+      new Promise<OwnerGlance>((resolve) => {
+        release = resolve;
+      }),
+  );
+  const pending = hubStore.refreshGlance();
+  // A peer tab logs out mid-read: extEpoch moves, bootGen does not.
+  hubStore.applyAuthIdentityChangeForTest();
+  release(GLANCE);
+  await pending;
+  expect(hubStore.getSnapshot().glance).toBeNull();
+  expect(hubStore.getSnapshot().glanceFailed).toBe(false);
+});

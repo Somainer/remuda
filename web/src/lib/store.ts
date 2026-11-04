@@ -9062,12 +9062,18 @@ class HubStore {
    */
   refreshGlance(): Promise<void> {
     if (this.glanceInFlight) return this.glanceInFlight;
-    const epoch = this.bootGen;
+    // The identity fence is BOTH coordinates: bootGen retires a pre-bootstrap
+    // read, and extEpoch retires one in flight across a peer-tab/logout/401
+    // retirement (which bumps extEpoch but not bootGen) — otherwise the
+    // retired identity's projection repaints the next owner's row.
+    const boot = this.bootGen;
+    const ext = this.extEpoch;
+    const live = () => boot === this.bootGen && ext === this.extEpoch;
     const job = (async () => {
       try {
         // The owner's local-day offset, east of UTC (the Hub clamps it).
         const glance = await api.ownerGlance(-new Date().getTimezoneOffset());
-        if (epoch !== this.bootGen) return;
+        if (!live()) return;
         // A malformed body (an older/mock Hub, a proxy page) is a failed read,
         // never a half-populated projection the home would crash on.
         if (
@@ -9081,7 +9087,7 @@ class HubStore {
         }
         this.emit({ glance, glanceAt: Date.now(), glanceFailed: false });
       } catch {
-        if (epoch !== this.bootGen) return;
+        if (!live()) return;
         this.emit({ glanceFailed: true });
       }
     })().finally(() => {

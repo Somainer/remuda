@@ -581,6 +581,13 @@ pub async fn delete_instance(
         .get_instance(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // D-062 r2: deleting a claimed row ends (or forgets) the claim: Human only.
+    crate::herdr_claims::authorize_pane_write(
+        &instance,
+        Some(&device),
+        "instance.close",
+        &mut json!({}),
+    )?;
     let force = query.force == Some(1);
     let chapter_is_live = |lifecycle: &str| !matches!(lifecycle, "exited" | "failed" | "closed");
     // ma-lineage r6/r7 items 1-2: one side-effect-free pre-check decides
@@ -665,7 +672,7 @@ pub async fn delete_instance(
                 instance.lifecycle
             )));
         }
-        stop_before_delete(&state, &instance).await?;
+        stop_before_delete(&state, &instance, &device).await?;
         // The close can be ignored by a gone/closed link, so re-plan and
         // refuse with 409 BEFORE any lease return, purge or audit rather than
         // discovering a live chapter inside the delete transaction after the
@@ -1004,7 +1011,15 @@ pub async fn delete_instance(
 async fn stop_before_delete(
     state: &AppState,
     instance: &crate::store::InstanceRecord,
+    device: &crate::store::Device,
 ) -> Result<(), HubError> {
+    let mut payload = json!({ "instanceId": instance.instance_id, "origin": "human" });
+    crate::herdr_claims::authorize_pane_write(
+        instance,
+        Some(device),
+        "instance.close",
+        &mut payload,
+    )?;
     let (command, created) = state
         .store
         .queue_command(
@@ -1012,7 +1027,7 @@ async fn stop_before_delete(
             Some(instance.instance_id.clone()),
             instance.host_id.clone(),
             "instance.close".into(),
-            json!({ "instanceId": instance.instance_id, "origin": "human" }),
+            payload,
             None,
             None,
             // Hub-internal cleanup before an operator delete (main-agent.md
@@ -2004,7 +2019,7 @@ pub async fn resume_instance(
     // Resuming spends host capacity and starts a native process, so it stays a
     // human/bot action; an Agent asking to resume its own parent would escape
     // the scope its instance credential was issued for (D-017).
-    crate::agent_scope::require_operator(&state, &headers).await?;
+    let device = crate::agent_scope::require_operator(&state, &headers).await?;
     // Read on the reader pool: a continuation resume racing another one may
     // hold the writer thread open inside its fence transaction, and the
     // lineage branch must keep observing committed state meanwhile.
@@ -2013,6 +2028,19 @@ pub async fn resume_instance(
         .get_instance_read(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // D-062: a claimed pane was never launched by Remuda; there is nothing to
+    // resume. The gate refuses non-Humans first (403), then everyone (400).
+    crate::herdr_claims::authorize_pane_write(
+        &parent,
+        Some(&device),
+        "instance.resume",
+        &mut json!({}),
+    )?;
+    if crate::herdr_claims::is_claimed(&parent) {
+        return Err(HubError::BadRequest(
+            "a claimed herdr pane cannot be resumed; claim the pane again".into(),
+        ));
+    }
     let mode = match body.mode.as_str() {
         "structured" => ResumeMode::Structured,
         "terminal" => ResumeMode::Terminal,
@@ -2984,6 +3012,13 @@ pub async fn post_command(
         &mut payload,
     )
     .await?;
+    // D-062 r2: the one Human-only gate for writes to a claimed pane.
+    crate::herdr_claims::authorize_pane_write(
+        &instance,
+        Some(&device),
+        &body.operation,
+        &mut payload,
+    )?;
     // Same-id client retry (protocol §2.5: a retry keeps its id). Identifier
     // identity — executable payload and idempotency key — is enforced for
     // EVERY operation here and, authoritatively for the concurrent-first-POST
@@ -4689,6 +4724,21 @@ pub(crate) async fn forward_if_online(
     command: CommandRecord,
     host_online: bool,
 ) -> Result<CommandRecord, HubError> {
+    // D-062 r2: a pane write to a claimed instance without the Human gate's
+    // stamp is never sent, whatever route queued it; the row settles rejected.
+    if let Err(error) = crate::herdr_claims::verify_forward(state, &command).await {
+        let (status, body) = error.status_code_and_body();
+        let _ = state
+            .store
+            .reject_command_outcome(
+                command.command_id.clone(),
+                "human-only: a claimed herdr pane takes writes only from a human operator".into(),
+                Some(i64::from(status)),
+                Some(body.to_string()),
+            )
+            .await;
+        return Err(error);
+    }
     if !host_online {
         return Ok(command);
     }

@@ -175,6 +175,7 @@ async fn dispatch_hub(
         Some(controller) => Some(controller.dispatch_guard().await?),
         None => None,
     };
+    crate::herdr_claim::refuse_non_human_write(&runtime.node, method, &params)?;
     if method == "host.doctor" {
         return runtime.node.doctor().await;
     }

@@ -203,6 +203,25 @@ async fn broadcast(
             ));
         };
         obj.insert("instanceId".into(), json!(instance.instance_id.clone()));
+        // D-062 r2: a claimed pane takes writes only from a human operator;
+        // a non-Human broadcast skips it with a per-instance refusal.
+        if let Err(err) = crate::herdr_claims::authorize_pane_write(
+            &instance,
+            Some(&device),
+            &body.operation,
+            &mut payload,
+        ) {
+            failed += 1;
+            results.push(json!({
+                "instanceId": instance.instance_id,
+                "hostId": instance.host_id,
+                "kind": instance.kind,
+                "ok": false,
+                "error": err.to_string(),
+                "reason": "human-only",
+            }));
+            continue;
+        }
         // Per-instance derivation: one key per (broadcast, instance) pair.
         let key = body
             .idempotency_key
@@ -482,6 +501,15 @@ async fn fleet_commands(
                 .or_insert_with(|| json!(instance_id.clone()));
         }
         crate::agent_scope::stamp(&mut payload, &device);
+        // D-062 r2: the Human-only gate for a claimed member.
+        if let Some(member) = state.store.get_instance(instance_id.clone()).await? {
+            crate::herdr_claims::authorize_pane_write(
+                &member,
+                Some(&device),
+                &body.operation,
+                &mut payload,
+            )?;
+        }
         let (command, created) = state
             .store
             .queue_command(

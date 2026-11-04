@@ -420,7 +420,7 @@ pub async fn follow_socket(
     }
     let filter = query.instance_id;
     let tty = query.tty == Some(1);
-    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id, tty)))
+    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device, tty)))
 }
 
 async fn node_session(state: AppState, socket: WebSocket, token: String) {
@@ -2110,9 +2110,12 @@ async fn follow_session(
     state: AppState,
     socket: WebSocket,
     filter: Option<String>,
-    device_id: String,
+    // D-062 r2: the authenticated device rides into the TTY relay so a write
+    // to a claimed pane can be held to the Human-only gate.
+    device: crate::store::Device,
     mut want_tty: bool,
 ) {
+    let device_id = device.id.clone();
     let cap = state.config.follow_buffer_events.max(1);
     let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
@@ -2211,7 +2214,7 @@ async fn follow_session(
                     match msg {
                         Message::Binary(bytes) => {
                             if want_tty {
-                                handle_follow_input(&state, &out_tx, &instance_ids, &bytes).await;
+                                handle_follow_input(&state, &out_tx, &device, &instance_ids, &bytes).await;
                             }
                         }
                         Message::Text(text) => {
@@ -2236,7 +2239,7 @@ async fn follow_session(
                                     }
                                 }
                             } else if kind == Some("tty.resize") && want_tty {
-                                handle_follow_resize(&state, &out_tx, &instance_ids, &value).await;
+                                handle_follow_resize(&state, &out_tx, &device, &instance_ids, &value).await;
                             } else if kind == Some("visibility")
                                 && let Some(visible) = follow_visibility(&value)
                             {
@@ -2576,6 +2579,7 @@ async fn send_tty_diagnostic(
 async fn handle_follow_input(
     state: &AppState,
     out_tx: &mpsc::Sender<FollowMsg>,
+    device: &crate::store::Device,
     instance_ids: &[String],
     bytes: &[u8],
 ) {
@@ -2657,6 +2661,7 @@ async fn handle_follow_input(
     forward_tty_call(
         state,
         out_tx,
+        device,
         &instance_id,
         "tty.write",
         json!({
@@ -2670,6 +2675,7 @@ async fn handle_follow_input(
 async fn handle_follow_resize(
     state: &AppState,
     out_tx: &mpsc::Sender<FollowMsg>,
+    device: &crate::store::Device,
     instance_ids: &[String],
     value: &Value,
 ) {
@@ -2690,6 +2696,7 @@ async fn handle_follow_resize(
     forward_tty_call(
         state,
         out_tx,
+        device,
         instance_id,
         "tty.resize",
         json!({ "instanceId": instance_id, "cols": cols, "rows": rows }),
@@ -2704,12 +2711,33 @@ async fn handle_follow_resize(
 async fn forward_tty_call(
     state: &AppState,
     out_tx: &mpsc::Sender<FollowMsg>,
+    device: &crate::store::Device,
     instance_id: &str,
     method: &str,
-    params: Value,
+    mut params: Value,
 ) {
     let host_id = match state.store.get_instance(instance_id.to_string()).await {
-        Ok(Some(instance)) => instance.host_id,
+        Ok(Some(instance)) => {
+            // D-062 r2: the one Human-only gate for writes to a claimed pane.
+            if let Err(error) = crate::herdr_claims::authorize_pane_write(
+                &instance,
+                Some(device),
+                method,
+                &mut params,
+            ) {
+                tracing::warn!(%instance_id, %method, "follow tty input to a claimed pane refused: not a human operator");
+                send_tty_diagnostic(
+                    out_tx,
+                    Some(instance_id),
+                    method,
+                    "human-only",
+                    &error.to_string(),
+                )
+                .await;
+                return;
+            }
+            instance.host_id
+        }
         Ok(None) => {
             tracing::warn!(%instance_id, %method, "tty relay target instance is unknown");
             send_tty_diagnostic(

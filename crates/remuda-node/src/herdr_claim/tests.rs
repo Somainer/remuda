@@ -834,3 +834,66 @@ fn claim_errors_never_read_as_loss_of_the_nodes_own_carrier() {
         "a claimed pane's server is not the Node's carrier: {error}"
     );
 }
+
+#[tokio::test]
+async fn the_node_refuses_a_non_human_write_to_a_claimed_pane() {
+    let harness = Harness::new().await;
+    let claimed = harness
+        .claim(harness.target("w1", "w1:t1", None))
+        .await
+        .expect("claim");
+    let id = claimed.meta.id.as_id().to_string();
+    harness.wait_call("terminal.control", "w1:p1").await;
+    harness.clear_calls();
+    for (method, params) in [
+        (
+            "instance.keys",
+            json!({"instanceId": id, "keys": ["esc"], "origin": "bot"}),
+        ),
+        (
+            "tty.write",
+            json!({"instanceId": id, "dataBase64": "eA==", "origin": "agent"}),
+        ),
+        (
+            "instance.send",
+            json!({"instanceId": id, "input": {"type": "prompt", "text": "x"}, "origin": "hub"}),
+        ),
+        ("instance.close", json!({"instanceId": id, "origin": "bot"})),
+    ] {
+        let error = crate::transport::hubnode::dispatch_method(&harness.node, method, params)
+            .await
+            .expect_err("a non-human write is refused");
+        assert!(
+            error.to_string().contains("human-only"),
+            "{method}: {error}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let writes: Vec<Value> = harness
+        .calls()
+        .into_iter()
+        .filter(|call| {
+            !matches!(
+                call["method"].as_str(),
+                Some("session.snapshot" | "pane.process_info" | "agent.get" | "pane.read")
+            )
+        })
+        .collect();
+    assert!(writes.is_empty(), "nothing reached the pane: {writes:?}");
+    assert_eq!(
+        harness
+            .store
+            .get_instance(&claimed.meta.id)
+            .expect("row")
+            .lifecycle,
+        InstanceLifecycle::Ready
+    );
+    crate::transport::hubnode::dispatch_method(
+        &harness.node,
+        "instance.keys",
+        json!({"instanceId": id, "keys": ["esc"], "origin": "human"}),
+    )
+    .await
+    .expect("a human write passes");
+    harness.wait_call("terminal.input", "w1:p1").await;
+}

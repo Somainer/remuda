@@ -24,6 +24,23 @@ whatever that pane can do. For the same reason the Hub refuses every
 `/v1/instances/{id}/commands` call on a claimed instance from a non-Human
 caller (403, reason `human-only`).
 
+The rule is structural (round 2). Every operation that writes to a claimed
+pane or ends its claim — `instance.send`, `instance.keys`, `tty.write` and
+`tty.resize` (from the commands route **and** the follow socket's TTY input),
+`instance.configure`, `instance.cancel`, `instance.respond`, `instance.close`,
+release, `DELETE /v1/instances/{id}`, resume and fleet broadcast/run — passes
+one Hub gate, `herdr_claims::authorize_pane_write`, with the authenticated,
+narrowed device. Only a Human device passes; the gate stamps the payload
+(`claimWrite`, `origin: human`), and `forward_if_online` refuses (and settles
+rejected) any such command for a claimed instance without that stamp, so a
+route that forgets the gate fails closed. Hub-internal work (inbox delivery,
+restart notices, digests) never writes to a claimed pane. A fleet broadcast
+from a non-Human skips claimed targets with a per-instance `human-only`
+result. The Node refuses the same writes to a claimed pane when the frame's
+Hub-stamped `origin` is not `human`. A source-scan test fails if a Hub path
+sends a pane-write Node RPC without the gate. A claimed pane cannot be
+resumed at all (400).
+
 ## 2. Identity
 
 A claim names:

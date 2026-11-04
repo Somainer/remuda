@@ -70,6 +70,55 @@ pub const REASON_RELEASED: &str = "released";
 /// Native diagnostic carrying `lost` / `ok` contact with the herdr server.
 pub const CONTACT_EVENT: &str = "herdr_claim_contact";
 
+/// Hub→Node methods that write to a pane or end its claim (D-062 r2).
+const PANE_WRITE_METHODS: &[&str] = &[
+    "instance.send",
+    "instance.configure",
+    "instance.cancel",
+    "instance.respond",
+    "interaction.respond",
+    "tty.write",
+    "instance.keys",
+    "tty.resize",
+    "instance.close",
+    "instance.purge",
+];
+
+/// D-062 r2, Node side of the Human-only rule: refuse a write to a claimed
+/// pane whose frame carries a Hub-stamped origin other than `human`. A frame
+/// with no origin (an older Hub) is left to the Hub's gate.
+pub(crate) fn refuse_non_human_write(
+    node: &DevNode,
+    method: &str,
+    params: &Value,
+) -> Result<(), NodeError> {
+    if !PANE_WRITE_METHODS.contains(&method) {
+        return Ok(());
+    }
+    let Some(origin) = params.get("origin") else {
+        return Ok(());
+    };
+    if origin.as_str() == Some("human") {
+        return Ok(());
+    }
+    let Some(id) = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .and_then(|id| InstanceId::from_str(id).ok())
+    else {
+        return Ok(());
+    };
+    match node.inner.store.get_instance(&id) {
+        Ok(instance) if instance.driver == DriverKind::HerdrClaimed => {
+            tracing::warn!(instance = %id.as_id(), method, "non-human write to a claimed herdr pane refused");
+            Err(NodeError::InvalidRequest(format!(
+                "human-only: {method} to a claimed herdr pane needs a human operator (D-062)"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Whether `method` is one of the D-062 claim RPCs.
 pub(crate) fn is_herdr_claim_method(method: &str) -> bool {
     matches!(

@@ -55,6 +55,83 @@ pub(crate) fn is_claimed(instance: &InstanceRecord) -> bool {
     instance.driver == DRIVER
 }
 
+/// Operations that write to a claimed pane or end/release its claim (D-062
+/// r2). On a `herdr-claimed` instance every one of them needs a seated Human
+/// device, never a Bot, an Agent, a narrowed Human or the Hub itself.
+pub(crate) const PANE_WRITE_OPS: &[&str] = &[
+    "instance.send",
+    "instance.keys",
+    "tty.write",
+    "tty.resize",
+    "instance.configure",
+    "instance.cancel",
+    "instance.respond",
+    "interaction.respond",
+    "instance.close",
+    "instance.resume",
+    "instance.purge",
+];
+
+/// Hub-stamped proof, on a forwarded payload, that [`authorize_pane_write`]
+/// admitted the write. `agent_scope::stamp` strips any caller-supplied copy.
+pub(crate) const CLAIM_WRITE_MARK: &str = "claimWrite";
+
+/// The ONE gate for writes to a claimed pane (D-062 r2 item 1).
+///
+/// Every Hub path that forwards a [`PANE_WRITE_OPS`] operation for an
+/// instance calls this with the authenticated (narrowed) device, or `None`
+/// for Hub-internal work. On a claimed instance only a Human device passes;
+/// the payload is then stamped with [`CLAIM_WRITE_MARK`] and `origin: human`
+/// so the forward-time check and the Node can verify it. Anything else is
+/// 403 `human-only`. A non-claimed instance or another operation is untouched.
+pub(crate) fn authorize_pane_write(
+    instance: &InstanceRecord,
+    device: Option<&Device>,
+    operation: &str,
+    payload: &mut Value,
+) -> Result<(), HubError> {
+    if !is_claimed(instance) || !PANE_WRITE_OPS.contains(&operation) {
+        return Ok(());
+    }
+    let Some(device) = device.filter(|device| agent_scope::origin(device) == InputOrigin::Human)
+    else {
+        return Err(human_only());
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(CLAIM_WRITE_MARK.into(), json!(device.id));
+        object.insert("origin".into(), json!("human"));
+    }
+    Ok(())
+}
+
+/// Forward-time backstop: a command for a claimed instance whose operation
+/// writes to the pane must carry the gate's stamp, or it is never sent. A
+/// route that forgot [`authorize_pane_write`] therefore fails closed.
+pub(crate) async fn verify_forward(
+    state: &AppState,
+    command: &crate::store::CommandRecord,
+) -> Result<(), HubError> {
+    if !PANE_WRITE_OPS.contains(&command.operation.as_str()) {
+        return Ok(());
+    }
+    let Some(instance_id) = command.instance_id.clone() else {
+        return Ok(());
+    };
+    let Some(instance) = state.store.get_instance(instance_id).await? else {
+        return Ok(());
+    };
+    if !is_claimed(&instance) {
+        return Ok(());
+    }
+    let stamped = command
+        .payload
+        .get(CLAIM_WRITE_MARK)
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        && command.payload.get("origin").and_then(Value::as_str) == Some("human");
+    if stamped { Ok(()) } else { Err(human_only()) }
+}
+
 async fn require_human(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
     crate::auth::require_origin(headers, &state.config)?;
     // An Agent, or a Human narrowed to an instance, is refused here with
@@ -379,6 +456,8 @@ async fn release(
     if matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") && !host_lost {
         return Ok(Json(json!({ "instance": instance, "released": false })));
     }
+    let mut payload = json!({ "instanceId": instance_id, "origin": "human" });
+    authorize_pane_write(&instance, Some(&device), "instance.close", &mut payload)?;
     let (command, created) = state
         .store
         .queue_command(
@@ -386,7 +465,7 @@ async fn release(
             Some(instance_id.clone()),
             instance.host_id.clone(),
             "instance.close".into(),
-            json!({ "instanceId": instance_id, "origin": "human" }),
+            payload,
             None,
             None,
             None,
@@ -453,5 +532,270 @@ async fn audit(state: &AppState, device: &Device, action: &str, instance_id: &st
         .await
     {
         tracing::warn!(%error, action, instance_id, "herdr claim audit row not written");
+    }
+}
+
+#[cfg(test)]
+mod gate_scan {
+    //! D-062 r2 item 1, structural: every Hub path that sends a Node RPC able
+    //! to write to a claimed pane (or end its claim) goes through the
+    //! Human-only gate. A new route that forwards one without it fails here.
+    use super::PANE_WRITE_OPS;
+    use std::path::{Path, PathBuf};
+
+    /// Bodies of the generic RPC helpers: their method is the caller's
+    /// argument, so the rule applies at their call sites instead.
+    /// `proxy_to_host` (host files), `proxy_scm` (workspace SCM) and
+    /// `call_admitted_frame` (D-057 direct operations) are read/ops proxies
+    /// that take the method from their callers too.
+    const GENERIC_HELPERS: &[&str] = &[
+        "call_node",
+        "call_node_pinned",
+        "proxy_to_host",
+        "proxy_scm",
+        "call_admitted_frame",
+    ];
+    /// Functions that do not route anything: the transport layer itself.
+    const SKIPPED_FILES: &[&str] = &["transport.rs"];
+
+    fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Production text of a file: everything before its first test module.
+    fn production(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).expect("source");
+        match text.find("#[cfg(test)]") {
+            Some(at) => text[..at].to_owned(),
+            None => text,
+        }
+    }
+
+    /// `(name, start, end)` of every fn in `text`, by the next fn header.
+    fn functions(text: &str) -> Vec<(String, usize, usize)> {
+        let mut starts = Vec::new();
+        let mut search = 0;
+        while let Some(found) = text[search..].find("fn ") {
+            let at = search + found;
+            search = at + 3;
+            let prev = text[..at].chars().last().unwrap_or('\n');
+            if !(prev.is_whitespace()) {
+                continue;
+            }
+            let name: String = text[at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                starts.push((name, at));
+            }
+        }
+        let mut out = Vec::new();
+        for (index, (name, start)) in starts.iter().enumerate() {
+            let end = starts.get(index + 1).map_or(text.len(), |next| next.1);
+            out.push((name.clone(), *start, end));
+        }
+        out
+    }
+
+    /// The `index`th top-level argument of the call opening at `open` (`(`).
+    fn argument(text: &str, open: usize, index: usize) -> Option<String> {
+        let mut depth = 0usize;
+        let mut current = String::new();
+        let mut args = Vec::new();
+        let mut in_str = false;
+        for ch in text[open + 1..].chars() {
+            if in_str {
+                current.push(ch);
+                if ch == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => {
+                    in_str = true;
+                    current.push(ch);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' | ']' | '}' if depth == 0 => {
+                    args.push(current.trim().to_owned());
+                    break;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    args.push(current.trim().to_owned());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        args.get(index).cloned()
+    }
+
+    /// Whether a method argument can name a pane write: a guarded literal, or
+    /// anything not a literal (a variable carries any method).
+    fn may_write(method: &str) -> bool {
+        match method
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(literal) => PANE_WRITE_OPS.contains(&literal),
+            None => {
+                let upper = method.to_ascii_uppercase();
+                let guarded_const = [
+                    "TTY_WRITE",
+                    "TTY_RESIZE",
+                    "INSTANCE_SEND",
+                    "INSTANCE_KEYS",
+                    "INSTANCE_CLOSE",
+                    "INSTANCE_CONFIGURE",
+                    "INSTANCE_CANCEL",
+                    "INSTANCE_RESPOND",
+                    "INTERACTION_RESPOND",
+                    "INSTANCE_RESUME",
+                ]
+                .iter()
+                .any(|op| upper.contains(op));
+                // A protocol `METHOD_*` constant names its method; any other
+                // non-literal (a variable) may carry any method.
+                !method.contains("METHOD_") || guarded_const
+            }
+        }
+    }
+
+    #[test]
+    fn every_node_write_path_runs_the_human_only_gate() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        let mut checked = Vec::new();
+        let mut offenders = Vec::new();
+        for file in files {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            if SKIPPED_FILES.contains(&name.as_str()) {
+                continue;
+            }
+            let text = production(&file);
+            for (function, start, end) in functions(&text) {
+                if GENERIC_HELPERS.contains(&function.as_str()) {
+                    continue;
+                }
+                let body = &text[start..end];
+                let gated =
+                    body.contains("authorize_pane_write(") || body.contains("verify_forward(");
+                // (pattern, index of the method argument)
+                for (pattern, method_arg) in [
+                    (".call(", 1usize),
+                    ("call_node(", 2),
+                    ("call_node_pinned(", 2),
+                ] {
+                    let mut search = 0;
+                    while let Some(found) = body[search..].find(pattern) {
+                        let at = search + found;
+                        search = at + pattern.len();
+                        if pattern == ".call(" {
+                            // Only Node RPCs: `state.nodes … .call(` / `nodes.call(`.
+                            let before = &body[at.saturating_sub(80)..at];
+                            if !before.contains("nodes") {
+                                continue;
+                            }
+                        } else if body[..at].ends_with("fn ") {
+                            continue;
+                        }
+                        let open = at + pattern.len() - 1;
+                        let Some(method) = argument(body, open, method_arg) else {
+                            continue;
+                        };
+                        if !may_write(&method) {
+                            continue;
+                        }
+                        checked.push(format!("{name}::{function} ({method})"));
+                        if !gated {
+                            offenders.push(format!("{name}::{function} sends {method}"));
+                        }
+                    }
+                }
+            }
+        }
+        // A generic helper's call sites never pass a pane-write method, unless
+        // the calling function runs the gate.
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        for file in files {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            let text = production(&file);
+            for (function, start, end) in functions(&text) {
+                let body = &text[start..end];
+                let gated =
+                    body.contains("authorize_pane_write(") || body.contains("verify_forward(");
+                for helper in GENERIC_HELPERS {
+                    let call = format!("{helper}(");
+                    let mut search = 0;
+                    while let Some(found) = body[search..].find(&call) {
+                        let at = search + found;
+                        search = at + call.len();
+                        if body[..at].ends_with("fn ") || body[..at].ends_with('_') {
+                            continue;
+                        }
+                        let open = at + call.len() - 1;
+                        let args: Vec<String> = (0..6)
+                            .filter_map(|index| argument(body, open, index))
+                            .collect();
+                        let writes = args
+                            .iter()
+                            .any(|arg| PANE_WRITE_OPS.iter().any(|op| arg == &format!("\"{op}\"")));
+                        if writes && !gated {
+                            offenders.push(format!(
+                                "{name}::{function} sends a pane write via {helper}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Node write paths that skip herdr_claims::authorize_pane_write / verify_forward: {offenders:#?}"
+        );
+        // The scan is not vacuous: it saw the three known write paths.
+        for known in ["forward_if_online", "forward_tty_call", "delete_instance"] {
+            assert!(
+                checked
+                    .iter()
+                    .any(|site| site.contains(&format!("::{known} "))),
+                "{known} not found by the scan: {checked:#?}"
+            );
+        }
+        let http = production(&root.join("http.rs"));
+        let forward = functions(&http)
+            .into_iter()
+            .find(|(name, _, _)| name == "forward_if_online")
+            .expect("forward_if_online");
+        assert!(
+            http[forward.1..forward.2].contains("herdr_claims::verify_forward("),
+            "forward_if_online must keep the forward-time backstop"
+        );
     }
 }

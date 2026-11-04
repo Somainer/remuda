@@ -717,3 +717,302 @@ async fn contact_loss_shows_on_the_claim_and_never_ends_the_instance() -> Result
     fixture.hub.shutdown().await;
     Ok(())
 }
+
+// ---- D-062 r2 item 1: every write/end path to a claimed pane is Human-only ----
+
+async fn claimed(fixture: &Fixture) -> Result<String> {
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "{body}");
+    Ok(body["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_owned())
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// Open `/v1/follow?tty=1` for `id` as `header`, then send one TTY input
+/// frame. Returns the follow socket, or the handshake error.
+async fn follow_and_type(
+    fixture: &Fixture,
+    header: (&'static str, String),
+    id: &str,
+) -> Result<Ws> {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+    let mut req = format!("ws://{}/v1/follow?instanceId={id}&tty=1", fixture.hub.addr)
+        .into_client_request()?;
+    req.headers_mut().insert(header.0, header.1.parse()?);
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(req),
+    )
+    .await??;
+    let uuid =
+        remuda_protocol::StreamUuid::from_prefixed_id(remuda_protocol::Id::new("tty")?.as_str())
+            .context("stream uuid")?;
+    let frame = remuda_protocol::encode_binary_frame(
+        remuda_protocol::BinaryChannel::TtyInput,
+        uuid,
+        0,
+        b"rm -rf ~\r",
+    )?;
+    ws.send(Message::Binary(frame.into())).await?;
+    Ok(ws)
+}
+
+/// The next `tty.diagnostic` on a follow socket, if one arrives in time.
+async fn diagnostic(ws: &mut Ws) -> Option<Value> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&text)
+                    && value["type"] == "tty.diagnostic"
+                {
+                    return Some(value);
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn follow_socket_tty_input_to_a_claimed_pane_is_human_only() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let bot = fixture
+        .hub
+        .mint_bot_device_token("hclaim-bot-follow")
+        .await?;
+    let mut ws = follow_and_type(&fixture, ("Authorization", format!("Bearer {bot}")), &id).await?;
+    let refused = diagnostic(&mut ws)
+        .await
+        .context("bot input got no diagnostic")?;
+    assert_eq!(refused["reason"], "human-only", "{refused}");
+    assert_eq!(refused["operation"], "tty.write");
+    assert!(
+        fixture.node.params_of("tty.write").is_empty(),
+        "a bot keystroke reached the node"
+    );
+
+    let agent = fixture
+        .hub
+        .test_mint_agent_token("hclaim-agent-follow", &id)
+        .await?;
+    assert!(
+        follow_and_type(&fixture, ("Authorization", format!("Bearer {agent}")), &id)
+            .await
+            .is_err(),
+        "an agent cannot open the follow socket at all"
+    );
+    assert!(fixture.node.params_of("tty.write").is_empty());
+
+    let _human = follow_and_type(&fixture, ("Cookie", fixture.cookie.clone()), &id).await?;
+    for _ in 0..50 {
+        if !fixture.node.params_of("tty.write").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let writes = fixture.node.params_of("tty.write");
+    assert_eq!(writes.len(), 1, "the human keystroke reaches the node");
+    assert_eq!(writes[0]["origin"], "human");
+    assert!(
+        writes[0]["claimWrite"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{}",
+        writes[0]
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_skips_a_claimed_pane_for_a_non_human() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let body = json!({
+        "operation": "instance.send",
+        "payload": {"input": {"type": "prompt", "text": "hi"}},
+        "kinds": ["claude"],
+    });
+    let bot = fixture
+        .hub
+        .mint_bot_device_token("hclaim-bot-fleet")
+        .await?;
+    let (status, refused) = fixture
+        .call(
+            "POST",
+            "/v1/fleet/broadcast",
+            &[("Authorization", format!("Bearer {bot}"))],
+            Some(&body),
+        )
+        .await?;
+    assert_eq!(status, 200, "{refused}");
+    let row = refused["results"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["instanceId"] == json!(id)))
+        .context("claimed row in the broadcast results")?;
+    assert_eq!(row["ok"], false, "{row}");
+    assert_eq!(row["reason"], "human-only", "{row}");
+    let mut tty = body.clone();
+    tty["operation"] = json!("tty.write");
+    tty["payload"] = json!({"keys": ["enter"]});
+    let _ = fixture
+        .call(
+            "POST",
+            "/v1/fleet/broadcast",
+            &[("Authorization", format!("Bearer {bot}"))],
+            Some(&tty),
+        )
+        .await?;
+    let agent = fixture
+        .hub
+        .test_mint_agent_token("hclaim-agent-fleet", &id)
+        .await?;
+    let _ = fixture
+        .call(
+            "POST",
+            "/v1/fleet/broadcast",
+            &[("Authorization", format!("Bearer {agent}"))],
+            Some(&body),
+        )
+        .await?;
+    assert!(
+        fixture.node.params_of("instance.send").is_empty(),
+        "a non-human broadcast reached the pane"
+    );
+    assert!(fixture.node.params_of("tty.write").is_empty());
+
+    let (status, ok) = fixture
+        .call("POST", "/v1/fleet/broadcast", &fixture.human(), Some(&body))
+        .await?;
+    assert_eq!(status, 200, "{ok}");
+    let sends = fixture.node.params_of("instance.send");
+    assert_eq!(sends.len(), 1, "a human broadcast reaches the claimed pane");
+    assert_eq!(sends[0]["origin"], "human");
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_of_a_claimed_instance_is_human_only() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let bot = fixture
+        .hub
+        .mint_bot_device_token("hclaim-bot-delete")
+        .await?;
+    let (status, refused) = fixture
+        .call(
+            "DELETE",
+            &format!("/v1/instances/{id}?force=1"),
+            &[("Authorization", format!("Bearer {bot}"))],
+            None,
+        )
+        .await?;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["reason"], "human-only", "{refused}");
+    let agent = fixture
+        .hub
+        .test_mint_agent_token("hclaim-agent-delete", &id)
+        .await?;
+    let (status, _) = fixture
+        .call(
+            "DELETE",
+            &format!("/v1/instances/{id}?force=1"),
+            &[("Authorization", format!("Bearer {agent}"))],
+            None,
+        )
+        .await?;
+    assert_eq!(status, 403);
+    for method in ["instance.close", "instance.purge"] {
+        assert!(
+            fixture.node.params_of(method).is_empty(),
+            "{method} reached the node"
+        );
+    }
+    let (_, row) = fixture
+        .call(
+            "GET",
+            &format!("/v1/instances/{id}"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(row["lifecycle"], "ready", "the claim is still live: {row}");
+
+    let (status, deleted) = fixture
+        .call(
+            "DELETE",
+            &format!("/v1/instances/{id}?force=1"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{deleted}");
+    let closes = fixture.node.params_of("instance.close");
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0]["origin"], "human");
+    assert!(closes[0]["claimWrite"].as_str().is_some());
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unstamped_pane_write_is_never_forwarded() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    // A Hub-internal (or forgotten) path queues a send without the gate.
+    let store = fixture.hub.store().context("store")?;
+    let (command, _) = store
+        .queue_command(
+            None,
+            Some(id.clone()),
+            fixture.host.clone(),
+            "instance.send".into(),
+            json!({"instanceId": id, "origin": "human", "input": {"type": "prompt", "text": "x"}}),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    assert!(
+        fixture
+            .hub
+            .test_handle()
+            .test_forward_command_online(&command.command_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture.node.params_of("instance.send").is_empty(),
+        "the unstamped send reached the node"
+    );
+    let row = store
+        .get_command(command.command_id.clone())
+        .await?
+        .context("row")?;
+    assert_ne!(
+        row.state, "queued",
+        "the refused row settles: {}",
+        row.state
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}

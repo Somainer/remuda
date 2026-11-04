@@ -217,6 +217,7 @@ pub async fn dispatch_frame(
     params: Value,
     frame: MethodFrame,
 ) -> Result<Value, NodeError> {
+    crate::herdr_claim::refuse_non_human_write(node, method, &params)?;
     if method == remuda_protocol::METHOD_LINEAGE_FENCE {
         return node.apply_lineage_fence(&params).await;
     }

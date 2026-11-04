@@ -85,7 +85,9 @@ async fn owner_glance(
         .tz_offset_minutes
         .unwrap_or(0)
         .clamp(-14 * 60, 14 * 60);
-    Ok(Json(collect_owner_glance(&state, offset_minutes).await?))
+    Ok(Json(
+        collect_owner_glance(&state, &device, offset_minutes).await?,
+    ))
 }
 
 /// The owner's local-day start (00:00 local), expressed in UTC so the
@@ -100,9 +102,67 @@ fn local_day_start(now: OffsetDateTime, offset_minutes: i32) -> OffsetDateTime {
         .to_offset(UtcOffset::UTC)
 }
 
+/// One item of the merged `/v1/interactions` page as a pending interaction of
+/// the glance. The page merges the durable rows, the Hub's in-memory D-017
+/// grants and each Node's live copy; the owner's 需要你 count and the queue are
+/// derived from that same page, so a live card the owner can answer is never
+/// missing here.
+fn merged_item_pending(item: &Value) -> Option<PendingInteraction> {
+    let instance_id = item.get("instanceId").and_then(Value::as_str)?.to_string();
+    // Only a pending row is in the 待你处理 queue (deriveInboxQueue).
+    if item.get("state").and_then(Value::as_str) != Some("pending") {
+        return None;
+    }
+    let interaction_id = item
+        .get("interactionId")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let interaction = item
+        .get("interaction")
+        .cloned()
+        .unwrap_or_else(|| item.clone());
+    Some(PendingInteraction {
+        record: InteractionRecord {
+            interaction_id,
+            instance_id,
+            host_id: item
+                .get("hostId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            kind: item
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("approval")
+                .to_string(),
+            state: "pending".to_string(),
+            blocking: item
+                .get("blocking")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            // `pending_parts` reads `/payload/interaction` or `/interaction`, and
+            // the merged item carries the request inside that entity.
+            payload: serde_json::json!({ "interaction": interaction }),
+            created_at: item
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            updated_at: item
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        expired: false,
+    })
+}
+
 /// Render the owner glance at `offset_minutes` east of UTC.
 pub(crate) async fn collect_owner_glance(
     state: &AppState,
+    device: &crate::store::Device,
     offset_minutes: i32,
 ) -> Result<OwnerGlance, HubError> {
     let now = OffsetDateTime::now_utc();
@@ -111,11 +171,32 @@ pub(crate) async fn collect_owner_glance(
     let day_start = local_day_start(now, offset_minutes);
     let day_start = crate::config::rfc3339(day_start);
     let now_str = crate::config::rfc3339(now);
-    let snapshot = state
+    let mut snapshot = state
         .store
         .owner_glance_snapshot(day_start, now_str, now.unix_timestamp())
         .await
         .map_err(map_store)?;
+    // The queue's own source: the merged `/v1/interactions` page (durable rows
+    // + the Hub's in-memory grants + each Node's live copy), filtered to the
+    // owner scope and de-duplicated against the durable rows the snapshot read.
+    let merged = crate::interactions::merged_interactions(state, device, None, None, None).await?;
+    let scope: std::collections::HashSet<&str> =
+        snapshot.scope.iter().map(String::as_str).collect();
+    let mut seen: std::collections::HashSet<String> = snapshot
+        .pending
+        .iter()
+        .map(|pending| pending.record.interaction_id.clone())
+        .collect();
+    for item in merged {
+        let Some(pending) = merged_item_pending(&item) else {
+            continue;
+        };
+        if scope.contains(pending.record.instance_id.as_str())
+            && seen.insert(pending.record.interaction_id.clone())
+        {
+            snapshot.pending.push(pending);
+        }
+    }
     Ok(render_owner_glance(
         snapshot,
         now.unix_timestamp(),
@@ -154,6 +235,8 @@ pub(crate) struct BlockedTask {
 
 /// Everything the route reads, in one consistent snapshot.
 pub(crate) struct OwnerGlanceSnapshot {
+    /// The owner-scope instance ids (the same list the rows are filtered by).
+    pub scope: Vec<String>,
     pub instances: Vec<ScopeInstance>,
     pub pending: Vec<PendingInteraction>,
     pub blocked_tasks: Vec<BlockedTask>,
@@ -334,6 +417,7 @@ impl Store {
             }
             tx.commit()?;
             Ok(OwnerGlanceSnapshot {
+                scope,
                 instances,
                 pending,
                 blocked_tasks,
@@ -453,10 +537,15 @@ fn render_owner_glance(
     now: i64,
     offset_minutes: i32,
 ) -> OwnerGlance {
-    let queued: std::collections::HashSet<&str> = snapshot
+    // §5.1 A counts INTERACTIONS (the inbox queue is one row per interaction);
+    // the instance set is only what the B rule dedupes against.
+    let live_pending: Vec<&PendingInteraction> = snapshot
         .pending
         .iter()
         .filter(|pending| !pending.expired)
+        .collect();
+    let queued: std::collections::HashSet<&str> = live_pending
+        .iter()
         .map(|pending| pending.record.instance_id.as_str())
         .collect();
     let mut sessions_by_task: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -477,7 +566,7 @@ fn render_owner_glance(
                 .is_some_and(|sessions| sessions.iter().any(|id| queued.contains(id)))
         })
         .count();
-    let need_you = queued.len() + blocked_without_interaction;
+    let need_you = live_pending.len() + blocked_without_interaction;
 
     let mut done_unseen = 0;
     let mut working = 0;
@@ -678,6 +767,10 @@ mod tests {
 
     fn snapshot(instances: Vec<ScopeInstance>) -> OwnerGlanceSnapshot {
         OwnerGlanceSnapshot {
+            scope: instances
+                .iter()
+                .map(|row| row.instance_id.clone())
+                .collect(),
             instances,
             pending: Vec::new(),
             blocked_tasks: Vec::new(),
@@ -756,6 +849,7 @@ mod tests {
     #[test]
     fn an_expired_interaction_is_not_queued_and_not_counted() {
         let snap = OwnerGlanceSnapshot {
+            scope: vec!["ins_a".to_string()],
             instances: vec![instance("ins_a", "running", "blocked")],
             pending: vec![PendingInteraction {
                 record: pending(
@@ -836,6 +930,7 @@ mod tests {
         )];
         let first = render(snap);
         let again = render(OwnerGlanceSnapshot {
+            scope: vec!["ins_a".to_string()],
             instances: vec![instance("ins_a", "running", "blocked")],
             pending: vec![pending(
                 "int_a",
@@ -889,6 +984,56 @@ mod tests {
         );
         let glance = render(snap);
         assert_eq!(glance.working[0].headline, "turn: turn_done");
+    }
+
+    /// §5.1 A counts interactions, not sessions: two cards on one session are
+    /// two 需要你 and one waiting ROW (§5.3 is per-session).
+    #[test]
+    fn two_pending_cards_on_one_session_count_twice_but_row_once() {
+        let snap = OwnerGlanceSnapshot {
+            scope: vec!["ins_a".to_string()],
+            instances: vec![instance("ins_a", "running", "blocked")],
+            pending: vec![
+                pending(
+                    "int_a",
+                    "ins_a",
+                    json!({ "kind": "approval", "title": "Bash" }),
+                ),
+                pending(
+                    "int_b",
+                    "ins_a",
+                    json!({ "kind": "approval", "title": "Read" }),
+                ),
+            ],
+            blocked_tasks: Vec::new(),
+            journals: HashMap::new(),
+            main_instance: None,
+        };
+        let glance = render(snap);
+        assert_eq!(glance.counts.need_you, 2);
+        assert_eq!(glance.waiting.len(), 1);
+    }
+
+    /// The `/v1/interactions` page merges each Node's live copy and the Hub's
+    /// in-memory grants; the owner count must see the same rows (the e2e fake
+    /// Node parks its approvals in the live copy, not in the table).
+    #[test]
+    fn a_merged_node_card_becomes_a_pending_interaction() {
+        let card = json!({
+            "id": "int_broker", "interactionId": "int_broker",
+            "instanceId": "ins_a", "hostId": "hst_1", "kind": "approval",
+            "state": "pending", "blocking": true,
+            "createdAt": "2026-10-29T01:00:00.000Z",
+            "updatedAt": "2026-10-29T01:00:00.000Z",
+            "request": { "kind": "approval", "title": "Bash", "description": "echo e2e" },
+            "deadline": { "state": "unknown" },
+        });
+        let pending = merged_item_pending(&card).expect("a broker card");
+        assert_eq!(pending.record.instance_id, "ins_a");
+        assert!(!pending.expired);
+        let (kind, question) = crate::digest::interaction_question(&pending.record);
+        assert_eq!(kind, "approval");
+        assert_eq!(question, "echo e2e");
     }
 
     /// §5.3 今日完成: the same instant is yesterday for one offset and today

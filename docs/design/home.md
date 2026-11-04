@@ -376,7 +376,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 
 **授权。** 只有 owner 自己的 Human 设备能读：Agent、Bot、以及带 `x-remuda-instance-id` 被降级成 Agent 的 Human 凭据都得到 403。
 
-行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。一次调用的开销是一组有界查询：范围递归一次、实例页一次、范围内的 pending 交互一次、阻塞任务一次，以及至多 50 条工作中会话各自一段有界 journal（与 digest 的 256 行上限相同）。
+行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。一次调用的开销是一组有界查询：范围递归一次、实例页一次、阻塞任务一次、`/v1/interactions` 同一合并页一次（durable 行 + Hub 内存里的一次性授权 + 各 Node 的 live 副本，`需要你` 与收件箱因此同源），以及至多 50 条工作中会话各自一段有界 journal（与 digest 的 256 行上限相同）。
 
 ## 6 Main 卡与「问 Main」
 

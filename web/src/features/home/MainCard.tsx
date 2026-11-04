@@ -9,7 +9,16 @@ import type { Id } from "../../types/wire";
 import { Composer } from "../session/Composer";
 import { mainEcho, type MainEcho } from "./mainStatus";
 import { useMainTail } from "./mainTail";
-import { mainStatusFor, useCompactLayout, useLineageSync } from "./useMain";
+import { mainStatusFor, useCompactLayout, useLineageSync, useMainAside } from "./useMain";
+import { useHomeFreshness } from "./freshness";
+import { WakeSheet } from "./WakeSheet";
+import { useMainWakes, wakeLine } from "./wakes";
+import { glanceCounts, type GlanceSource } from "./glance";
+import { useInboxClockNow } from "../mobile/useInboxPendingCount";
+import { thisDeviceId } from "../../lib/interactionStatus";
+import { useTaskLedger } from "../tasks/taskLedger";
+import { quickAskChips, stuckCount } from "./quickAsk";
+import wakesCss from "./wakes.module.css";
 import css from "./mainCard.module.css";
 
 /** Everything the card and the 问 Main input read about the resolved Main. */
@@ -40,6 +49,13 @@ export function MainCard({ placement }: { placement: "phone" | "desktop" }) {
 function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phone" | "desktop" }) {
   const { hub, instance, status, online } = useMainView(entry);
   const { tail, carried, read } = useMainTail(entry, hub.instances);
+  // §2.4: at ≥1440 the wake-ups are the 「今天」 card in the right column; on
+  // the phone and at 1280–1439 they are this card's optional third line.
+  const aside = useMainAside();
+  const freshness = useHomeFreshness();
+  const wakes = useMainWakes(entry.lineageId);
+  const [wakesOpen, setWakesOpen] = useState(false);
+  const wakeText = wakes.loaded ? wakeLine(wakes.wakes) : null;
   const echo = mainEcho({
     entry,
     bubbles: hub.bubbles,
@@ -101,6 +117,32 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
           }
         }}
       />
+      {!aside && wakeText ? (
+        <button
+          type="button"
+          className={wakesCss.line}
+          data-testid="main-wake-line"
+          data-stale={freshness.state === "stale" ? "1" : undefined}
+          aria-haspopup="dialog"
+          onClick={() => setWakesOpen(true)}
+        >
+          <span aria-hidden="true">◷</span>
+          <span className={wakesCss.lineText} title={wakeText}>
+            {wakeText}
+          </span>
+          <span className={wakesCss.lineChevron} aria-hidden="true">
+            ›
+          </span>
+        </button>
+      ) : null}
+      {!aside && wakeText ? (
+        <WakeSheet
+          open={wakesOpen}
+          wakes={wakes.wakes}
+          stale={freshness.state === "stale"}
+          onClose={() => setWakesOpen(false)}
+        />
+      ) : null}
       {desktop ? (
         <div className={css.meta} data-testid="main-card-meta">
           {modelWord || effortWord ? (
@@ -146,8 +188,29 @@ export function MainAskDock() {
  * message will queue.
  */
 function AskMain({ entry }: { entry: MainEntry }) {
-  const { instance, status, online } = useMainView(entry);
+  const { hub, instance, status, online } = useMainView(entry);
   const mobile = useCompactLayout();
+  const { tasks } = useTaskLedger(null);
+  const deviceId = useMemo(() => thisDeviceId(), []);
+  const nowMs = useInboxClockNow();
+  // home.md §6.3: the chips are only the questions this Main can answer; the
+  // counts are the same ① derivation the home paints (never invented).
+  const suggestions = useMemo(() => {
+    const source: GlanceSource = {
+      instances: hub.instances,
+      interactions: hub.interactions,
+      hosts: hub.hosts,
+      tasks,
+      answering: hub.answering,
+      deviceId,
+      nowMs,
+    };
+    return quickAskChips({
+      grants: instance.grants,
+      needYou: glanceCounts(source).needYou,
+      stuck: stuckCount(source),
+    });
+  }, [hub.instances, hub.interactions, hub.hosts, hub.answering, tasks, deviceId, nowMs, instance.grants]);
   // The draft and staged files belong to the LINEAGE: Resume or a restart
   // moves Main to a new chapter and the half-typed message must survive it.
   const scope = askScope(entry.lineageId);
@@ -185,6 +248,7 @@ function AskMain({ entry }: { entry: MainEntry }) {
       phase="idle"
       capabilities={instance.capabilities}
       placeholder={placeholder}
+      suggestions={suggestions}
       primaryOverride={
         status.resumable
           ? {

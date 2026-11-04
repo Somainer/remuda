@@ -142,9 +142,15 @@ export function Composer({
   placeholder,
   primaryOverride = null,
   draftScope,
+  suggestions,
 }: {
   /** The instance sends and uploads go to. */
   instanceId: string;
+  /**
+   * Ask variant only (home.md §6.3): the quick-ask chips, shown ONLY while
+   * the input holds focus. A tap fills the input with `text` and never sends.
+   */
+  suggestions?: readonly { id: string; label: string; text: string }[];
   /**
    * Where the draft and the staged attachments live; defaults to
    * `instanceId`. The 问 Main input scopes them to the Main LINEAGE, so a
@@ -273,6 +279,8 @@ export function Composer({
   const ask = variant === "ask";
   const scope = draftScope ?? instanceId;
   const [text, setText] = useState(() => readDraft(scope));
+  // home.md §6.3: the quick-ask chips appear only while the input has focus.
+  const [inputFocused, setInputFocused] = useState(false);
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
   // and the Sheet that replaces both window.confirm calls.
@@ -1560,6 +1568,31 @@ export function Composer({
         onRetry={images.retry}
       />
       <CodeQuoteChips quotes={codeQuotes.quotes} unreferenced={unreferencedCode} onRemove={removeCodeQuote} />
+      {/* home.md §6.3: quick-ask chips, only while the 问 Main input focused.
+          A tap fills the draft through the SAME path as typing and never
+          sends; mousedown is swallowed so the textarea keeps focus. */}
+      {ask && inputFocused && suggestions && suggestions.length > 0 ? (
+        <div className={css.askChips} data-testid="composer-suggestions" role="group" aria-label="快捷提问">
+          {suggestions.map((suggestion) => (
+            <button
+              key={suggestion.id}
+              type="button"
+              className={css.askChip}
+              data-testid="composer-suggestion"
+              data-suggestion-id={suggestion.id}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                textRef.current = suggestion.text;
+                setText(suggestion.text);
+                writeDraft(scope, suggestion.text);
+                inputRef.current?.focus();
+              }}
+            >
+              {suggestion.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
       {images.notice ? (
         <div className={css.attachNotice} data-testid="attachment-notice">
           {images.notice}
@@ -1597,6 +1630,8 @@ export function Composer({
             setText(e.target.value);
             writeDraft(scope, e.target.value);
           }}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
           onPaste={(event) => {
             // Swallow the paste only when a file was actually taken: otherwise
             // plain-text pasting and the iOS caret both break.

@@ -22834,7 +22834,7 @@
               "type": "null"
             }
           ],
-          "description": "How its processes were contained once it ended (cleanup, not a\nsecurity boundary): `cgroup` (every process killed with its verified\ncgroup v2 leaf), `subreaper` (Linux: descendants, marked processes and\nthe process group swept; a check that kills its supervisor and\ndetaches with a cleared environment can outlive it) or `process-group`\n(only the group). Absent when nothing ran."
+          "description": "How its processes were contained once it ended (cleanup, not a\nsecurity boundary: a check runs with its admitter's authority, so a\nsurvivor escalates nothing): `cgroup` (every process still in its\nverified per-check cgroup v2 domain killed; one that moved itself into\na writable ancestor such as the Node's delegated cgroup, cleared its\nmarker and killed its supervisor can outlive it), `subreaper` (Linux:\ndescendants, marked processes and the process group swept; a check that\nkills its supervisor and detaches with a cleared environment can\noutlive it) or `process-group` (only the group). Absent when nothing\nran."
         },
         "containmentIncomplete": {
           "description": "The sweep stopped at its hard limit with processes the kernel could\nnot kill still live.",

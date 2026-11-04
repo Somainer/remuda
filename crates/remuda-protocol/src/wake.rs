@@ -397,11 +397,15 @@ pub struct WakeRunCheck {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_truncated: bool,
     /// How its processes were contained once it ended (cleanup, not a
-    /// security boundary): `cgroup` (every process killed with its verified
-    /// cgroup v2 leaf), `subreaper` (Linux: descendants, marked processes and
-    /// the process group swept; a check that kills its supervisor and
-    /// detaches with a cleared environment can outlive it) or `process-group`
-    /// (only the group). Absent when nothing ran.
+    /// security boundary: a check runs with its admitter's authority, so a
+    /// survivor escalates nothing): `cgroup` (every process still in its
+    /// verified per-check cgroup v2 domain killed; one that moved itself into
+    /// a writable ancestor such as the Node's delegated cgroup, cleared its
+    /// marker and killed its supervisor can outlive it), `subreaper` (Linux:
+    /// descendants, marked processes and the process group swept; a check that
+    /// kills its supervisor and detaches with a cleared environment can
+    /// outlive it) or `process-group` (only the group). Absent when nothing
+    /// ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<WakeCheckContainment>,
     /// The sweep stopped at its hard limit with processes the kernel could

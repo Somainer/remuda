@@ -14,9 +14,14 @@
 //!    a process that outlives it gains nothing that check did not have. What
 //!    applies, recorded on the run as its `containment` label (see
 //!    [`contain`]):
-//!    * `cgroup`: the outer shell was verified to be in a cgroup v2 leaf
-//!      (the Node's own cgroup delegated and writable). `cgroup.kill` ends
-//!      every process of the check, whatever it did;
+//!    * `cgroup`: the outer shell was verified to be in the leaf of a cgroup
+//!      v2 domain made for this check alone under the Node's delegated cgroup.
+//!      `cgroup.kill` on the leaf and the domain ends every process of the
+//!      check still in either, whatever `setsid`, a double fork or a cleared
+//!      environment did. **Residual:** a process that writes its own pid into
+//!      the `cgroup.procs` of a writable ancestor (the Node's delegated cgroup)
+//!      leaves both, and, if it also clears its marker, detaches and kills its
+//!      supervisor, can outlive the report;
 //!    * `subreaper` (Linux otherwise): the outer shell is a child subreaper
 //!      (`PR_SET_CHILD_SUBREAPER`), so every orphan below it, `setsid`, a
 //!      double fork and `nohup … &` included, is reparented to it. Until two
@@ -314,7 +319,7 @@ impl Containment {
 /// A fresh cgroup v2 leaf for one check, when the Node's own cgroup is
 /// delegated to it (see [`CgroupFs::leaf_parent`]); not yet joined.
 fn cgroup_leaf() -> Option<Leaf> {
-    CgroupFs::system()?.create_leaf(&format!("check-{}", uuid::Uuid::now_v7().simple()))
+    CgroupFs::system()?.create_leaf(&uuid::Uuid::now_v7().simple().to_string())
 }
 
 /// The live (not zombie) descendants of `root`, from `/proc/*/stat`.
@@ -448,18 +453,12 @@ fn live_marked(marker: &str) -> Vec<i32> {
     found
 }
 
-/// The pids in a cgroup leaf.
+/// The pids in a cgroup leaf and its per-check domain.
 fn leaf_members(containment: &Containment) -> Vec<i32> {
     containment
         .leaf
         .as_ref()
-        .and_then(|leaf| std::fs::read_to_string(leaf.dir.join("cgroup.procs")).ok())
-        .map(|procs| {
-            procs
-                .lines()
-                .filter_map(|pid| pid.trim().parse().ok())
-                .collect()
-        })
+        .map(Leaf::members)
         .unwrap_or_default()
 }
 
@@ -539,7 +538,7 @@ impl Sweep {
 /// of the walk's reach. Elsewhere: the process group.
 async fn sweep(sweep: &mut Sweep, containment: &Containment, outer: Option<u32>, marker: &str) {
     if let Some(leaf) = &containment.leaf {
-        let _ = std::fs::write(leaf.dir.join("cgroup.kill"), "1");
+        leaf.kill();
     }
     #[cfg(not(target_os = "linux"))]
     kill_group(outer);
@@ -594,7 +593,7 @@ async fn sweep_after_reap(
 fn remove_leaf(containment: &Containment) {
     if let Some(leaf) = &containment.leaf {
         for _ in 0..100 {
-            if std::fs::remove_dir(&leaf.dir).is_ok() {
+            if leaf.remove() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));

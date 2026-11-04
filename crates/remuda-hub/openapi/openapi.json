@@ -6919,7 +6919,7 @@
         "type": "string"
       },
       "WakeCheckContainment": {
-        "description": "How a check's processes were contained once it ended (cleanup, not a security boundary): cgroup (every process killed with its verified cgroup v2 leaf), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.",
+        "description": "How a check's processes were contained once it ended (cleanup, not a security boundary: a check runs with its admitter's authority, so a survivor escalates nothing): cgroup (every process still in its verified per-check cgroup v2 domain killed; one that moved itself into a writable ancestor such as the Node's delegated cgroup, cleared its marker and killed its supervisor can outlive it), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.",
         "enum": [
           "cgroup",
           "subreaper",

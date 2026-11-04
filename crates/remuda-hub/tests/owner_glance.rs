@@ -368,12 +368,42 @@ async fn the_scope_is_main_subtree_plus_hand_opened_not_private_lineages() -> Re
     // A second blocked task whose only session is already in the queue is the
     // `linked` task above (created before `plain`).
 
+    // A pending interaction on a session OUTSIDE the owner scope (the private
+    // worker): ① needYou must still count it — §5.1 says ①, the ④ header and
+    // the OS badge are one definition, and both of those read every
+    // interaction. §5.3 keeps the ROW scoped, so no waiting row names it.
+    ctx.journal(
+        &private,
+        json!({ "kind": "interaction.requested", "payload": { "interaction": {
+            "id": "int_glance_private", "kind": "approval", "state": "pending", "blocking": true,
+            "answerable": true, "carrier": "harness-hook",
+            "deadline": { "state": "unknown" },
+            "request": { "kind": "approval", "title": "Bash", "description": "private run?",
+                         "toolCallId": "tc_private", "options": [] } }}}),
+    )
+    .await?;
+
     let (status, glance) = ctx.get(&ctx.human, "/v1/owner/glance").await?;
     assert_eq!(status, 200, "{glance}");
-    // A (the pending approval) + B (the blocked `task`, whose sessions are not
-    // queued). The `linked` task is blocked too, but its session already holds
-    // the approval, so it must not be counted a second time (§5.1).
-    assert_eq!(glance["counts"]["needYou"], 2, "{glance}");
+    // A (both pending approvals, one out of scope) + B (the blocked `task`,
+    // whose sessions are not queued). The `linked` task is blocked too, but its
+    // session already holds an approval, so it is not counted a second time
+    // (§5.1).
+    assert_eq!(glance["counts"]["needYou"], 3, "{glance}");
+    // The queue's own source agrees: every pending row the merged page serves.
+    let (status, interactions) = ctx.get(&ctx.human, "/v1/interactions").await?;
+    assert_eq!(status, 200, "{interactions}");
+    let pending_rows = interactions["items"]
+        .as_array()
+        .context("interactions items")?
+        .iter()
+        .filter(|item| item["state"].as_str() == Some("pending"))
+        .count();
+    assert_eq!(
+        u64::try_from(pending_rows).unwrap_or(u64::MAX) + 1,
+        glance["counts"]["needYou"].as_u64().unwrap_or(0),
+        "needYou == the queue's interactions + B: {glance} {interactions}"
+    );
     let waiting = glance["waiting"].as_array().context("waiting rows")?;
     let row = waiting
         .iter()
@@ -385,6 +415,12 @@ async fn the_scope_is_main_subtree_plus_hand_opened_not_private_lineages() -> Re
             .as_str()
             .is_some_and(|text| text.contains("run the tests?")),
         "{row}"
+    );
+    assert!(
+        waiting
+            .iter()
+            .all(|row| row["instanceId"].as_str() != Some(private.as_str())),
+        "the out-of-scope session gets no waiting row: {waiting:?}"
     );
     Ok(())
 }

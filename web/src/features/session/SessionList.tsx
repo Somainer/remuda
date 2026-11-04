@@ -759,13 +759,20 @@ export function SessionList({
         // Desktop groups are status buckets, not project groups, so an idle fold
         // here would hide the only row whenever every session is idle. Project
         // folding stays on the phone home; this list only shares rank().
+        // 「子 agent 不在此列」 is true only on the unfiltered board: the ① rank
+        // tap lists dispatched workers too (see `source` above), so the caption
+        // goes with the filter rather than contradicting the rows.
         return (
           <section key={group.key} data-testid={`session-group-${group.key}`}>
             <div className={css.group}>
               <div className={`${css.groupTitle} ${group.key === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
-              <div className={css.groupMeta}>
+              <div className={css.groupMeta} data-testid={`session-group-meta-${group.key}`}>
                 {items.length}
-                {group.key === "blocked" ? " · 置顶，不进折叠组" : group.key === "recent" ? " · 子 agent 不在此列" : ""}
+                {group.key === "blocked"
+                  ? " · 置顶，不进折叠组"
+                  : group.key === "recent" && !rankFiltered
+                    ? " · 子 agent 不在此列"
+                    : ""}
               </div>
             </div>
             {items.map((instance) => {

@@ -1,9 +1,10 @@
 /**
  * home.md §5.1/§5.2/§5.3: the desktop ① row paints the ONE owner glance the
  * Hub serves (`GET /v1/owner/glance`), never a derivation over the instance
- * list. /sessions still lists top-level sessions only, so the board can hold
- * fewer rows than the owner-scope ● count — the count is the owner's whole
- * world, which is what ⑥ renders.
+ * list. The unfiltered /sessions board leaves out the sessions an Agent
+ * dispatched, so it can hold fewer rows than the owner-scope ● count — the
+ * count is the owner's whole world, which is what ⑥ renders and what the
+ * rank tap then lists.
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -399,4 +400,67 @@ it("keeps a resumed session on the board and folds only the dispatched worker", 
   } finally {
     vi.stubGlobal("fetch", realFetch);
   }
+});
+
+/**
+ * [r4 item 5] 「子 agent 不在此列」 is a claim about the rows: it holds on the
+ * unfiltered board and is false under a rank filter, which lists dispatched
+ * workers too. The caption follows the filter.
+ */
+it("drops the 子 agent caption when a rank filter lists the workers", async () => {
+  const host = {
+    ...mockDb.hosts[0],
+    id: "host-a",
+    workspaces: [{ workspaceId: "wsp-a", hostId: "host-a", root: "/home/dev/ws" }],
+  };
+  const base = {
+    ...mockDb.instances[0],
+    hostId: "host-a",
+    workspaceId: "wsp-a",
+    lifecycle: "running",
+    connectivity: "connected",
+    activity: known("idle"),
+    unseen: false,
+  };
+  const root = { ...base, id: "ins-root", parent: null, creatorOrigin: "human" } as Instance;
+  const worker = {
+    ...base,
+    id: "ins-worker",
+    parent: { instanceId: "ins-root", runId: null, commandId: null },
+    creatorOrigin: "agent",
+  } as Instance;
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [host], nextCursor: null } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [root, worker], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockImplementation(() => () => undefined);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(glance());
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  await hubStore.bootstrap();
+  await hubStore.refresh();
+  await hubStore.refreshGlance();
+
+  const { unmount } = render(
+    <MemoryRouter initialEntries={["/sessions?scope=all"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  await screen.findByTestId("session-list");
+  expect(screen.getAllByTestId("board-card")).toHaveLength(1);
+  expect(screen.getByTestId("session-group-meta-recent")).toHaveTextContent("子 agent 不在此列");
+  unmount();
+
+  render(
+    <MemoryRouter initialEntries={["/sessions?scope=all&rank=idle"]}>
+      <SessionsPage />
+    </MemoryRouter>,
+  );
+  await screen.findByTestId("session-list");
+  expect(screen.getAllByTestId("board-card")).toHaveLength(2);
+  expect(screen.getByTestId("session-group-meta-recent")).toHaveTextContent("2");
+  expect(screen.getByTestId("session-group-meta-recent")).not.toHaveTextContent("子 agent");
 });

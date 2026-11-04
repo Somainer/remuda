@@ -106,9 +106,12 @@ export function SessionList({
   // dispatched (they are never plain desktop rows). A resume is NOT one: it
   // names the resumed session as its parent but stays on the board
   // (`dispatchedChild`). The ① rank tap, however, filters by the SAME rank the
-  // owner glance counted, and that count spans the owner's whole world —
-  // dispatched workers included (⑥ lists them too) — so a rank-filtered board
-  // INCLUDES them. The count and the tapped rows therefore always agree.
+  // owner glance counted, and that count includes dispatched workers (⑥ lists
+  // them too), so a rank-filtered board INCLUDES them. The tapped rows are the
+  // rank over the rows this board holds, not the glance's owner scope: inside
+  // the owner's world they match the count, but a session outside it (another
+  // agent's private lineage) is listed without being counted, and a Space
+  // scope lists only that Space's share of the count.
   const rankFiltered = conditions.rank.length > 0;
   const source = (global ? hub.instances : (instances ?? hub.instances)).filter(
     (instance) => rankFiltered || !dispatchedChild(instance),

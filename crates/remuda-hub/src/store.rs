@@ -2685,6 +2685,10 @@ impl Store {
                     }
                 };
                 drop(ready_tx);
+                // cb-wake-engine: results the previous process left queued
+                // are applied, then every run still running is interrupted
+                // (never replayed), before any job runs.
+                crate::wake::boot(&mut conn);
                 // cb-inbox-facts: facts the previous process left queued.
                 crate::inbox::drain_sources(&mut conn);
                 // cb-inbox-deliver: rows the previous process left waiting.
@@ -2701,6 +2705,9 @@ impl Store {
                             // cb-inbox-facts: the state changes this job
                             // committed that queued a fact source.
                             crate::inbox::drain_sources(&mut conn);
+                            // cb-wake-engine: wake results this job queued
+                            // (their notices join the outbox below).
+                            crate::wake::drain_outcomes(&mut conn, time::OffsetDateTime::now_utc());
                             // cb-inbox-deliver: the lineages whose delivery
                             // gate this job's state changes may have opened.
                             if crate::inbox_deliver::form_due(&mut conn) {
@@ -8575,6 +8582,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // cb-inbox-deliver: after the inbox (its rows), lineages, interactions,
     // commands and hosts, which its due triggers read.
     crate::inbox_deliver::migrate(&conn)?;
+    // cb-wake-engine: after the inbox and its delivery (their rows and the
+    // command settlement columns its triggers read).
+    crate::wake::migrate(&conn)?;
     // cb-usage-resume: after the inbox (its supply parks) and the commands,
     // instances and lineages its triggers read.
     crate::usage_resume::migrate(&conn)?;
@@ -16447,6 +16457,11 @@ fn append_loaded_event(
             crate::inbox::fold_append(conn, instance_id, &event, &now, before, turn_ended)
         });
     }
+    // cb-wake-engine: a turn end that ends a wake run queues its result in
+    // this transaction; like the facts, it can never fail the append.
+    crate::inbox::guard("wake_fold", conn, || {
+        crate::wake::fold_turn_end(conn, instance_id, &event, turn_ended)
+    });
     // seen-hub: a settled turn end becomes the instance's turn-end mark; an
     // owner client showing the session right now folds it seen in this write.
     let seen = if turn_ended {

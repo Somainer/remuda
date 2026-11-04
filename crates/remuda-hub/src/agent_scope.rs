@@ -383,6 +383,28 @@ fn inbox_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a st
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// `GET`/`POST /v1/lineages/{id}/wake-ups` and `DELETE
+/// /v1/lineages/{id}/wake-ups/{wake}` (cb-wake-engine): the lineage manages
+/// its own wake-ups. The path id must be the caller's own lineage; the
+/// handler re-checks that and runs the initiator check on writes.
+fn wake_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str> {
+    use axum::http::Method;
+    let rest = path.strip_prefix("/v1/lineages/")?;
+    let (id, tail) = rest.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    let admitted = match tail {
+        "wake-ups" => *method == Method::GET || *method == Method::POST,
+        _ => {
+            tail.strip_prefix("wake-ups/")
+                .is_some_and(|wake| !wake.is_empty() && !wake.contains('/'))
+                && *method == Method::DELETE
+        }
+    };
+    admitted.then_some(id)
+}
+
 /// `GET /v1/lineages/{id}/glance` (cb-digest): the lineage read predicate,
 /// extended to the one projection hung under it. Same rule as
 /// [`lineage_read_target`]: the path id must be the caller's own lineage.
@@ -1271,7 +1293,12 @@ pub async fn restrict_agent_routes(
                 Some(id) => agent_owns_lineage(&state, &device, id).await?,
                 None => false,
             };
-            if !read && !write && !memory && !inbox {
+            // cb-wake-engine: the caller's own lineage wake-ups.
+            let wake = match wake_target(request.method(), path) {
+                Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                None => false,
+            };
+            if !read && !write && !memory && !inbox && !wake {
                 // cb-errors: the same 403 for a route an Agent may not use,
                 // carrying its reason and next step.
                 return Err(HubError::agent_route());
@@ -1299,6 +1326,34 @@ mod tests {
         assert!(!is_auth_establishing("/v1/auth/passkeys"));
         // Listing/management are not auth-establishing either.
         assert!(!is_auth_establishing("/v1/devices"));
+    }
+
+    #[test]
+    fn only_the_wake_route_shapes_are_agent_wake_targets() {
+        use axum::http::Method;
+        assert_eq!(
+            wake_target(&Method::GET, "/v1/lineages/ins_1/wake-ups"),
+            Some("ins_1")
+        );
+        assert_eq!(
+            wake_target(&Method::POST, "/v1/lineages/ins_1/wake-ups"),
+            Some("ins_1")
+        );
+        assert_eq!(
+            wake_target(&Method::DELETE, "/v1/lineages/ins_1/wake-ups/gate-check"),
+            Some("ins_1")
+        );
+        for (method, path) in [
+            (Method::DELETE, "/v1/lineages/ins_1/wake-ups"),
+            (Method::PATCH, "/v1/lineages/ins_1/wake-ups"),
+            (Method::GET, "/v1/lineages/ins_1/wake-ups/w"),
+            (Method::DELETE, "/v1/lineages/ins_1/wake-ups/a/b"),
+            (Method::DELETE, "/v1/lineages/ins_1/wake-ups/"),
+            (Method::GET, "/v1/lineages//wake-ups"),
+            (Method::GET, "/v1/instances/ins_1/wake-ups"),
+        ] {
+            assert_eq!(wake_target(&method, path), None, "{method} {path}");
+        }
     }
 
     #[test]

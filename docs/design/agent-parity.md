@@ -308,7 +308,7 @@ These are not on origin/main. Each is built for the seat first; the owner's coun
 |---|---|---|---|
 | `remuda memory write`, `read`, `search`, `rm`, `consolidate` | `/v1/lineages/{id}/memory…` (protocol.md §8.4) | PWA memory page, `about-me` editor | `cb-memory-core`, `cb-memory-ui` |
 | `remuda worker digest`, `remuda glance` | `GET /v1/workers/{id}/digest`, `GET /v1/lineages/{id}/glance` | PWA board projection | `cb-digest` |
-| `remuda wake add`, `list`, `rm` | wake-up routes (main-agent.md §11) | wake-ups shown in Main's status | `cb-wake-engine`, `cb-wake-check` |
+| `remuda wake add`, `list`, `rm` | `/v1/lineages/{id}/wake-ups…` (main-agent.md §11.9, protocol.md §8.4; built by `cb-wake-engine`, the check is `cb-wake-check`) | wake-ups shown in Main's status | `cb-wake-engine`, `cb-wake-check` |
 | `remuda owner notify` | owner-notify route (main-agent.md §11.5), `address-owner` only | "to you" cards | `cb-owner-notify` |
 
 ## Gap index

@@ -992,13 +992,22 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
     let now = now_rfc3339();
     let mut formed = Formed::default();
     let mut carried = Vec::with_capacity(rows.len());
+    // cb-wake-engine (§11.3): a batch carries at most one wake run, and its
+    // text opens with that run's envelope. Another wake run waiting now goes
+    // in a later batch, after this one settles: each run is its own turn.
+    let mut wake: Option<Waiting> = None;
     for row in rows {
         match recheck(conn, lineage_id, &muted, &row)? {
+            None if row.kind == InboxFactKind::WakeDue => {
+                if wake.is_none() {
+                    wake = Some(row);
+                }
+            }
             None => carried.push(row),
             Some(reason) => formed.pushes |= fall_back(conn, &row, reason, &now)?,
         }
     }
-    if carried.is_empty() {
+    if carried.is_empty() && wake.is_none() {
         return Ok(formed);
     }
     let batch_id = crate::config::new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -1006,12 +1015,32 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
         .iter()
         .map(|row| line(conn, row))
         .collect::<Result<Vec<_>, _>>()?;
-    let composed = voice::compose(
-        &voice::header(&batch_id, lineage_id, chapter.generation, carried.len()),
+    let facts = carried.len() + usize::from(wake.is_some());
+    let (header, template) = match &wake {
+        Some(run) => (
+            format!(
+                "{}{}",
+                voice::wake_header(&batch_id, lineage_id, chapter.generation, facts),
+                voice::wake_envelope(&run.payload)
+            ),
+            voice::WAKE_TEMPLATE_VERSION,
+        ),
+        None => (
+            voice::header(&batch_id, lineage_id, chapter.generation, facts),
+            voice::TEMPLATE_VERSION,
+        ),
+    };
+    let mut composed = voice::compose(
+        &header,
         &lines,
         &voice::footer(lineage_id, &now, snapshot(conn, lineage_id)?),
         lineage_id,
     );
+    // The envelope lists the wake run in full.
+    composed.listed += usize::from(wake.is_some());
+    if let Some(run) = wake {
+        carried.insert(0, run);
+    }
     let fact_ids: Vec<i64> = carried.iter().map(|row| row.id).collect();
     // §10, Ids: the id is chosen and the row persisted now, with the
     // Hub-internal initiator for the live chapter's generation and no device
@@ -1047,7 +1076,7 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
             chapter.generation,
             chapter.host_id,
             voice::OPENING_TAG,
-            voice::TEMPLATE_VERSION,
+            template,
             serde_json::to_string(&fact_ids)?,
             i64::try_from(composed.listed).unwrap_or(i64::MAX),
             composed.text,
@@ -1081,7 +1110,7 @@ fn form_one(conn: &Connection, lineage_id: &str) -> Result<Formed, StoreError> {
         facts = carried.len(),
         listed = composed.listed,
         bytes = composed.text.len(),
-        template = voice::TEMPLATE_VERSION,
+        template,
         kinds = %kinds,
         "inbox batch formed"
     );

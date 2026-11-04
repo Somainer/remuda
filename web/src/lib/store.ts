@@ -9422,17 +9422,14 @@ function mainChapterLive(instance: Instance): boolean {
   return instance.lastError === "host-contact-lost";
 }
 
-function chapterTime(instance: Instance): number {
-  const t = Date.parse(instance.updatedAt || instance.createdAt);
+/**
+ * A chapter's creation in ms: the only time Main resolution orders by. Never
+ * `updatedAt` — a host reconnect or a heartbeat bumps it, and Main must not
+ * change hands over that.
+ */
+function chapterCreated(instance: Instance): number {
+  const t = Date.parse(instance.createdAt);
   return Number.isFinite(t) ? t : 0;
-}
-
-/** The more recently touched chapter; an exact tie falls to the lower id. */
-function laterChapter(a: Instance, b: Instance): Instance {
-  const ta = chapterTime(a);
-  const tb = chapterTime(b);
-  if (ta !== tb) return ta > tb ? a : b;
-  return a.id <= b.id ? a : b;
 }
 
 export function resolveMain(instances: readonly Instance[]): MainEntry | null {
@@ -9440,26 +9437,36 @@ export function resolveMain(instances: readonly Instance[]): MainEntry | null {
   if (seats.length === 0) return null;
   const lineageOf = (row: Instance) => (row.lineageId ?? row.id) as Id;
   const generationOf = (row: Instance) => row.generation ?? 1;
-  // Newer generation first, then the more recently touched row.
-  const newer = (a: Instance, b: Instance) =>
-    generationOf(a) !== generationOf(b)
-      ? generationOf(a) > generationOf(b)
-        ? a
-        : b
-      : laterChapter(a, b);
+  // Newer generation first, then the later-created chapter, then the lower id.
+  const newer = (a: Instance, b: Instance) => {
+    if (generationOf(a) !== generationOf(b)) return generationOf(a) > generationOf(b) ? a : b;
+    const ca = chapterCreated(a);
+    const cb = chapterCreated(b);
+    if (ca !== cb) return ca > cb ? a : b;
+    return a.id <= b.id ? a : b;
+  };
   const live = seats.filter(mainChapterLive);
   let pick: Instance;
   if (live.length > 0) {
     // The Hub admits one active holder (§2.5); stay deterministic anyway.
     pick = live.reduce(newer);
   } else {
-    const latestByLineage = new Map<Id, Instance>();
+    // Per lineage: its creation (the earliest chapter's) and its newest
+    // chapter; then the lineage CREATED last, an exact tie to the lower id.
+    const byLineage = new Map<Id, { born: number; latest: Instance }>();
     for (const row of seats) {
       const key = lineageOf(row);
-      const current = latestByLineage.get(key);
-      latestByLineage.set(key, current ? newer(current, row) : row);
+      const current = byLineage.get(key);
+      byLineage.set(
+        key,
+        current
+          ? { born: Math.min(current.born, chapterCreated(row)), latest: newer(current.latest, row) }
+          : { born: chapterCreated(row), latest: row },
+      );
     }
-    pick = [...latestByLineage.values()].reduce(laterChapter);
+    pick = [...byLineage.values()].reduce((a, b) =>
+      a.born !== b.born ? (a.born > b.born ? a : b) : a.latest.id <= b.latest.id ? a : b,
+    ).latest;
   }
   const lineageId = lineageOf(pick);
   const chapterIds = instances

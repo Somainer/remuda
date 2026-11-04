@@ -19,7 +19,8 @@ type Seat = {
   lifecycle: Instance["lifecycle"];
   lastError: string | null;
   fenced: boolean;
-  timeMs: number;
+  createdMs: number;
+  updatedMs: number;
 };
 
 const cases = JSON.parse(
@@ -30,7 +31,8 @@ const cases = JSON.parse(
 ) as { cases: { name: string; seats: Seat[]; expect: string | null }[] };
 
 function seatRow(seat: Seat): Instance {
-  const at = new Date(seat.timeMs).toISOString();
+  const created = new Date(seat.createdMs).toISOString();
+  const updated = new Date(seat.updatedMs).toISOString();
   return {
     ...mockDb.instances[0],
     id: seat.instanceId as Id,
@@ -38,10 +40,12 @@ function seatRow(seat: Seat): Instance {
     generation: seat.generation,
     lifecycle: seat.lifecycle,
     lastError: seat.lastError,
-    fencedAt: seat.fenced ? at : undefined,
+    fencedAt: seat.fenced ? updated : undefined,
     grants: ["address-owner"],
-    createdAt: at,
-    updatedAt: at,
+    createdAt: created,
+    // Real: a later touch (a host reconnect) moves only this — and must not
+    // change the pick.
+    updatedAt: updated,
   } as Instance;
 }
 

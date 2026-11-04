@@ -63,8 +63,10 @@ pub(crate) struct MainSeatRow {
     pub last_error: Option<String>,
     /// Whether authority moved away from this chapter (`fenced_at` set).
     pub fenced: bool,
-    /// `updated_at` (else `created_at`) as Unix milliseconds.
-    pub time_ms: i64,
+    /// `created_at` as Unix milliseconds. The ordering key is the chapter's
+    /// creation, never `updated_at`: a host reconnect or a heartbeat bumps
+    /// that, and Main must not change hands over it.
+    pub created_ms: i64,
 }
 
 /// Lifecycles that end a Main chapter (the client's `MAIN_TERMINAL`).
@@ -80,31 +82,31 @@ fn main_seat_live(row: &MainSeatRow) -> bool {
         || row.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER)
 }
 
-/// The more recently touched row; equal times fall to the lower id, so the
-/// pick never depends on the order the rows were read in.
-fn main_seat_later<'a>(a: &'a MainSeatRow, b: &'a MainSeatRow) -> &'a MainSeatRow {
-    if a.time_ms != b.time_ms {
-        return if a.time_ms > b.time_ms { a } else { b };
-    }
-    if a.instance_id <= b.instance_id { a } else { b }
-}
-
-/// The newer chapter: a higher generation, then [`main_seat_later`].
+/// The newer chapter: a higher generation, then the later-created one; an
+/// exact tie falls to the lower id, so the pick never depends on the order
+/// the rows were read in.
 fn main_seat_newer<'a>(a: &'a MainSeatRow, b: &'a MainSeatRow) -> &'a MainSeatRow {
     if a.generation != b.generation {
         return if a.generation > b.generation { a } else { b };
     }
-    main_seat_later(a, b)
+    if a.created_ms != b.created_ms {
+        return if a.created_ms > b.created_ms { a } else { b };
+    }
+    if a.instance_id <= b.instance_id { a } else { b }
 }
 
 /// THE Main resolution, one definition for the Hub (home.md §5.3, §6.1),
 /// written to match the client's `resolveMain` (`web/src/lib/store.ts`); the
 /// shared cases in `tests/fixtures/main_seat_cases.json` hold both to it.
 ///
-/// 1. The live `address-owner` chapter ([`main_seat_live`]), the newest when
-///    a chapter races its successor.
+/// 1. The live `address-owner` chapter ([`main_seat_live`]), the newest
+///    ([`main_seat_newer`]) when a chapter races its successor.
 /// 2. Otherwise — Main paused, closed or ended — the newest chapter of each
-///    `address-owner` lineage, and of those the most recently touched one.
+///    `address-owner` lineage, and of those the lineage CREATED last (its
+///    earliest chapter's `created_at`); an exact tie falls to the lower id.
+///
+/// Only stable keys order the pick (generation, creation, id), so a host
+/// reconnect or a restart's touch never flips Main.
 ///
 /// A paused Main therefore still resolves, so its subtree (the workers it
 /// dispatched, still running) stays in the owner's world.
@@ -116,15 +118,31 @@ pub(crate) fn pick_main_seat(seats: &[MainSeatRow]) -> Option<&MainSeatRow> {
     {
         return Some(live);
     }
-    let mut newest: std::collections::BTreeMap<&str, &MainSeatRow> =
+    // Per lineage: (its creation = the earliest chapter's, its newest chapter).
+    let mut lineages: std::collections::BTreeMap<&str, (i64, &MainSeatRow)> =
         std::collections::BTreeMap::new();
     for row in seats {
-        newest
+        lineages
             .entry(row.lineage_id.as_str())
-            .and_modify(|current| *current = main_seat_newer(current, row))
-            .or_insert(row);
+            .and_modify(|(born, current)| {
+                *born = (*born).min(row.created_ms);
+                *current = main_seat_newer(current, row);
+            })
+            .or_insert((row.created_ms, row));
     }
-    newest.into_values().reduce(main_seat_later)
+    lineages
+        .into_values()
+        .reduce(|a, b| {
+            if a.0 != b.0 {
+                return if a.0 > b.0 { a } else { b };
+            }
+            if a.1.instance_id <= b.1.instance_id {
+                a
+            } else {
+                b
+            }
+        })
+        .map(|(_, row)| row)
 }
 
 fn rfc3339_ms(stamp: &str) -> Option<i64> {
@@ -139,14 +157,13 @@ pub(crate) fn resolve_main_seat(
 ) -> Result<Option<MainSeatRow>, crate::store::StoreError> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, COALESCE(lineage_id, id), generation, lifecycle, last_error,
-                fenced_at IS NOT NULL, updated_at, created_at
+                fenced_at IS NOT NULL, created_at
            FROM instances
           WHERE grants_json LIKE '%\"address-owner\"%'",
     )?;
     let seats = stmt
         .query_map([], |row| {
-            let updated: Option<String> = row.get(6)?;
-            let created: Option<String> = row.get(7)?;
+            let created: Option<String> = row.get(6)?;
             Ok(MainSeatRow {
                 instance_id: row.get(0)?,
                 lineage_id: row.get(1)?,
@@ -154,11 +171,7 @@ pub(crate) fn resolve_main_seat(
                 lifecycle: row.get(3)?,
                 last_error: row.get(4)?,
                 fenced: row.get(5)?,
-                time_ms: updated
-                    .as_deref()
-                    .and_then(rfc3339_ms)
-                    .or_else(|| created.as_deref().and_then(rfc3339_ms))
-                    .unwrap_or(0),
+                created_ms: created.as_deref().and_then(rfc3339_ms).unwrap_or(0),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

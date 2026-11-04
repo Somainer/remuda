@@ -316,6 +316,38 @@ export function Composer({
   const textRef = useRef(text);
   textRef.current = text;
 
+  /**
+   * home.md §6.3: a quick-ask tap writes the question into the draft and never
+   * sends. It must never lose typed text (r2): an empty draft becomes the
+   * question, anything else receives it at the caret (the chip row keeps the
+   * textarea focused), or appended when no caret is available.
+   */
+  const applySuggestion = (value: string) => {
+    const current = textRef.current;
+    const area = inputRef.current;
+    let next: string;
+    let caret: number;
+    if (current.length === 0) {
+      next = value;
+      caret = value.length;
+    } else if (area && document.activeElement === area) {
+      const at = area.selectionStart ?? current.length;
+      next = `${current.slice(0, at)}${value}${current.slice(at)}`;
+      caret = at + value.length;
+    } else {
+      const separator = /[\s　]$/.test(current) ? "" : " ";
+      next = `${current}${separator}${value}`;
+      caret = next.length;
+    }
+    textRef.current = next;
+    setText(next);
+    writeDraft(scope, next);
+    area?.focus();
+    // The controlled value lands on the next render; place the caret after
+    // the inserted question then.
+    queueMicrotask(() => inputRef.current?.setSelectionRange(caret, caret));
+  };
+
   // ── §4.8 voice input (m-voice) ──────────────────────────────────────────
   // Platform keyboard dictation is the primary path and needs no code. The
   // mic is an enhancement rendered ONLY when the browser ships
@@ -1581,12 +1613,7 @@ export function Composer({
               data-testid="composer-suggestion"
               data-suggestion-id={suggestion.id}
               onMouseDown={(event) => event.preventDefault()}
-              onClick={() => {
-                textRef.current = suggestion.text;
-                setText(suggestion.text);
-                writeDraft(scope, suggestion.text);
-                inputRef.current?.focus();
-              }}
+              onClick={() => applySuggestion(suggestion.text)}
             >
               {suggestion.label}
             </button>

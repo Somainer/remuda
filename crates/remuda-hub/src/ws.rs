@@ -696,6 +696,13 @@ pub(crate) fn spawn_post_hello_tasks(
     // cb-inbox-deliver: a batch formed or released while this host was away
     // is forwarded now (held behind its fences until they are acknowledged).
     state.store.kick_delivery();
+    // D-062 r3 item 1: so is a claim detach (a release, or the detach of a
+    // claim whose commit reply was lost) queued while it was away.
+    {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        tokio::spawn(async move { crate::herdr_claims::deliver_detaches(&state, &host_id).await });
+    }
     // r13 item 1: now that this carrier is registered, immediately reconcile
     // (read-only, forced) any Landing row pinned to this host against the exact
     // granted merge — covering a Hub restart where the push reached origin

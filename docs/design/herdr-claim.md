@@ -105,12 +105,17 @@ Remuda does **not** own the claimed process.
   or an ordinary close on a claimed instance — **detaches only**. It stops the
   Node's watcher and TTY bridge and ends the instance with reason `released`.
   It never closes the pane, never kills or signals its process, and never stops
-  the herdr server. Release is idempotent: releasing an instance that already
-  ended answers 200 with `released: false` — unless its detach was never sent
-  (no release audit on the row): then it queues that detach once and answers
-  `released: true`. A claim whose commit reply is lost (the Node may hold it)
-  is failed on the Hub and its idempotent detach is queued at once, delivered
-  when the host reconnects, so no claim is left that the Hub cannot release.
+  the herdr server. The detach is an idempotent `instance.close` command:
+  forwarded at once when the host is online, otherwise left queued and
+  forwarded on the host's next `node.hello` and by the Hub's 1 s tick (each
+  command is sent at most once). Release is idempotent, and what decides is
+  the detach's **delivery**, read from its command row, never the release
+  audit: releasing an instance that already ended answers 200 with
+  `released: false` when a detach was delivered (forwarded and not refused) or
+  is still queued (it is driven again now); with none, or only ones the Node
+  refused, it queues one and answers `released: true`. A claim whose commit
+  reply is lost (the Node may hold it) is failed on the Hub and its detach is
+  queued at once, so no claim is left that the Hub cannot release.
 - The only things that act on the pane are `instance send` (the prompt
   input), `instance keys` and interrupt, and TTY control/observe from the PWA.
 - A Node shutdown is not a release: the claimed rows stay live and the next
@@ -217,7 +222,8 @@ is no claim UI in this cut; the CLI is the only way to claim.
 The Hub writes an audit row for every claim (`instance.claim`) and release
 (`instance.release`, including a close on a claimed instance): the device
 that did it, host, session, socket, workspace, tab, pane and kind; a claim also
-records the pid and command name. Logs and audit rows never carry pane
+records the pid and command name, and a release names its detach command
+(`commandId`), whose state says whether the Node got it. Logs and audit rows never carry pane
 content. Discovery never calls `pane.read` or `agent.read`. The Node reads a
 claimed pane's visible screen in three places, never logging the text: once at
 claim and at each re-attach, only to size the TTY bridge (the widest visible

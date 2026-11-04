@@ -14,7 +14,7 @@
 use crate::agent_scope;
 use crate::error::{NextStep, action};
 use crate::http::map_store;
-use crate::store::{Device, InstanceRecord};
+use crate::store::{ClaimDetach, Device, InstanceRecord};
 use crate::{AppState, HubError};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -473,14 +473,25 @@ async fn release(
     let host_lost = instance.lifecycle == "exited"
         && instance.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER);
     if matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") && !host_lost {
-        // D-062 r2 item 4: an ended or failed claim row whose detach was never
-        // released (a claim whose commit reply was lost, a row from before
-        // this fix) may still be live on its Node: queue the idempotent
-        // detach once. Otherwise a second release is a no-op.
-        let released =
-            instance.herdr_claim.is_some() && !released_before(&state, &instance_id).await;
+        // D-062 r3 item 1: an ended or failed claim row may still be live on
+        // its Node (a claim whose commit reply was lost, a row from before
+        // the detach existed). What decides is the detach's delivery, never
+        // the release audit: one already delivered makes this a no-op, one
+        // still queued is driven now, and with none at all one is queued.
+        let detach = if instance.herdr_claim.is_some() {
+            state
+                .store
+                .claim_detach_state(instance_id.clone())
+                .await
+                .map_err(map_store)?
+        } else {
+            ClaimDetach::Delivered
+        };
+        let released = detach == ClaimDetach::Missing;
         if released {
             queue_detach(&state, &device, &instance, "ended-without-release").await?;
+        } else if detach == ClaimDetach::Pending {
+            deliver_detaches(&state, &instance.host_id).await;
         }
         let instance = state
             .store
@@ -507,8 +518,11 @@ async fn release(
 }
 
 /// Queue the Node detach for a claim (an idempotent `instance.close`),
-/// delivered now or when the host reconnects, and audit it as a release.
-/// The release itself never waits on the Node.
+/// delivered now or, while the host is away, by [`deliver_detaches`] on its
+/// next hello or the Hub tick. The release audit records the human's request
+/// and names the detach command; whether the detach was delivered is that
+/// command's state (`Store::claim_detach_state`), never the audit. The
+/// release itself never waits on the Node.
 async fn queue_detach(
     state: &AppState,
     device: &Device,
@@ -532,29 +546,70 @@ async fn queue_detach(
         )
         .await
         .map_err(map_store)?;
+    let command_id = command.command_id.clone();
     if created {
         let live = state.nodes.kind_of(&instance.host_id).await.is_some();
         if let Err(error) = crate::http::forward_if_online(state, command, live).await {
             tracing::warn!(instance_id = %instance.instance_id, %error, "claim detach not yet delivered to the node");
         }
     }
-    audit_release_with(state, device, instance, Some(reason)).await;
+    audit_release_with(state, device, instance, Some(reason), Some(&command_id)).await;
     Ok(())
 }
 
-/// Whether a release (detach) was already audited for this instance.
-async fn released_before(state: &AppState, instance_id: &str) -> bool {
-    state
+/// D-062 r3 item 1: forward every claim detach still queued for `host_id`.
+/// Runs after the host's hello and from the Hub tick, so a detach queued
+/// while the Node was away (or whose send never left the Hub) reaches it.
+/// Each command is sent at most once: `forward_if_online` serializes attempts
+/// per command and its durable forward mark refuses a second send.
+pub(crate) async fn deliver_detaches(state: &AppState, host_id: &str) {
+    if state.nodes.kind_of(host_id).await.is_none() {
+        return;
+    }
+    let pending = match state
         .store
-        .audit_for(instance_id.to_owned())
+        .undelivered_claim_detaches(Some(host_id.to_owned()))
         .await
-        .is_ok_and(|rows| rows.iter().any(|row| row["action"] == "instance.release"))
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%host_id, %error, "queued claim detaches not read");
+            return;
+        }
+    };
+    for command in pending {
+        let command_id = command.command_id.clone();
+        if let Err(error) = crate::http::forward_if_online(state, command, true).await {
+            tracing::warn!(%host_id, %command_id, %error, "queued claim detach not delivered");
+        }
+    }
+}
+
+/// The Hub tick's half of [`deliver_detaches`]: every online host with a
+/// queued detach. Skipped while a previous pass still runs.
+pub(crate) async fn deliver_all_detaches(state: &AppState) {
+    let Ok(_pass) = state.herdr_detaches.try_lock() else {
+        return;
+    };
+    let pending = match state.store.undelivered_claim_detaches(None).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "queued claim detaches not read");
+            return;
+        }
+    };
+    let mut hosts: Vec<String> = pending.into_iter().map(|command| command.host_id).collect();
+    hosts.sort();
+    hosts.dedup();
+    for host_id in hosts {
+        deliver_detaches(state, &host_id).await;
+    }
 }
 
 /// Audit a release (also a close on a claimed instance through the commands
 /// route). Ids only, never pane content.
 pub(crate) async fn audit_release(state: &AppState, device: &Device, instance: &InstanceRecord) {
-    audit_release_with(state, device, instance, None).await;
+    audit_release_with(state, device, instance, None, None).await;
 }
 
 async fn audit_release_with(
@@ -562,6 +617,7 @@ async fn audit_release_with(
     device: &Device,
     instance: &InstanceRecord,
     reason: Option<&str>,
+    command_id: Option<&str>,
 ) {
     let claim = instance.herdr_claim.clone().unwrap_or(Value::Null);
     audit(
@@ -578,6 +634,7 @@ async fn audit_release_with(
             "paneId": claim.get("paneId"),
             "kind": instance.kind,
             "reason": reason,
+            "commandId": command_id,
         }),
     )
     .await;

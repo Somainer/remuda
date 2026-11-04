@@ -1632,7 +1632,7 @@ worker.provision params: "initiator": {"instanceId": "ins_…", "lineageId": "in
 | `instance.claim` | Hub→Node | `{instanceId,session,workspaceId,tabId,paneId,kind}` → `{instance}`；按 `instanceId` 幂等；同一 (socket, pane) 已有活认领时拒绝 |
 | `GET /v1/hosts/{id}/herdr?session=` | Client→Hub | 代理 `herdr.discover` |
 | `POST /v1/instances/claim` | Client→Hub | `{hostId,herdrSession,workspaceId,tabId,paneId?,kind?,name?,title?,projectId?}` → `{instance,claim}`；错误：id 不成链或 tab 多 pane → 400，(host, socket, pane) 已有活认领 → 409（带现有 instanceId），herdr 不可达 → 400 |
-| `POST /v1/instances/{id}/release` | Client→Hub | → `{instance,released}`；只脱离、幂等；对已结束的认领实例回 200 `released:false` |
+| `POST /v1/instances/{id}/release` | Client→Hub | → `{instance,released}`；只脱离、幂等。脱离是一条 `instance.close` 命令：host 在线即转发，离线则排队，在该 host 下一次 `node.hello` 后与 Hub 每秒 tick 时转发（每条至多发送一次）。对已结束的认领实例：已有脱离送达（已转发且未被拒）或仍在排队时回 200 `released:false`；没有、或只有被 Node 拒绝的脱离时重新排队一条并回 `released:true`。判定看命令状态，不看审计行 |
 
 Node 拒绝时错误文本带稳定前缀，Hub 据此映射：`herdr-claim-invalid`、`herdr-claim-ambiguous`、`herdr-claim-own-session`、`herdr-unreachable` → 400，`herdr-claim-conflict` → 409。CLI：`remuda host herdr ls --host H [--session S]`、`remuda instance claim --host H --herdr-session S --workspace W --tab T [--pane P] [--kind claude|codex|grok|agy|shell] [--name N] [--project P]`、`remuda instance release <id>`。driver `herdr-claimed` 只由 `instance.claim` 产生，`instance.create` 拒绝它。
 

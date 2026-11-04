@@ -32,6 +32,17 @@ struct FakeNode {
     calls: Mutex<Vec<(String, Value)>>,
     /// D-062 r2 item 4: commit the claim, then lose the reply.
     drop_claim_reply: std::sync::atomic::AtomicBool,
+    /// D-062 r3 item 1: commit the claim, then the link dies mid-call — the
+    /// transport is unregistered before the Hub sees the (lost) reply.
+    vanish_on_claim: Mutex<Option<(remuda_hub::HubTestHandle, String)>>,
+    /// The Node's live claims: instance id → pane id; a close frees one.
+    held: Mutex<std::collections::HashMap<String, String>>,
+    /// Refuse a resolve of a held pane like the real Node's uniqueness check
+    /// (off by default, so the Hub's own check is what other tests see).
+    node_uniqueness: std::sync::atomic::AtomicBool,
+    /// Refuse this many `instance.close` frames with an explicit error (the
+    /// Node did not run them) before accepting.
+    refuse_closes: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeNode {
@@ -94,6 +105,46 @@ impl NodeTransport for FakeNode {
                 .lock()
                 .unwrap()
                 .push((method.clone(), params.clone()));
+            let pane = params
+                .get("paneId")
+                .and_then(Value::as_str)
+                .unwrap_or("w1:p1")
+                .to_owned();
+            let instance = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if method == "instance.close"
+                && self
+                    .refuse_closes
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return Ok(Some(node_error("node busy: try the close again")));
+            }
+            match method.as_str() {
+                "instance.claim" => {
+                    self.held.lock().unwrap().insert(instance, pane.clone());
+                }
+                "instance.close" => {
+                    self.held.lock().unwrap().remove(&instance);
+                }
+                _ => {}
+            }
+            if method == "instance.claim" {
+                let vanish = self.vanish_on_claim.lock().unwrap().take();
+                if let Some((hub, host)) = vanish {
+                    hub.test_disconnect_node(&host).await;
+                    return Err(remuda_hub::HubError::Internal(
+                        "node link closed before the reply".into(),
+                    ));
+                }
+            }
             if method == "instance.claim"
                 && self
                     .drop_claim_reply
@@ -102,6 +153,23 @@ impl NodeTransport for FakeNode {
                 return Err(remuda_hub::HubError::Internal(
                     "node link dropped before the reply".into(),
                 ));
+            }
+            let holder = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, held)| **held == pane)
+                .map(|(id, _)| id.clone());
+            if method == "herdr.resolve"
+                && self
+                    .node_uniqueness
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(holder) = holder
+            {
+                return Ok(Some(node_error(&format!(
+                    "conflict: herdr-claim-conflict: pane {pane} in herdr session work is already claimed by {holder}"
+                ))));
             }
             let reply = match method.as_str() {
                 "herdr.discover" => json!({"result": {"sessions": [{
@@ -1122,6 +1190,228 @@ async fn release_detaches_an_ended_claim_row_that_was_never_released() -> Result
         .await?;
     assert_eq!(second["released"], false, "{second}");
     assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+/// Poll until `done` holds (bounded).
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) -> Result<()> {
+    let start = std::time::Instant::now();
+    while !done() {
+        anyhow::ensure!(
+            start.elapsed() < Duration::from_secs(15),
+            "never happened: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(())
+}
+
+/// D-062 r3 item 1: the claim commits on the Node and the link dies before
+/// the reply, so the Hub queues the detach with NO transport registered
+/// (`kind_of` is None). Returns the instance id.
+async fn claim_while_the_link_dies(fixture: &Fixture) -> Result<String> {
+    fixture
+        .node
+        .node_uniqueness
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *fixture.node.vanish_on_claim.lock().unwrap() =
+        Some((fixture.hub.test_handle(), fixture.host.clone()));
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    assert!(status >= 400, "{status} {body}");
+    let claimed = fixture.node.params_of("instance.claim");
+    assert_eq!(claimed.len(), 1, "the Node received (and holds) the claim");
+    let id = claimed[0]["instanceId"].as_str().context("id")?.to_owned();
+    assert_eq!(
+        fixture
+            .node
+            .held
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(String::as_str),
+        Some("w1:p1")
+    );
+    assert!(
+        fixture.node.params_of("instance.close").is_empty(),
+        "nothing can be delivered while the host is away"
+    );
+    let commands = fixture
+        .hub
+        .store()
+        .context("store")?
+        .list_instance_commands(id.clone(), 20)
+        .await?;
+    let closes: Vec<_> = commands
+        .iter()
+        .filter(|command| command.operation == "instance.close")
+        .collect();
+    assert_eq!(closes.len(), 1, "{commands:?}");
+    assert_eq!(
+        (closes[0].state.as_str(), closes[0].forwarded),
+        ("queued", false)
+    );
+    // A release while the host is away does not consume the detach: it is
+    // still owed, so nothing new is queued and the release is not "done".
+    let (status, release) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{release}");
+    assert_eq!(release["released"], false, "{release}");
+    let audit = fixture.audit(&id).await?;
+    let release_audit = audit
+        .iter()
+        .find(|row| row["action"] == "instance.release")
+        .context("release audit")?;
+    assert_eq!(
+        release_audit["detail"]["commandId"],
+        json!(closes[0].command_id),
+        "the audit names the detach whose state says if it was delivered"
+    );
+    Ok(id)
+}
+
+async fn reclaim_after_detach(fixture: &Fixture, id: &str) -> Result<()> {
+    let node = fixture.node.clone();
+    eventually("the queued detach reaches the Node", || {
+        node.params_of("instance.close").len() == 1
+    })
+    .await?;
+    let closes = fixture.node.params_of("instance.close");
+    assert_eq!(closes[0]["instanceId"], json!(id));
+    assert_eq!(closes[0]["origin"], "human");
+    assert!(fixture.node.held.lock().unwrap().is_empty());
+    // Several hello/tick passes later it is still delivered exactly once.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    let (status, again) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["released"], false, "delivered: a no-op now");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    // The Node freed the pane, so it can be claimed again.
+    let (status, claimed) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    assert_eq!(status, 200, "{claimed}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_detach_queued_while_the_node_is_away_is_delivered_on_its_hello() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claim_while_the_link_dies(&fixture).await?;
+    // The Node reconnects.
+    fixture
+        .hub
+        .test_set_node_transport(&fixture.host, fixture.node.clone())
+        .await;
+    fixture
+        .hub
+        .test_handle()
+        .test_run_post_hello(&fixture.host)
+        .await;
+    reclaim_after_detach(&fixture, &id).await?;
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_detach_queued_while_the_node_is_away_is_delivered_by_the_tick() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claim_while_the_link_dies(&fixture).await?;
+    // The transport comes back without this test running the hello path:
+    // the Hub tick alone delivers the owed detach.
+    fixture
+        .hub
+        .test_set_node_transport(&fixture.host, fixture.node.clone())
+        .await;
+    reclaim_after_detach(&fixture, &id).await?;
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_detach_the_node_refused_is_queued_again_by_release() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    fixture
+        .node
+        .drop_claim_reply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .node
+        .refuse_closes
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    assert!(status >= 400, "{status} {body}");
+    let id = fixture.node.params_of("instance.claim")[0]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_owned();
+    // The detach reached the Node, which refused it: the claim is still live
+    // there, although a release was audited.
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    assert!(fixture.node.held.lock().unwrap().contains_key(&id));
+    assert!(
+        fixture
+            .audit(&id)
+            .await?
+            .iter()
+            .any(|row| row["action"] == "instance.release")
+    );
+    // The audit is not delivery: a release queues the detach again.
+    let (status, again) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["released"], true, "{again}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 2);
+    assert!(fixture.node.held.lock().unwrap().is_empty());
+    let (_, third) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    assert_eq!(third["released"], false, "{third}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 2);
     fixture.hub.shutdown().await;
     Ok(())
 }

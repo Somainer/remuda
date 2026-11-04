@@ -1658,6 +1658,17 @@ pub struct ContinuationResumeRequest {
 /// `chapterCause` of a chapter an owner Resume opened.
 pub const OWNER_RESUME_CAUSE: &str = "owner-resume";
 
+/// Result of [`Store::claim_detach_state`] (D-062 r3 item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimDetach {
+    /// A detach reached the Node, or may have (forwarded, not refused).
+    Delivered,
+    /// A detach is queued and not yet forwarded; the sweeps deliver it.
+    Pending,
+    /// No detach was queued, or every one was refused before the Node ran it.
+    Missing,
+}
+
 /// Result of [`Store::mark_forward_intent_gated`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardMark {
@@ -5469,6 +5480,80 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?)
+        })
+        .await
+    }
+
+    /// D-062 r3 item 1: claim detaches (`instance.close` on a `herdr-claimed`
+    /// row) still queued and never forwarded — queued while the host was away,
+    /// or rolled back by a send that never left the Hub — oldest first,
+    /// optionally for one host. The hello and tick sweeps forward them.
+    pub(crate) async fn undelivered_claim_detaches(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        self.read("undelivered_claim_detaches", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.instance_id, c.host_id, c.operation, c.state, c.resolution,
+                        c.forwarded, c.payload_json, c.idempotency_key, c.created_at,
+                        c.updated_at, c.settlement_outcome, c.settlement_reason,
+                        c.settlement_http_status, c.settlement_http_body,
+                        c.initiator_instance_id, c.initiator_lineage_id,
+                        c.initiator_generation, c.initiator_device_id,
+                        c.initiator_root_turn_json
+                 FROM instances i
+                 JOIN commands c ON c.instance_id = i.id
+                 WHERE i.driver = 'herdr-claimed'
+                   AND c.operation = 'instance.close'
+                   AND c.state = 'queued' AND c.forwarded = 0
+                   AND (?1 IS NULL OR c.host_id = ?1)
+                 ORDER BY c.created_at ASC, c.id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![host_id], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// D-062 r3 item 1: where a claim's Node detach stands, read from its
+    /// `instance.close` commands rather than from the release audit (which
+    /// records the human's request, not its delivery).
+    pub(crate) async fn claim_detach_state(
+        &self,
+        instance_id: String,
+    ) -> Result<ClaimDetach, StoreError> {
+        self.read("claim_detach_state", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT state, forwarded, COALESCE(settlement_outcome, '')
+                 FROM commands
+                 WHERE instance_id = ?1 AND operation = 'instance.close'",
+            )?;
+            let rows = stmt
+                .query_map(params![instance_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            // Forwarded and not refused: the Node got it (or may have; the
+            // close is idempotent and its journal converges the row).
+            if rows
+                .iter()
+                .any(|(_, forwarded, outcome)| *forwarded && outcome != "rejected")
+            {
+                return Ok(ClaimDetach::Delivered);
+            }
+            if rows
+                .iter()
+                .any(|(state, forwarded, _)| state == "queued" && !forwarded)
+            {
+                return Ok(ClaimDetach::Pending);
+            }
+            Ok(ClaimDetach::Missing)
         })
         .await
     }

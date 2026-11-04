@@ -218,6 +218,9 @@ pub struct AppState {
     /// cb-wake-engine: the tick health `/healthz` reports and the fresh-mode
     /// drive.
     pub(crate) wake: crate::wake::WakeState,
+    /// D-062 r3 item 1: one tick pass of the queued claim-detach delivery
+    /// at a time.
+    pub(crate) herdr_detaches: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -779,6 +782,19 @@ impl HubTestHandle {
         transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
     ) {
         self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Drop the live Node session for `host_id`, e.g. from inside a synthetic
+    /// transport's call (the link dies while an RPC is in flight).
+    pub async fn test_disconnect_node(&self, host_id: &str) {
+        self.state.nodes.remove(host_id).await;
+    }
+
+    /// Run what an authenticated `node.hello` starts once the host's
+    /// transport is registered (fences, sweeps, queued deliveries).
+    pub async fn test_run_post_hello(&self, host_id: &str) {
+        let generation = self.state.nodes.generation_of(host_id).await.unwrap_or(0);
+        crate::ws::spawn_post_hello_tasks(&self.state, host_id.to_owned(), generation, false);
     }
 
     /// Arm the forward_if_online pre-send barrier.
@@ -2499,6 +2515,7 @@ async fn spawn_inner(
         screen_sweeps: crate::stall_screen::SweepsInFlight::default(),
         outbox: crate::push_route::OutboxState::default(),
         wake: crate::wake::WakeState::default(),
+        herdr_detaches: Arc::new(tokio::sync::Mutex::const_new(())),
     };
     // D-057 §7.7: the send gate's map survives a Hub restart through the
     // lineages table; deliveries are re-sent on hello and by the tick.
@@ -2653,6 +2670,12 @@ async fn spawn_inner(
                             crate::inbox_deliver::retry_tick(&retry_state).await;
                         });
                     }
+                    // D-062 r3 item 1: claim detaches queued while their
+                    // host was away, off the loop.
+                    let detach_state = reaper_state.clone();
+                    tokio::spawn(async move {
+                        crate::herdr_claims::deliver_all_detaches(&detach_state).await;
+                    });
                     // cb-wake-engine: due wake-ups, off the loop.
                     if inbox_ticks.is_multiple_of(crate::wake::TICK_EVERY) {
                         let wake_state = reaper_state.clone();

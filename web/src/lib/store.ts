@@ -1730,6 +1730,7 @@ class HubStore {
       });
       this.glanceIndex = null;
       this.seenMarks.clear();
+      this.glanceRaw = null;
     }
     this.disposeOutboxForAuthChange();
   }
@@ -6160,6 +6161,7 @@ class HubStore {
     if (identityChanged) {
       this.glanceIndex = null;
       this.seenMarks.clear();
+      this.glanceRaw = null;
     }
     // Gate 49 item 6 (low): recheck the issuing epoch AFTER every
     // publication-bearing helper too — a subscriber invoked synchronously by
@@ -8327,14 +8329,20 @@ class HubStore {
       view = await api.instanceSeen(instanceId, durableSeq, options.visible);
       this.applySeenView(view);
     } catch (error) {
+      // Refused: the row is still unseen on the Hub, so it returns to ⑤ and
+      // ◉ (list and count) exactly as the last glance listed it.
       this.seenMarks.delete(instanceId);
+      this.restoreGlance();
       this.rollbackSeen(instanceId, optimistic, previous);
       throw error;
     }
     // Committed: a read that STARTS after now is the Hub's truth. A still-
-    // unseen answer (a newer turn end) needs no strip at all.
-    if (view.unseen) this.seenMarks.delete(instanceId);
-    else this.seenMarks.set(instanceId, this.glanceReadSeq);
+    // unseen answer (a newer turn end) needs no strip at all, and gets its
+    // row back at once.
+    if (view.unseen) {
+      this.seenMarks.delete(instanceId);
+      this.restoreGlance();
+    } else this.seenMarks.set(instanceId, this.glanceReadSeq);
     // A turn end that committed just before this report's lease reads unseen
     // in the answer although the page is showing it: cover it once, at the
     // answer's own turn end (the Hub clamps to its journal). Bounded — the
@@ -9094,6 +9102,12 @@ class HubStore {
    */
   private seenMarks = new Map<string, number>();
   private glanceReadSeq = 0;
+  /**
+   * The last glance exactly as the Hub served it, before any mark was
+   * stripped, and the read sequence it began at. Dropping a mark re-derives
+   * the painted glance from it, so the row returns where the Hub put it.
+   */
+  private glanceRaw: { glance: NonNullable<HubState["glance"]>; readSeq: number } | null = null;
 
   private stripSeen(
     glance: NonNullable<HubState["glance"]>,
@@ -9105,6 +9119,14 @@ class HubStore {
       else this.seenMarks.delete(id);
     }
     return withoutDoneUnseen(glance, drop);
+  }
+
+  /** Re-derive the painted glance from the Hub's last answer and the marks left. */
+  private restoreGlance() {
+    const raw = this.glanceRaw;
+    if (!raw || !this.state.glance) return;
+    const next = this.stripSeen(raw.glance, raw.readSeq);
+    if (next !== this.state.glance) this.emit({ glance: next });
   }
 
   /** Apply the pending marks to the glance already painted. */
@@ -9149,6 +9171,7 @@ class HubStore {
           this.emit({ glanceFailed: true });
           return;
         }
+        this.glanceRaw = { glance, readSeq };
         this.emit({ glance: this.stripSeen(glance, readSeq), glanceAt: Date.now(), glanceFailed: false });
       } catch {
         if (!live()) return;

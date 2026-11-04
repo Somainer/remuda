@@ -5019,7 +5019,7 @@ export type WakeCheck = ({
 export type WakeCheckAdmission = ("owner" | "own-host-bypass" | "approved");
 
 /** WakeCheckOutcome wire values; `protocol.md` §8.4. */
-export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable" | "no-workspace");
+export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable" | "no-workspace" | "cwd-unusable");
 
 /** `wake.check` params (Hub→Node). */
 export type WakeCheckParams = ({

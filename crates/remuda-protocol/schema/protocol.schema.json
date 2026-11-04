@@ -22369,6 +22369,11 @@
           "const": "no-workspace",
           "description": "Wire value `no-workspace`.",
           "type": "string"
+        },
+        {
+          "const": "cwd-unusable",
+          "description": "Wire value `cwd-unusable`.",
+          "type": "string"
         }
       ]
     },
@@ -22469,7 +22474,7 @@
         },
         "outcome": {
           "$ref": "#/$defs/WakeCheckOutcome",
-          "description": "`exited`, `timed-out` (everything it started was killed), `syntax`\n(`sh -n` refused it; nothing ran), `unavailable` (it could not start)\nor `no-workspace` (no workspace of the lineage on this Node; nothing\nran)."
+          "description": "`exited`, `timed-out` (everything it started was killed), `syntax`\n(`sh -n` refused it; nothing ran), `unavailable` (it could not start)\n`no-workspace` (no workspace of the lineage on this Node; nothing\nran) or `cwd-unusable` (the workspace is there, the directory in it is\nnot; nothing ran)."
         },
         "runId": {
           "description": "The run, echoed.",
@@ -22717,7 +22722,7 @@
           ]
         },
         "failureKind": {
-          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`, `check-exit`, `check-timeout`, `check-syntax`,\n`check-unavailable`, `check-no-workspace`.",
+          "description": "Why it failed: `not-received`, `not-delivered`, `delivery`,\n`turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,\n`child-ended`, `check-exit`, `check-timeout`, `check-syntax`,\n`check-unavailable`, `check-no-workspace`, `check-cwd-unusable`.",
           "type": [
             "string",
             "null"

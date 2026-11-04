@@ -194,6 +194,7 @@ wire_enum!(WakeCheckOutcome, "8.4", {
     Syntax => "syntax",
     Unavailable => "unavailable",
     NoWorkspace => "no-workspace",
+    CwdUnusable => "cwd-unusable",
 });
 
 wire_enum!(WakeRunState, "8.4", {
@@ -500,7 +501,7 @@ pub struct WakeRun {
     /// Why it failed: `not-received`, `not-delivered`, `delivery`,
     /// `turn-failed`, `chapter-ended`, `fresh-refused`, `child-failed`,
     /// `child-ended`, `check-exit`, `check-timeout`, `check-syntax`,
-    /// `check-unavailable`, `check-no-workspace`.
+    /// `check-unavailable`, `check-no-workspace`, `check-cwd-unusable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<String>,
 }
@@ -574,8 +575,9 @@ pub struct WakeCheckResult {
     pub run_id: String,
     /// `exited`, `timed-out` (everything it started was killed), `syntax`
     /// (`sh -n` refused it; nothing ran), `unavailable` (it could not start)
-    /// or `no-workspace` (no workspace of the lineage on this Node; nothing
-    /// ran).
+    /// `no-workspace` (no workspace of the lineage on this Node; nothing
+    /// ran) or `cwd-unusable` (the workspace is there, the directory in it is
+    /// not; nothing ran).
     pub outcome: WakeCheckOutcome,
     /// The exit code, when it exited with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

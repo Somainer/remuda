@@ -761,12 +761,18 @@ impl DevNode {
                 .map(|instance| instance.workspace_id),
             (None, None) => None,
         };
-        let place = workspace.and_then(|workspace| {
-            self.resolve_workspace_cwd(Some(&workspace), request.cwd.as_deref())
-                .ok()
-        });
+        // The workspace first (it must be registered here), then the
+        // directory in it: an unusable cwd is its own failure (r3).
+        let place = match workspace
+            .filter(|workspace| self.resolve_workspace_cwd(Some(workspace), None).is_ok())
+        {
+            None => Err(WakeCheckOutcome::NoWorkspace),
+            Some(workspace) => self
+                .resolve_workspace_cwd(Some(&workspace), request.cwd.as_deref())
+                .map_err(|_| WakeCheckOutcome::CwdUnusable),
+        };
         let run = match place {
-            Some((_, cwd)) => {
+            Ok((_, cwd)) => {
                 let env = check_env(&node_env(), &request.env);
                 // Unique per call, even were the Hub to ask twice for a run.
                 let marker = format!("{}.{}", request.run_id, uuid::Uuid::now_v7().simple());
@@ -779,7 +785,11 @@ impl DevNode {
                 )
                 .await
             }
-            None => CheckRun::without_output(
+            Err(WakeCheckOutcome::CwdUnusable) => CheckRun::without_output(
+                WakeCheckOutcome::CwdUnusable,
+                "its directory in the lineage's workspace is not usable; nothing ran",
+            ),
+            Err(_) => CheckRun::without_output(
                 WakeCheckOutcome::NoWorkspace,
                 "no workspace of the lineage on this Node; nothing ran",
             ),
@@ -1207,6 +1217,19 @@ mod tests {
             assert_eq!(refused["outcome"], "no-workspace", "{refused}");
         }
         assert!(!marker.exists(), "nothing ran in the first workspace");
+        // r3: the workspace is there, its directory is not: its own outcome.
+        for cwd in ["missing", "../../outside"] {
+            let refused = crate::transport::hubnode::dispatch_method(
+                &node,
+                METHOD_WAKE_CHECK,
+                serde_json::json!({"runId": "wrn_6", "command": format!("touch {}", marker.display()),
+                                   "timeoutSecs": 30, "workspaceId": workspace, "cwd": cwd}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused["outcome"], "cwd-unusable", "{cwd}: {refused}");
+        }
+        assert!(!marker.exists());
         for timeout in [0, 3601] {
             assert!(
                 crate::transport::hubnode::dispatch_method(

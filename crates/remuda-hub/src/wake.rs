@@ -185,6 +185,9 @@ pub(crate) mod failure {
     /// The lineage has no workspace on the check's host: nothing ran (r2;
     /// a check never runs in a workspace its Node picks).
     pub(crate) const CHECK_NO_WORKSPACE: &str = "check-no-workspace";
+    /// The lineage's workspace is there, the check's directory in it is not
+    /// usable: nothing ran (r3).
+    pub(crate) const CHECK_CWD_UNUSABLE: &str = "check-cwd-unusable";
 }
 
 // ── tables ─────────────────────────────────────────────────────────────────
@@ -2520,6 +2523,9 @@ fn failure_text(kind: &str) -> &'static str {
         failure::CHECK_SYNTAX => "its check is not valid shell; nothing ran",
         failure::CHECK_UNAVAILABLE => "its check could not start on its Node",
         failure::CHECK_NO_WORKSPACE => "the lineage has no workspace on its check's host",
+        failure::CHECK_CWD_UNUSABLE => {
+            "its check's directory in the lineage's workspace is not usable"
+        }
         _ => "it did not finish",
     }
 }
@@ -3311,6 +3317,9 @@ fn apply_report_state_only(
                 (remuda_protocol::WakeCheckOutcome::NoWorkspace, _) => {
                     ("failed", "failed", Some(failure::CHECK_NO_WORKSPACE), None)
                 }
+                (remuda_protocol::WakeCheckOutcome::CwdUnusable, _) => {
+                    ("failed", "failed", Some(failure::CHECK_CWD_UNUSABLE), None)
+                }
             }
         }
     };
@@ -3478,6 +3487,9 @@ fn apply_report(
         }
         (Some(remuda_protocol::WakeCheckOutcome::NoWorkspace), _) => {
             ("failed", Some(failure::CHECK_NO_WORKSPACE))
+        }
+        (Some(remuda_protocol::WakeCheckOutcome::CwdUnusable), _) => {
+            ("failed", Some(failure::CHECK_CWD_UNUSABLE))
         }
         (Some(remuda_protocol::WakeCheckOutcome::Unavailable), _) | (None, _) => {
             ("failed", Some(failure::CHECK_UNAVAILABLE))

@@ -2400,17 +2400,28 @@ async fn a_check_that_could_not_run_fails_the_run() -> Result<()> {
     ctx.check_tick(&shift(&first, 1)).await?;
     ctx.checks.push(CheckAnswer::Error);
     ctx.check_tick(&shift(&first, 181)).await?;
+    ctx.checks.push(CheckAnswer::Result(json!({
+        "outcome": "cwd-unusable", "stdout": "", "stdoutTruncated": false,
+        "summary": "its directory in the lineage's workspace is not usable; nothing ran",
+    })));
+    ctx.check_tick(&shift(&first, 361)).await?;
     let runs = ctx.runs(&seat).await?;
     assert_eq!(runs[0]["state"], "failed");
     assert_eq!(runs[0]["failureKind"], "check-syntax");
     assert!(runs[0]["checkExit"].is_null(), "nothing ran");
     assert_eq!(runs[1]["failureKind"], "check-unavailable");
+    assert_eq!(
+        runs[2]["failureKind"], "check-cwd-unusable",
+        "r3: its own category"
+    );
+    assert!(runs[2]["checkExit"].is_null());
     assert!(ctx.wake_sends(&seat).is_empty());
     assert_eq!(
         ctx.notice_titles(&seat)?,
         [
             "Wake-up q failed: check-syntax",
-            "Wake-up q failed: check-unavailable"
+            "Wake-up q failed: check-unavailable",
+            "Wake-up q failed: check-cwd-unusable"
         ]
     );
     Ok(())

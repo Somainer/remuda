@@ -4117,7 +4117,7 @@ export interface components {
             endedAt?: string;
             /** @description The wake-due inbox row (persistent mode). */
             factId?: number;
-            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax, check-unavailable or check-no-workspace. */
+            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax, check-unavailable, check-no-workspace or check-cwd-unusable. */
             failureKind?: string;
             /** Format: date-time */
             firedAt: string;

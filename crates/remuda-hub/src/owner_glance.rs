@@ -1056,4 +1056,94 @@ mod tests {
         assert!(!(stamp >= utc_start.as_str() && stamp <= now_str.as_str()));
         assert!(stamp >= plus_two.as_str() && stamp <= now_str.as_str());
     }
+
+    fn turn_event(name: &str, status: &str, settled: bool) -> Value {
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native", "topic": "turn", "nativeName": name,
+                "nativeId": { "state": "known", "value": "sess-glance-upgrade" },
+                "status": { "state": "known", "value": status },
+                "relatedIds": if settled { json!({ "settledRootTurn": "true" }) } else { json!({}) },
+                "dataRef": null, "severity": "info", "affectsCompletion": false
+            }
+        })
+    }
+
+    async fn settle_turn(store: &Store, host: &str, instance: &str) -> i64 {
+        store
+            .append_journal(
+                host.to_owned(),
+                instance.to_owned(),
+                None,
+                turn_event("turn_started", "working", false),
+            )
+            .await
+            .expect("turn start");
+        store
+            .append_journal(
+                host.to_owned(),
+                instance.to_owned(),
+                None,
+                turn_event("result", "turn_done", true),
+            )
+            .await
+            .expect("turn end")
+            .record
+            .seq
+    }
+
+    /// [CRITICAL] home-glance-d060: `turn_end_at` appeared after the seen
+    /// rung was already the top of an existing database, so a rung-only
+    /// migration never ran on an upgraded hub.sqlite and every settled-turn
+    /// append failed with "no such column". The column is now added by the
+    /// unconditional opener; this test rewinds a fresh database to exactly
+    /// that upgraded shape and proves appends and the glance still work.
+    #[tokio::test]
+    async fn an_upgraded_database_gains_turn_end_at_and_still_appends_turns() {
+        use crate::store::{SCHEMA_USER_VERSION, Store};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, host) = crate::store_test_support::open_with_host(dir.path(), "glance-upgrade")
+            .await
+            .unwrap();
+        store
+            .ensure_instance(host.clone(), "ins-glance-upgrade".into())
+            .await
+            .unwrap();
+        settle_turn(&store, &host, "ins-glance-upgrade").await;
+        store.close().await;
+
+        // The shape an upgraded hub.sqlite has: the ladder already sits at its
+        // top rung, and the later column does not exist.
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        let top: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(top, SCHEMA_USER_VERSION, "fresh database climbs the ladder");
+        db.execute_batch("ALTER TABLE instances DROP COLUMN turn_end_at;")
+            .unwrap();
+        drop(db);
+
+        let store = Store::open(dir.path()).unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        assert!(
+            crate::store::column_exists(&db, "instances", "turn_end_at").unwrap(),
+            "the unconditional opener restores the column on an upgraded database"
+        );
+        drop(db);
+
+        // The append that used to fail is fine, and the stamp lands.
+        settle_turn(&store, &host, "ins-glance-upgrade").await;
+        let now = OffsetDateTime::now_utc();
+        let day_start = crate::config::rfc3339(local_day_start(now, 0));
+        let now_str = crate::config::rfc3339(now);
+        let snapshot = store
+            .owner_glance_snapshot(day_start, now_str, now.unix_timestamp())
+            .await
+            .expect("the glance reads an upgraded database");
+        // The glance route renders without a 500; the row's stamp is present.
+        let _glance = render_owner_glance(snapshot, now.unix_timestamp(), 0);
+        store.close().await;
+    }
 }

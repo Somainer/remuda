@@ -8291,6 +8291,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
+    // home-glance-d060: `turn_end_at` (the local-day 今日完成 stamp, written in
+    // the same transaction as `turn_end_seq`) is added UNCONDITIONALLY, like
+    // `ended_at`. It first appeared after the seen rung (5) was already at the
+    // top of an existing database: a rung-only migration would never run
+    // there, and every settled-turn append would fail with "no such column".
+    ensure_column(&conn, "instances", "turn_end_at", "TEXT")?;
     // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
     // backfills run ONCE per schema PRAGMA marker, not on every Store::open
     // for every evidence-less terminal row (that set only grows). This is the

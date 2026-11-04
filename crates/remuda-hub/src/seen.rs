@@ -58,11 +58,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (instance_id, scope)
         );",
     )?;
-    ensure_column(conn, "instances", "turn_end_seq", "INTEGER")?;
-    // home-glance-d060: the local-day 今日完成 count reads WHEN the latest
-    // settled turn ended, not only its seq. Written in the same transaction as
-    // `turn_end_seq`, so the two can never disagree.
-    ensure_column(conn, "instances", "turn_end_at", "TEXT")
+    ensure_column(conn, "instances", "turn_end_seq", "INTEGER")
 }
 
 /// Owner clients currently showing a session, keyed by instance then device.

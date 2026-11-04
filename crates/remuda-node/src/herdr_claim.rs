@@ -702,8 +702,7 @@ impl DevNode {
     /// The registered workspace holding the pane's cwd, else a fresh id that
     /// occupies no registered workspace.
     fn workspace_for_cwd(&self, cwd: Option<&str>) -> WorkspaceId {
-        self.registered_workspace_for_cwd(cwd)
-            .unwrap_or_else(WorkspaceId::new)
+        self.registered_workspace_for_cwd(cwd).unwrap_or_default()
     }
 
     /// The registered workspace whose root contains the pane's cwd.

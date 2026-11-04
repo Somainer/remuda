@@ -1149,10 +1149,12 @@ mod tests {
                 1,
             ),
             (
+                // A plain D-026 resume: the Hub writes `resumedFrom` and
+                // inherits the predecessor's (null) parent, so it is NOT a
+                // true root — it joins through the chain.
                 "ins.human_root.resumed",
                 Some("human"),
-                json!({ "parentInstanceId": "ins.human_root",
-                        "resumedFrom": "ins.human_root" }),
+                json!({ "resumedFrom": "ins.human_root" }),
                 "ins.human_root.resumed",
                 1,
             ),
@@ -1188,10 +1190,11 @@ mod tests {
             // relaunch is a resume, never a true root, and its ROOT is the
             // Bot session.
             (
+                // The real resume shape: `resumedFrom` + the inherited (null)
+                // parent. A seed that gave it a parent would dodge item 4.
                 "ins.bot_root.relaunch",
                 Some("human"),
-                json!({ "parentInstanceId": "ins.bot_root",
-                        "resumedFrom": "ins.bot_root" }),
+                json!({ "resumedFrom": "ins.bot_root" }),
                 "ins.bot_root.relaunch",
                 1,
             ),

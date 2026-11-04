@@ -161,11 +161,18 @@ export type GlancePiece =
 
 export type GlanceLineInput = {
   /**
-   * null before the first Hub snapshot. `doneUnseen` is optional so a caller
-   * that only knows the older two counts still type-checks; an omitted count
-   * reads as 0.
+   * null before anything is known. Each count may also be unknown on its own
+   * (`null` → 「–」): ①'s 需要你 is known with ④'s first snapshot, the glance's
+   * segments only with the first glance read. `doneUnseen` is optional so a
+   * caller that only knows the older two counts still type-checks; an omitted
+   * count reads as 0.
    */
-  counts: (Omit<GlanceCounts, "doneUnseen"> & { doneUnseen?: number }) | null;
+  counts: {
+    needYou: number | null;
+    doneUnseen?: number | null;
+    working: number | null;
+    doneToday?: number;
+  } | null;
   /** Local hour, injected so the greeting is testable. */
   hour: number;
   hostsOnline: number;
@@ -205,13 +212,17 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
     ];
   }
   const { needYou, working } = input.counts;
-  const doneUnseen = input.counts.doneUnseen ?? 0;
+  const doneUnseen = input.counts.doneUnseen === undefined ? 0 : input.counts.doneUnseen;
   const pieces: GlancePiece[] = [];
-  if (needYou > 0) pieces.push({ key: "needYou", count: needYou });
+  // An unknown count is a 「–」 piece; a known zero is hidden (the greeting
+  // stands in for a zero 需要你).
+  if (needYou === null || needYou > 0) pieces.push({ key: "needYou", count: needYou });
   else pieces.push({ key: "greeting", text: greetingForHour(input.hour) });
   // §5.2 order: 需要你 · 完成未看 · 工作中.
-  if (doneUnseen > 0 || input.doneUnseenFilter === true) pieces.push({ key: "doneUnseen", count: doneUnseen });
-  if (working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
+  if (doneUnseen === null || doneUnseen > 0 || input.doneUnseenFilter === true) {
+    pieces.push({ key: "doneUnseen", count: doneUnseen });
+  }
+  if (working === null || working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
   // §5.2 今日完成: desktop only, hidden while unknown (`doneToday` absent), and
   // a known zero is hidden like every other segment.
   const doneToday = input.counts.doneToday ?? null;
@@ -223,7 +234,8 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
   if (
     needYou === 0 &&
     doneUnseen === 0 &&
-    !(working > 0 || input.workingFilter === true) &&
+    working === 0 &&
+    input.workingFilter !== true &&
     !paintedDoneToday &&
     input.hostsTotal > 0
   ) {

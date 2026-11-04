@@ -3,11 +3,14 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { OwnerGlance } from "../../types/generated";
 import type { HubState } from "../../lib/store";
+import type { Id } from "../../types/wire";
+import { interaction as queueInteraction } from "./queueTestData";
 
 /**
  * ① 的渲染契约 (home.md §5.2 / §5.3 / §8): the row's grammar is unit-tested
- * purely in glance.test.ts; this file pins the wiring — every count comes from
- * the ONE owner glance (never from the instance list), first snapshot 「–」,
+ * purely in glance.test.ts; this file pins the wiring — 需要你 comes from ④'s
+ * own client page (so it is known when ④ is), every other count from the ONE
+ * owner glance (never from the instance list), first snapshot 「–」,
  * the desktop-only 今日完成 segment, the stale grey + 「更新于 HH:MM」, and the
  * two taps.
  */
@@ -32,6 +35,11 @@ vi.mock("../../lib/store", async (importOriginal) => {
     },
   };
 });
+
+// ④'s owner-wide task ledger: no blocked task here, so N is the queue alone.
+vi.mock("../tasks/taskLedger", () => ({
+  useTaskLedger: () => ({ tasks: [], projectName: () => null }),
+}));
 
 vi.mock("./freshness", () => ({
   useHomeFreshness: () => fake.freshness,
@@ -80,18 +88,40 @@ describe("HomeGlance", () => {
     expect(screen.queryByTestId("glance-updated")).toBeNull();
   });
 
-  it("paints the glance's counts, never a derivation over the instance list", () => {
+  it("paints ④'s 需要你 and the glance's other counts, never a derivation over the instance list", () => {
     // Three instances that would derive a ● of 3 on their own: the glance is
-    // the only source, so the segment must read its number instead.
+    // the only source of ●/◉, so those segments read its numbers. 需要你 is
+    // ④'s N — two pending approvals — whatever the glance's own needYou says.
     fake.state = hub({
       instances: [instance("ins_a"), instance("ins_b"), instance("ins_c")],
-      glance: glance({ needYou: 2, doneUnseen: 1, working: 7 }),
+      interactions: pending("ins_a", "ins_b"),
+      glance: glance({ needYou: 9, doneUnseen: 1, working: 7 }),
     });
     fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
     render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
     expect(screen.getByTestId("glance-need-you")).toHaveTextContent("2 需要你");
     expect(screen.getByTestId("glance-done-unseen")).toHaveTextContent("1 完成未看");
     expect(screen.getByTestId("glance-working")).toHaveTextContent("7 工作中");
+  });
+
+  /**
+   * [r6 item 1] ①'s 需要你 is known whenever ④ is: from ④'s first snapshot,
+   * not from the first glance read. Only the glance's own segments wait.
+   */
+  it("knows 需要你 with ④'s first snapshot, before any glance", () => {
+    fake.state = hub({ instances: [instance("ins_a")], interactions: pending("ins_a") });
+    fake.freshness = { state: "fresh", lastOkAt: 1, failingSince: null };
+    const { unmount } = render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
+    expect(screen.getByTestId("glance-need-you")).toHaveTextContent("1 需要你");
+    expect(screen.getByTestId("glance-done-unseen")).toHaveTextContent("– 完成未看");
+    expect(screen.getByTestId("glance-working")).toHaveTextContent("– 工作中");
+    unmount();
+    // A known zero is the greeting at once, as ④'s 「需要你 · 0」 is.
+    fake.state = hub({ instances: [instance("ins_a")] });
+    render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
+    expect(screen.queryByTestId("glance-need-you")).toBeNull();
+    expect(screen.getByTestId("glance-greeting")).toBeTruthy();
+    expect(screen.getByTestId("glance-working")).toHaveTextContent("– 工作中");
   });
 
   it("shows 「今日完成 N」 on the desktop only, and never while unknown", () => {
@@ -123,9 +153,13 @@ describe("HomeGlance", () => {
 
   it("greys the row and names the last good read when only the glance failed", () => {
     const lastGood = new Date(2026, 9, 31, 9, 5).getTime();
-    fake.state = hub(
-      { glance: glance({ needYou: 2 }), glanceAt: lastGood, glanceFailed: true },
-    );
+    fake.state = hub({
+      instances: [instance("ins_a"), instance("ins_b")],
+      interactions: pending("ins_a", "ins_b"),
+      glance: glance({ working: 3 }),
+      glanceAt: lastGood,
+      glanceFailed: true,
+    });
     fake.freshness = { state: "fresh", lastOkAt: Date.now(), failingSince: null };
     render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
     // The main refresh is healthy, but these numbers are frozen: never fresh.
@@ -236,4 +270,11 @@ function instance(id = "ins_a", parent: unknown = null, extra: Record<string, un
     exit: { state: "na" },
     ...extra,
   } as unknown as HubState["instances"][number];
+}
+
+/** Pending approvals on these sessions: what ④'s queue (and so N) counts. */
+function pending(...instanceIds: string[]) {
+  return instanceIds.map((instanceId, index) =>
+    queueInteraction({ id: `int_${index}` as Id, instanceId: instanceId as Id }),
+  );
 }

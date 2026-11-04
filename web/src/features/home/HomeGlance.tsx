@@ -3,12 +3,14 @@ import { useHub } from "../../lib/store";
 import { useNowTick } from "../../lib/useNowTick";
 import { hostIsOnline } from "../hosts/model";
 import { HOME_FRESHNESS, useHomeFreshness } from "./freshness";
+import { useGlanceSource } from "./glanceSource";
 import { useOwnerGlancePoll } from "./useOwnerGlance";
 import {
   formatGlanceCount,
   formatUpdatedAt,
+  glanceCounts,
   glancePieces,
-  type GlanceCounts,
+  type GlanceLineInput,
 } from "./glance";
 import css from "./homeGlance.module.css";
 
@@ -19,12 +21,13 @@ import css from "./homeGlance.module.css";
  * total). Desktop: the same line inside the PageHeader, plus the desktop-only
  * 「今日完成 N」 segment.
  *
- * home-glance-d060: every count reads ONE `GET /v1/owner/glance` per poll —
- * the projection home.md §5.3 defines over Main's subtree plus the sessions
- * the owner opened by hand. Nothing here derives a number from the instance
- * list any more, so the row cannot disagree with the Hub (or with
- * `remuda glance`); before the first glance the segments read 「–」 and
- * 今日完成 stays hidden, exactly as §5.2 asks.
+ * 需要你 (§5.1 N) is ④'s number by construction: `glanceCounts().needYou`
+ * over the ONE client page ④'s header and the OS badge read
+ * (`useGlanceSource`), so it is known the moment ④ is and never disagrees with
+ * it. The other segments — 完成未看, 工作中, 今日完成 — read ONE
+ * `GET /v1/owner/glance` per poll, the projection home.md §5.3 defines over
+ * Main's subtree plus the sessions the owner opened by hand; before the first
+ * glance they read 「–」 and 今日完成 stays hidden, exactly as §5.2 asks.
  *
  * Taps: 需要你 scrolls to the queue; 完成未看 and 工作中 each filter the ledger
  * to that rank, and a second tap clears it.
@@ -55,19 +58,27 @@ export function HomeGlance({
   // §5.3: the glance is polled only while this home surface is mounted, and
   // once per cycle; the mount read closes the cold-bootstrap 「–」 window.
   useOwnerGlancePoll();
-  const counts = useMemo<GlanceCounts | null>(() => {
+  // §5.1: ④'s N, from ④'s own page — known with the first Hub snapshot, which
+  // is exactly when ④'s header stops reading 「–」.
+  const source = useGlanceSource();
+  const needYou = useMemo(
+    () => (freshness.state === "unknown" ? null : glanceCounts(source).needYou),
+    [freshness.state, source],
+  );
+  const counts = useMemo<GlanceLineInput["counts"]>(() => {
     const glance = hub.glance;
     // A store that somehow holds a partial projection paints 「–」 rather than
     // crashing the home (refreshGlance rejects malformed bodies at the
     // boundary; this is the belt and braces).
-    if (!glance || !glance.counts || typeof glance.counts.needYou !== "number") return null;
+    const known = glance?.counts && typeof glance.counts.working === "number" ? glance.counts : null;
+    if (needYou === null && known === null) return null;
     return {
-      needYou: glance.counts.needYou,
-      doneUnseen: glance.counts.doneUnseen,
-      working: glance.counts.working,
-      doneToday: glance.counts.doneToday,
+      needYou,
+      doneUnseen: known ? known.doneUnseen : null,
+      working: known ? known.working : null,
+      ...(known ? { doneToday: known.doneToday } : {}),
     };
-  }, [hub.glance]);
+  }, [hub.glance, needYou]);
 
   const hostsOnline = hub.hosts.filter((host) => hostIsOnline(host)).length;
   const pieces = glancePieces({
@@ -88,7 +99,7 @@ export function HomeGlance({
   const glanceStale =
     hub.glanceFailed ||
     (hub.glanceAt !== null && nowMs - hub.glanceAt > HOME_FRESHNESS.staleAfterMs);
-  const stale = freshness.state === "stale" || (counts !== null && glanceStale);
+  const stale = freshness.state === "stale" || (hub.glance !== null && glanceStale);
   const updatedAt = hub.glanceAt ?? freshness.lastOkAt;
 
   return (

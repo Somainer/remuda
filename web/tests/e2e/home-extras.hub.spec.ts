@@ -219,7 +219,7 @@ test.describe("home-main-extras", () => {
     const { context, page } = await phonePage(browser);
     try {
       const mainId = await seatMain(page, "hextras-main phone");
-      const host = await fakeHost(page);
+      const hostId = await fakeHost(page);
       const lineageId = await lineageOf(page, mainId);
       const wakeName = `hextras-${Date.now().toString(36)}`;
       await addWake(page, lineageId, wakeName);
@@ -235,7 +235,7 @@ test.describe("home-main-extras", () => {
       await expect(star).toBeVisible({ timeout: 20_000 });
       await expect(star.locator("xpath=ancestor::*[@data-testid='host-chip']")).toHaveAttribute(
         "data-host-id",
-        host.id!,
+        hostId,
       );
       await expect(page.getByTestId("host-summary")).toContainText("主机在线");
 
@@ -327,6 +327,7 @@ test.describe("home-main-extras", () => {
     await login(page);
     try {
       const mainId = await seatMain(page, "hextras-main 1440");
+      const hostId = await fakeHost(page);
       const lineageId = await lineageOf(page, mainId);
       const wakeName = `hextras-today-${Date.now().toString(36)}`;
       await addWake(page, lineageId, wakeName);
@@ -334,8 +335,14 @@ test.describe("home-main-extras", () => {
       const aside = page.getByTestId("sessions-aside");
       await expect(aside).toBeVisible({ timeout: 20_000 });
       await expect(aside.getByTestId("main-card")).toHaveAttribute("data-main-id", mainId);
-      // ② ★ is visible in the all-online collapsed strip at 1440 too (r2).
-      await expect(page.getByTestId("host-main-star")).toBeVisible({ timeout: 20_000 });
+      // ② ★ is visible in the all-online collapsed strip at 1440 too (r2),
+      // on the host it names (r3).
+      const star = page.getByTestId("host-main-star");
+      await expect(star).toBeVisible({ timeout: 20_000 });
+      await expect(star.locator("xpath=ancestor::*[@data-testid='host-chip']")).toHaveAttribute(
+        "data-host-id",
+        hostId,
+      );
       // §2.2: the right column owns ⑩ here, so the card has no third line.
       await expect(page.getByTestId("main-wake-line")).toHaveCount(0);
       const today = aside.getByTestId("home-today");

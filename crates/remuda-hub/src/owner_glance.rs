@@ -262,15 +262,17 @@ impl Store {
                 .ok();
             let main_lineage = main.as_ref().map(|(lineage, _)| lineage.clone());
             // §5.3 scope: Main's lineage subtree, plus the sessions the owner
-            // opened by hand. "Hand-opened" is defined from the Hub-stamped
-            // creator (`instances.creator_origin`, written from the
-            // authenticated device at create): the instance — or the ROOT of
-            // its resume/continuation chain — was created by a Human device.
-            // That excludes, by construction: Bot-created roots (creator
-            // `bot`), supervisor respawns and auto-continued successors whose
-            // lineage root is an Agent-dispatched worker, and rows with no
-            // stamp at all (pre-upgrade rows, `ensure_instance` phantoms). A
-            // hand-opened session never drags in the children it dispatched.
+            // opened by hand. ONE rule: a session is the owner's when the ROOT
+            // of its resume/continuation chain — its generation-1 chapter — is
+            // a TRUE root (no parent, no `resumedFrom`, its own lineage) whose
+            // Hub-stamped creator was a Human device (or the upgrade
+            // backfill's `legacy`). The chain then follows every
+            // `resumedFrom` link and every continuation chapter of that
+            // lineage (2nd, 3rd, …), so a Bot root relaunched by a human, a
+            // supervisor-respawned worker and an auto-continued successor all
+            // stay out: their ROOT is not hand-opened. A hand-opened session
+            // never drags in the children it dispatched — those carry it as
+            // `parentInstanceId`, not as a resume/continuation link.
             let mut scope_stmt = tx.prepare(
                 "WITH RECURSIVE
                      main_scope(id) AS (
@@ -281,18 +283,20 @@ impl Store {
                              ON json_extract(i.spec_json, '$.parentInstanceId') = s.id
                      ),
                      hand(id) AS (
-                         -- A root the owner's own device created.
+                         -- A TRUE root the owner's device created (or the
+                         -- upgrade backfill could only call `legacy`).
                          SELECT id FROM instances
-                          WHERE creator_origin = 'human'
+                          WHERE creator_origin IN ('human', 'legacy')
                             AND json_extract(spec_json, '$.parentInstanceId') IS NULL
+                            AND json_extract(spec_json, '$.resumedFrom') IS NULL
+                            AND (lineage_id IS NULL OR lineage_id = id)
                          UNION
-                         -- A continuation chapter of a hand-opened lineage.
+                         -- A resume of a hand session, or ANY continuation
+                         -- chapter of a hand lineage (generation 2, 3, …).
                          SELECT i.id FROM instances i
-                           JOIN hand h ON i.lineage_id = h.id AND i.generation > 1
-                         UNION
-                         -- A plain D-026 resume of a hand-opened session.
-                         SELECT i.id FROM instances i
-                           JOIN hand h ON json_extract(i.spec_json, '$.resumedFrom') = h.id
+                           JOIN hand h
+                             ON json_extract(i.spec_json, '$.resumedFrom') = h.id
+                             OR (i.lineage_id = h.id AND i.generation > 1)
                      )
                  SELECT id FROM main_scope
                  UNION
@@ -1171,6 +1175,43 @@ mod tests {
                 "ins.worker_root",
                 2,
             ),
+            // Upgrade backfill's remaining true roots are accepted as
+            // hand-opened.
+            (
+                "ins.legacy_root",
+                Some("legacy"),
+                json!({}),
+                "ins.legacy_root",
+                1,
+            ),
+            // A Bot-created root relaunched by the owner's device: the
+            // relaunch is a resume, never a true root, and its ROOT is the
+            // Bot session.
+            (
+                "ins.bot_root.relaunch",
+                Some("human"),
+                json!({ "parentInstanceId": "ins.bot_root",
+                        "resumedFrom": "ins.bot_root" }),
+                "ins.bot_root.relaunch",
+                1,
+            ),
+            // The SECOND continuation of a hand-opened lineage: its own
+            // stamp is NULL and its resumedFrom names S1; the chain root is
+            // still the Human root, so the lineage arm reaches it.
+            (
+                "ins.human_root.cont2",
+                None,
+                json!({ "resumedFrom": "ins.human_root.cont1" }),
+                "ins.human_root",
+                2,
+            ),
+            (
+                "ins.human_root.cont3",
+                None,
+                json!({ "resumedFrom": "ins.human_root.cont2" }),
+                "ins.human_root",
+                3,
+            ),
         ];
         for (id, creator, spec, lineage, generation) in seeds {
             store
@@ -1215,6 +1256,101 @@ mod tests {
             !scope.contains("ins.worker_root.successor"),
             "a successor whose root is an Agent-created worker"
         );
+        assert!(
+            scope.contains("ins.legacy_root"),
+            "an upgraded true root the backfill calls legacy is hand-opened"
+        );
+        assert!(
+            !scope.contains("ins.bot_root.relaunch"),
+            "a human relaunch of a Bot root is not hand-opened"
+        );
+        assert!(
+            scope.contains("ins.human_root.cont3"),
+            "the SECOND continuation of a hand-opened lineage is in scope"
+        );
+        store.close().await;
+    }
+
+    /// [r3 item 1] A pre-stamp database has every `creator_origin` NULL, so
+    /// without a backfill every hand-opened session vanishes from ①/⑥ and a
+    /// Hub without Main shows nothing. The unconditional opener classifies
+    /// each row from durable evidence (dispatch audit/parent → agent, a
+    /// Human seat → human, a remaining true root → legacy).
+    #[tokio::test]
+    async fn an_upgraded_database_backfills_the_creator_stamp() {
+        use crate::store::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, host) =
+            crate::store_test_support::open_with_host(dir.path(), "glance-backfill")
+                .await
+                .unwrap();
+        let seeds = [
+            ("ins.old_root", json!({})),
+            (
+                "ins.old_child",
+                json!({ "parentInstanceId": "ins.old_root" }),
+            ),
+        ];
+        for (id, spec) in seeds {
+            store
+                .ensure_instance(host.clone(), id.to_string())
+                .await
+                .unwrap();
+            store
+                .run_named("seed_old", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET spec_json = ?2, creator_origin = NULL, lineage_id = ?1
+                          WHERE id = ?1",
+                        params![id, spec.to_string()],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        store.close().await;
+
+        // The upgraded shape: the column did not exist before this build.
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute_batch("ALTER TABLE instances DROP COLUMN creator_origin;")
+            .unwrap();
+        drop(db);
+
+        let store = Store::open(dir.path()).unwrap();
+        let root = store
+            .get_instance("ins.old_root".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            root.creator_origin.as_deref(),
+            Some("legacy"),
+            "a pre-stamp true root becomes legacy"
+        );
+        let child = store
+            .get_instance("ins.old_child".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.creator_origin.as_deref(),
+            Some("agent"),
+            "a parented row was Agent-created"
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let day_start = crate::config::rfc3339(local_day_start(now, 0));
+        let now_str = crate::config::rfc3339(now);
+        let snapshot = store
+            .owner_glance_snapshot(day_start, now_str)
+            .await
+            .unwrap();
+        let scope: std::collections::BTreeSet<&str> =
+            snapshot.scope.iter().map(String::as_str).collect();
+        assert!(scope.contains("ins.old_root"), "the upgraded hand root");
+        assert!(!scope.contains("ins.old_child"), "its dispatched child");
         store.close().await;
     }
 

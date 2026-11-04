@@ -108,9 +108,36 @@ const FRESH_PER_DRIVE: i64 = 16;
 pub(crate) const FRESH_DRIVER: &str = "claude-print";
 /// Checks one drive claims at most.
 const CHECKS_PER_DRIVE: i64 = 16;
-/// How much longer than a check's own timeout the Hub waits for its Node's
-/// answer: the `sh -n` precheck, the group kill and the reply.
+/// How much longer than a check's own timeout plus the Node's bounded
+/// overhead (`WAKE_CHECK_NODE_OVERHEAD_SECS`) the Hub waits for its answer:
+/// the link and the reply.
 const CHECK_RPC_MARGIN_SECS: u64 = 30;
+/// The first delay before a check its Node never received is asked again; it
+/// doubles per attempt up to [`CHECK_RETRY_MAX_SECS`].
+const CHECK_RETRY_FIRST_SECS: i64 = 1;
+/// The longest delay between two attempts to reach a check's Node.
+const CHECK_RETRY_MAX_SECS: i64 = 60;
+
+/// How long the Hub waits for a Node's answer to a check of `timeout_secs`:
+/// longer than the Node can take (the check's timeout plus its bounded
+/// overhead), so a check that ran its whole timeout is never taken as lost
+/// while it still runs.
+pub(crate) fn check_rpc_wait(timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        timeout_secs
+            .saturating_add(remuda_protocol::WAKE_CHECK_NODE_OVERHEAD_SECS)
+            .saturating_add(CHECK_RPC_MARGIN_SECS),
+    )
+}
+
+/// The delay before the next attempt to reach a check's Node, after
+/// `attempts` that never reached it: 1 s, doubling, at most 60 s.
+fn check_retry_secs(attempts: i64) -> i64 {
+    let exponent = u32::try_from(attempts.clamp(1, 16) - 1).unwrap_or(0);
+    CHECK_RETRY_FIRST_SECS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(CHECK_RETRY_MAX_SECS)
+}
 
 /// The failure kinds a run can end with; each latches its own owner notice.
 pub(crate) mod failure {
@@ -248,6 +275,14 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "check_output_truncated",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // r2: attempts that never reached the check's Node, and when to try again.
+    ensure_column(
+        conn,
+        "wake_runs",
+        "check_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "wake_runs", "check_next_at", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS wake_runs_check
             ON wake_runs(check_state) WHERE check_state IN ('pending', 'running');",
@@ -2640,6 +2675,7 @@ struct RunCheckSpec {
 #[derive(Debug, Clone)]
 struct CheckClaim {
     run_id: String,
+    wake_id: String,
     host_id: String,
     timeout_secs: u64,
     params: remuda_protocol::WakeCheckParams,
@@ -2729,8 +2765,9 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
         .query_row(
             "SELECT wake_id, lineage_id, name, scheduled_at, fired_at, check_json
                FROM wake_runs
-              WHERE run_id = ?1 AND state = 'queued' AND check_state = 'pending'",
-            params![run_id],
+              WHERE run_id = ?1 AND state = 'queued' AND check_state = 'pending'
+                AND (check_next_at IS NULL OR check_next_at <= ?2)",
+            params![run_id, now_rfc3339()],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -2802,7 +2839,7 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
     // run" is the reason a skip must not refresh `lastRunAt`).
     let mut env = std::collections::BTreeMap::new();
     for (key, value) in [
-        ("REMUDA_WAKE_ID", Some(wake_id)),
+        ("REMUDA_WAKE_ID", Some(wake_id.clone())),
         ("REMUDA_WAKE_NAME", Some(name)),
         ("REMUDA_WAKE_RUN_ID", Some(run_id.to_owned())),
         ("REMUDA_WAKE_LINEAGE_ID", Some(lineage_id)),
@@ -2817,6 +2854,7 @@ fn claim_check(conn: &mut Connection, run_id: &str) -> Result<Option<CheckClaim>
     let timeout_secs = u64::try_from(spec.timeout_secs).unwrap_or(1);
     Ok(Some(CheckClaim {
         run_id: run_id.to_owned(),
+        wake_id: wake_id.clone(),
         host_id: spec.host_id,
         timeout_secs,
         params: remuda_protocol::WakeCheckParams {
@@ -2840,9 +2878,12 @@ pub(crate) async fn drive_checks(state: &AppState) {
             Ok(conn
                 .prepare_cached(
                     "SELECT run_id FROM wake_runs WHERE state = 'queued' AND check_state = 'pending'
+                       AND (check_next_at IS NULL OR check_next_at <= ?2)
                       ORDER BY fired_at, run_id LIMIT ?1",
                 )?
-                .query_map(params![CHECKS_PER_DRIVE], |row| row.get::<_, String>(0))?
+                .query_map(params![CHECKS_PER_DRIVE, now_rfc3339()], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await;
@@ -2894,24 +2935,37 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
         Ok(params) => params,
         Err(_) => return,
     };
-    let answer = state
-        .nodes
-        .call(
-            &claim.host_id,
-            remuda_protocol::METHOD_WAKE_CHECK,
-            params,
-            std::time::Duration::from_secs(
-                claim.timeout_secs.saturating_add(CHECK_RPC_MARGIN_SECS),
-            ),
-        )
-        .await;
+    #[cfg(any(test, feature = "test-faults"))]
+    let busy = test_seams::take_check_node_busy(&claim.run_id)
+        || test_seams::take_check_node_busy(&claim.wake_id);
+    #[cfg(not(any(test, feature = "test-faults")))]
+    let busy = false;
+    let answer = if busy {
+        Err(HubError::NodeBusy {
+            retry_after_ms: 1000,
+        })
+    } else {
+        state
+            .nodes
+            .call(
+                &claim.host_id,
+                remuda_protocol::METHOD_WAKE_CHECK,
+                params,
+                check_rpc_wait(claim.timeout_secs),
+            )
+            .await
+    };
     let report = match answer {
         Ok(Some(frame)) => match frame.get("result") {
             Some(result) => serde_json::from_value(result.clone())
                 .map_or(CheckReport::Refused, CheckReport::Done),
             None => CheckReport::Refused,
         },
-        Ok(None) => CheckReport::NotSent,
+        // Not connected, or the link refused the frame before queueing it
+        // (NODE_BUSY: too many calls in flight): the Node never saw it.
+        Ok(None) | Err(HubError::NodeBusy { .. }) => CheckReport::NotSent,
+        // The frame was queued and the reply never came (the link went away,
+        // or the Node stayed silent past what it can take): it may have run.
         Err(_) => CheckReport::Lost,
     };
     #[cfg(any(test, feature = "test-faults"))]
@@ -2930,8 +2984,11 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
         })
         .await;
     match settled {
-        Ok(true) => drive_fresh(state).await,
-        Ok(false) => {}
+        Ok(Settled::Fresh) => drive_fresh(state).await,
+        Ok(Settled::Done) => {}
+        Ok(Settled::RetryAfter(secs)) => {
+            tokio::spawn(redrive_checks(state.clone(), secs));
+        }
         Err(err) => tracing::error!(
             category = "wake",
             code = crate::inbox::error_code(&err),
@@ -2940,8 +2997,30 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
     }
 }
 
-/// Write what a check did (§11.2), in one writer transaction; `true` when a
-/// fresh run may now create its child.
+/// Drive the due checks again after `secs` (a check its Node never
+/// received). Boxed: it is spawned from inside a check the drive started.
+fn redrive_checks(
+    state: AppState,
+    secs: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        drive_checks(&state).await;
+    })
+}
+
+/// What a check's settlement leaves to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// Nothing.
+    Done,
+    /// A fresh run may now create its child.
+    Fresh,
+    /// The call never reached the Node: ask again after this many seconds.
+    RetryAfter(u64),
+}
+
+/// Write what a check did (§11.2), in one writer transaction.
 ///
 /// * Exit 0: the run happens. It is the wake-up's last real run, and its
 ///   bounded stdout rides the run's detail as its summary (quoted as
@@ -2951,14 +3030,16 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
 /// * Any other exit, a signal, the timeout, a syntax error or a check that
 ///   could not start: `failed`, with a `wake-failed` fact to the lineage; the
 ///   `notify` declaration applies with its repeat-failure latch.
-/// * The call never reached the Node: the check waits for its host again.
+/// * The call never reached the Node (not connected, or NODE_BUSY before the
+///   frame was queued): the check waits again, and its next attempt waits
+///   1 s, doubling, at most 60 s.
 /// * The link went away mid-check: `interrupted`, never asked again (the
 ///   rule a Hub restart applies at boot).
 fn settle_check(
     conn: &mut Connection,
     run_id: &str,
     report: &CheckReport,
-) -> Result<bool, StoreError> {
+) -> Result<Settled, StoreError> {
     let tx = immediate_tx(conn)?;
     #[allow(clippy::type_complexity)]
     let run: Option<(
@@ -2989,20 +3070,28 @@ fn settle_check(
         )
         .optional()?;
     let Some((wake_id, lineage_id, name, mode, fired_at, detail, host_id)) = run else {
-        return Ok(false);
+        return Ok(Settled::Done);
     };
     let host_id = host_id.unwrap_or_default();
     let now = now_rfc3339();
     let result = match report {
         CheckReport::NotSent => {
-            tx.execute(
-                "UPDATE wake_runs SET state = 'queued', check_state = 'pending', started_at = NULL
-                  WHERE run_id = ?1",
+            let attempts: i64 = tx.query_row(
+                "SELECT check_attempts + 1 FROM wake_runs WHERE run_id = ?1",
                 params![run_id],
+                |row| row.get(0),
+            )?;
+            let secs = check_retry_secs(attempts);
+            let next = OffsetDateTime::now_utc().saturating_add(time::Duration::seconds(secs));
+            tx.execute(
+                "UPDATE wake_runs SET state = 'queued', check_state = 'pending', started_at = NULL,
+                        check_attempts = ?2, check_next_at = ?3
+                  WHERE run_id = ?1",
+                params![run_id, attempts, rfc3339(next)],
             )?;
             tx.commit()?;
-            tracing::info!(category = "wake", outcome = "check-not-sent");
-            return Ok(false);
+            tracing::info!(category = "wake", outcome = "check-not-sent", attempts);
+            return Ok(Settled::RetryAfter(u64::try_from(secs).unwrap_or(1)));
         }
         CheckReport::Lost => {
             tx.execute(
@@ -3013,7 +3102,7 @@ fn settle_check(
             )?;
             tx.commit()?;
             tracing::info!(category = "wake", outcome = "check-interrupted");
-            return Ok(false);
+            return Ok(Settled::Done);
         }
         CheckReport::Refused => None,
         CheckReport::Done(result) => Some(result),
@@ -3128,7 +3217,11 @@ fn settle_check(
         exit_code = exit,
         "wake check settled"
     );
-    Ok(fresh_due)
+    Ok(if fresh_due {
+        Settled::Fresh
+    } else {
+        Settled::Done
+    })
 }
 
 // ── fresh mode ─────────────────────────────────────────────────────────────
@@ -3450,6 +3543,43 @@ pub(crate) mod test_seams {
         }
     }
 
+    static CHECK_NODE_BUSY: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+    /// Make the next `times` Node calls of the check of `id` (a run id, or a
+    /// wake id for every run of it) answer NODE_BUSY (refused before the
+    /// frame was queued); 0 disarms.
+    pub fn arm_check_node_busy(run_id: &str, times: u32) {
+        let mut slot = CHECK_NODE_BUSY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let armed = slot.get_or_insert_with(HashMap::new);
+        if times == 0 {
+            armed.remove(run_id);
+        } else {
+            armed.insert(run_id.to_owned(), times);
+        }
+    }
+
+    /// Whether this Node call of `run_id`'s check is an armed NODE_BUSY.
+    pub(crate) fn take_check_node_busy(run_id: &str) -> bool {
+        let mut slot = CHECK_NODE_BUSY
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(armed) = slot.as_mut() else {
+            return false;
+        };
+        match armed.get_mut(run_id) {
+            Some(times) => {
+                *times -= 1;
+                if *times == 0 {
+                    armed.remove(run_id);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether this result write for `run_id` is an armed failure (counts it).
     pub(crate) fn take_result_failure(run_id: &str) -> bool {
         let mut slot = RESULT_FAILURES
@@ -3547,6 +3677,24 @@ mod tests {
             due_occurrences("sometimes", next, Some(60), now),
             Err("wake-trigger-unknown")
         );
+    }
+
+    /// r2: the Hub waits longer than a Node can take for a check (its
+    /// timeout plus the Node's bounded overhead), and a check its Node never
+    /// received is asked again after a bounded backoff.
+    #[test]
+    fn the_check_wait_outlasts_the_node_and_retries_back_off_to_a_bound() {
+        for timeout in [1, 30, WAKE_CHECK_TIMEOUT_MAX_SECS as u64] {
+            assert!(
+                check_rpc_wait(timeout).as_secs()
+                    > timeout + remuda_protocol::WAKE_CHECK_NODE_OVERHEAD_SECS,
+                "{timeout}"
+            );
+        }
+        assert_eq!(check_retry_secs(1), 1);
+        assert_eq!(check_retry_secs(2), 2);
+        assert_eq!(check_retry_secs(7), 60);
+        assert_eq!(check_retry_secs(i64::MAX), 60);
     }
 
     #[test]

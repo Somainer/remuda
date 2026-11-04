@@ -2644,3 +2644,68 @@ async fn wait_for_host(ctx: &Ctx, state: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+
+/// r2: a check its Node never received (NODE_BUSY: refused before the frame
+/// was queued) is not interrupted: the run waits, is asked again after a
+/// bounded backoff, and then runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_busy_check_is_retried_not_consumed() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project("wake-check-busy").await?;
+    let (seat, token) = ctx.bypass_seat(&project).await?;
+    let wake = ctx
+        .add_ok(
+            &token,
+            &seat,
+            checked(
+                "q",
+                json!({ "command": "./ready", "timeoutSecs": 5 }),
+                "failure",
+            ),
+        )
+        .await?;
+    let wake_id = wake["wakeId"].as_str().context("wake id")?;
+    remuda_hub::wake_test_support::arm_check_node_busy(wake_id, 2);
+    ctx.checks.exit(2, "");
+    ctx.check_tick(&shift(&next_fire(&wake), 1)).await?;
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs[0]["state"], "queued", "not consumed: {runs:#?}");
+    assert_eq!(runs[0]["check"]["state"], "pending");
+    assert!(ctx.check_calls().is_empty(), "nothing reached the Node");
+    let next: Option<String> = ctx.db()?.query_row(
+        "SELECT check_next_at FROM wake_runs WHERE run_id = ?1",
+        [runs[0]["runId"].as_str().unwrap()],
+        |row| row.get(0),
+    )?;
+    assert!(next.is_some(), "a backoff is recorded");
+    // The backoff (1 s, then 2 s) asks again on its own; the third attempt
+    // reaches the Node.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let runs = ctx.runs(&seat).await?;
+        if runs[0]["state"] != "queued" {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "never retried: {runs:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    ctx.hub.test_settle_wake_checks().await?;
+    let runs = ctx.runs(&seat).await?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["state"], "skipped", "it ran, once: {runs:#?}");
+    assert_eq!(ctx.check_calls().len(), 1);
+    let attempts: i64 = ctx.db()?.query_row(
+        "SELECT check_attempts FROM wake_runs WHERE run_id = ?1",
+        [runs[0]["runId"].as_str().unwrap()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(attempts, 2);
+    assert!(
+        ctx.notice_titles(&seat)?.is_empty(),
+        "NODE_BUSY is not a failure"
+    );
+    Ok(())
+}

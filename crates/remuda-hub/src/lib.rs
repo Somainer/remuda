@@ -365,6 +365,12 @@ pub mod wake_test_support {
         crate::wake::test_seams::arm_result_failure(run_id, times);
     }
 
+    /// cb-wake-check r2: make the next `times` Node calls of `run_id`'s check
+    /// answer NODE_BUSY (refused before the frame was queued); 0 disarms.
+    pub fn arm_check_node_busy(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_node_busy(run_id, times);
+    }
+
     /// Seconds without a completed tick after which `/healthz` answers 503.
     pub fn stale_after_secs() -> u64 {
         crate::wake::stale_after_secs()

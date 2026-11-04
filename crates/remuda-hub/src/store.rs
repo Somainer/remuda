@@ -976,9 +976,13 @@ pub struct InstanceRecord {
     #[serde(default)]
     pub auto_continue: bool,
     /// home-glance-d060 (home.md §5.3): the Hub-stamped origin of the device
-    /// that created this row (`human` / `bot` / `agent` / `hub`), or the
-    /// upgrade backfill's `legacy` for a pre-column true root. `None` only on
-    /// rows written before the stamp that no backfill rule could classify.
+    /// that created the chain ROOT (`human` / `bot` / `agent` / `hub`), or the
+    /// upgrade backfill's `legacy` for a pre-column true root. A first launch
+    /// stamps its caller; every successor (D-026 resume, continuation, worker
+    /// respawn) and a worker relaunch copy the previous instance's stamp, so
+    /// `agent` means "dispatched by an Agent" whoever pressed resume. `None`
+    /// only on rows written before the stamp that no backfill rule could
+    /// classify.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

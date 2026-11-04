@@ -7,6 +7,13 @@
 //! short-lived child for it (`fresh`). `--notify` is required: the Hub never
 //! picks whether a run pushes to the owner. `add --name` is idempotent: the
 //! same add under the same name returns the stored wake-up.
+//!
+//! `add --check '<sh>' --check-timeout <secs> [--check-host <host>]` gives the
+//! wake-up a check a Node runs before each run (main-agent.md §11.2): exit 0
+//! runs it with the check's stdout as its summary, exit 2 skips it, anything
+//! else fails it. The timeout has no default. An agent's check on another
+//! host, or from a session that keeps its permission control on, waits for
+//! the owner's one-shot approval: retry the same add with `--approval-id`.
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
@@ -85,10 +92,23 @@ struct AddArgs {
     /// Which runs notify the owner: `never`, `failure` or `always`.
     #[arg(long)]
     notify: String,
-    /// A shell check deciding whether the run happens (not supported yet;
-    /// the Hub refuses it).
-    #[arg(long)]
+    /// A shell check (`sh -c`) a Node runs before each run: exit 0 runs it,
+    /// with the check's stdout as its summary; exit 2 skips it; anything
+    /// else, or the timeout, fails it.
+    #[arg(long, value_name = "SH")]
     check: Option<String>,
+    /// With --check: the Node it runs on (a host id). An agent's own host
+    /// when omitted; the owner must name one.
+    #[arg(long, requires = "check", value_name = "HOST")]
+    check_host: Option<String>,
+    /// With --check: its timeout (`30`, `30s`, `5m`; 1 s to 1 h). Required:
+    /// there is no default.
+    #[arg(long, requires = "check", value_name = "SECS")]
+    check_timeout: Option<String>,
+    /// Retry an add the owner approved: the `interactionId` the first attempt
+    /// returned (D-017). The add must be the same one.
+    #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+    approval_id: Option<String>,
     /// Print the Hub's JSON response instead of text.
     #[arg(long)]
     json: bool,
@@ -142,6 +162,7 @@ async fn run(args: WakeArgs) -> anyhow::Result<()> {
     match args.command {
         WakeCommand::Add(add) => {
             let body = add_body(&add)?;
+            let client = client.with_approval(add.approval_id.clone(), false);
             let lineage = lineage_of(&client, add.lineage.lineage.clone()).await?;
             let value = client
                 .post(&format!("/v1/lineages/{lineage}/wake-ups"), &body)
@@ -242,7 +263,16 @@ fn add_body(args: &AddArgs) -> anyhow::Result<Value> {
         body["name"] = json!(name);
     }
     if let Some(check) = &args.check {
-        body["check"] = json!({ "command": check });
+        let mut check = json!({ "command": check });
+        if let Some(host) = &args.check_host {
+            check["hostId"] = json!(host);
+        }
+        // No default: without --check-timeout the Hub refuses the add and
+        // says why.
+        if let Some(timeout) = &args.check_timeout {
+            check["timeoutSecs"] = json!(parse_duration(timeout)?);
+        }
+        body["check"] = check;
     }
     Ok(body)
 }
@@ -279,7 +309,7 @@ fn render_list(value: &Value) -> String {
         lines.push("no wake-ups".to_owned());
     }
     for wake in &items {
-        lines.push(format!(
+        let mut line = format!(
             "{} {} [{}] {} mode={} notify={} next={} missed={}",
             wake["wakeId"].as_str().unwrap_or("?"),
             wake["name"].as_str().unwrap_or("?"),
@@ -289,7 +319,17 @@ fn render_list(value: &Value) -> String {
             wake["notify"].as_str().unwrap_or("?"),
             wake["nextFireAt"].as_str().unwrap_or("-"),
             wake["missedCount"].as_i64().unwrap_or(0),
-        ));
+        );
+        if let Some(check) = wake.get("check").filter(|check| check.is_object()) {
+            line.push_str(&format!(
+                " check@{} timeout={}s admission={} last-run={}",
+                check["hostId"].as_str().unwrap_or("?"),
+                check["timeoutSecs"].as_i64().unwrap_or(0),
+                check["admission"].as_str().unwrap_or("?"),
+                wake["lastRunAt"].as_str().unwrap_or("-"),
+            ));
+        }
+        lines.push(line);
     }
     let runs = value["runs"].as_array().cloned().unwrap_or_default();
     if !runs.is_empty() {
@@ -304,6 +344,15 @@ fn render_list(value: &Value) -> String {
             run["firedAt"].as_str().unwrap_or("?"),
             run["missedBefore"].as_i64().unwrap_or(0),
         );
+        if let Some(check) = run.get("check").filter(|check| check.is_object()) {
+            line.push_str(&format!(
+                " check={}",
+                check["state"].as_str().unwrap_or("?")
+            ));
+            if let Some(code) = run["checkExit"].as_i64() {
+                line.push_str(&format!(" exit={code}"));
+            }
+        }
         if let Some(kind) = run["failureKind"].as_str() {
             line.push_str(&format!(" failure={kind}"));
         }
@@ -379,7 +428,42 @@ mod tests {
                 "true"
             ])
             .unwrap()["check"],
-            json!({"command": "true"})
+            json!({"command": "true"}),
+            "no timeout is sent unless given: the Hub refuses that add and says why"
+        );
+        assert_eq!(
+            add(&[
+                "--text",
+                "t",
+                "--every",
+                "3m",
+                "--notify",
+                "failure",
+                "--check",
+                "test -s queue || exit 2",
+                "--check-host",
+                "hst_1",
+                "--check-timeout",
+                "2m",
+                "--approval-id",
+                "int_1"
+            ])
+            .unwrap()["check"],
+            json!({"command": "test -s queue || exit 2", "hostId": "hst_1", "timeoutSecs": 120})
+        );
+        assert!(
+            add(&[
+                "--text",
+                "t",
+                "--in",
+                "1m",
+                "--notify",
+                "never",
+                "--check-timeout",
+                "5"
+            ])
+            .is_err(),
+            "--check-timeout needs --check"
         );
     }
 
@@ -431,5 +515,19 @@ mod tests {
         let rendered = render_list(&list);
         assert!(rendered.contains("wak_1 beat [active] every 180s mode=persistent notify=failure"));
         assert!(rendered.contains("wrn_1 beat failed") && rendered.contains("failure=turn-failed"));
+        let checked = json!({"items": [{"wakeId": "wak_2", "name": "q", "state": "active",
+            "trigger": {"kind": "every", "everySecs": 180}, "mode": "persistent",
+            "notify": "failure", "missedCount": 0, "lastRunAt": "2026-11-04T10:00:00.000Z",
+            "check": {"command": "exit 2", "hostId": "hst_1", "timeoutSecs": 30,
+                      "admission": "approved"}}],
+            "runs": [{"runId": "wrn_2", "name": "q", "state": "skipped", "checkExit": 2,
+                      "firedAt": "2026-11-04T10:03:00.000Z", "missedBefore": 0,
+                      "check": {"state": "skipped", "hostId": "hst_1"}}]});
+        let rendered = render_list(&checked);
+        assert!(
+            rendered.contains("check@hst_1 timeout=30s admission=approved"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("wrn_2 q skipped") && rendered.contains("check=skipped exit=2"));
     }
 }

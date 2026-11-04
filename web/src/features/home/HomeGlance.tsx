@@ -1,7 +1,9 @@
 import { Fragment, useMemo } from "react";
 import { useHub } from "../../lib/store";
+import { useNowTick } from "../../lib/useNowTick";
 import { hostIsOnline } from "../hosts/model";
-import { useHomeFreshness } from "./freshness";
+import { HOME_FRESHNESS, useHomeFreshness } from "./freshness";
+import { useOwnerGlancePoll } from "./useOwnerGlance";
 import {
   formatGlanceCount,
   formatUpdatedAt,
@@ -47,9 +49,18 @@ export function HomeGlance({
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
+  // A local clock for the glance-age check: the store emits on every poll, but
+  // a hung poll would otherwise never re-render this row.
+  const nowMs = useNowTick(5_000);
+  // §5.3: the glance is polled only while this home surface is mounted, and
+  // once per cycle; the mount read closes the cold-bootstrap 「–」 window.
+  useOwnerGlancePoll();
   const counts = useMemo<GlanceCounts | null>(() => {
     const glance = hub.glance;
-    if (!glance) return null;
+    // A store that somehow holds a partial projection paints 「–」 rather than
+    // crashing the home (refreshGlance rejects malformed bodies at the
+    // boundary; this is the belt and braces).
+    if (!glance || !glance.counts || typeof glance.counts.needYou !== "number") return null;
     return {
       needYou: glance.counts.needYou,
       doneUnseen: glance.counts.doneUnseen,
@@ -71,8 +82,14 @@ export function HomeGlance({
     showDoneToday: placement === "desktop",
   });
   // §8: stale greys the whole row and names the last successful update. A
-  // foreground grace is explicitly NOT stale.
-  const stale = freshness.state === "stale";
+  // foreground grace is explicitly NOT stale. A glance-only failure (the main
+  // refresh still healthy) freezes these numbers, so it greys the row and
+  // names the last GOOD glance — frozen numbers are never shown as fresh.
+  const glanceStale =
+    hub.glanceFailed ||
+    (hub.glanceAt !== null && nowMs - hub.glanceAt > HOME_FRESHNESS.staleAfterMs);
+  const stale = freshness.state === "stale" || (counts !== null && glanceStale);
+  const updatedAt = hub.glanceAt ?? freshness.lastOkAt;
 
   return (
     <div
@@ -144,9 +161,9 @@ export function HomeGlance({
           )}
         </Fragment>
       ))}
-      {stale && freshness.lastOkAt !== null ? (
+      {stale && updatedAt !== null ? (
         <span className={css.updated} data-testid="glance-updated">
-          更新于 {formatUpdatedAt(freshness.lastOkAt)}
+          更新于 {formatUpdatedAt(updatedAt)}
         </span>
       ) : null}
     </div>

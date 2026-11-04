@@ -5,7 +5,7 @@
  * fewer rows than the owner-scope ● count — the count is the owner's whole
  * world, which is what ⑥ renders.
  */
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
@@ -38,7 +38,7 @@ function glance(counts: Partial<OwnerGlance["counts"]> = {}): OwnerGlance {
   } as unknown as OwnerGlance;
 }
 
-it("paints the owner glance's 工作中 count, while the board lists top-level sessions only", async () => {
+it("paints the owner glance's 工作中 count, and the rank tap shows the same rows it counted", async () => {
   const host = {
     ...mockDb.hosts[0],
     id: "host-a",
@@ -89,10 +89,19 @@ it("paints the owner glance's 工作中 count, while the board lists top-level s
     </MemoryRouter>,
   );
   await screen.findByTestId("session-list");
-  // One card: the child session is not a desktop row.
+  // One card: the child session is not a plain desktop row.
   expect(screen.getAllByTestId("board-card")).toHaveLength(1);
   // ① is the glance's number, not a re-derivation from that board.
   expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
+  // The ● tap filters by the rank the COUNT used, which spans children too:
+  // the tapped board shows 2 rows, matching the number (item 7).
+  await userEvent.click(screen.getByTestId("glance-working"));
+  await waitFor(() => expect(screen.getAllByTestId("board-card")).toHaveLength(2));
+  expect(
+    screen
+      .getAllByTestId("board-card")
+      .map((card) => card.getAttribute("data-rank")),
+  ).toEqual(["working", "working"]);
 });
 
 it("filters the ledger to 完成未看 when ◉ is tapped, and clears it on the second tap", async () => {

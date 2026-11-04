@@ -86,6 +86,16 @@ describe("WorkingList (home.md ⑥)", () => {
     expect(screen.getByText("没有在跑的会话")).toBeTruthy();
   });
 
+  it("never says nothing runs under a non-zero count", () => {
+    hub.instances = [];
+    // The count says two sessions run, but their store rows have not arrived.
+    hub.glance = glanceOf(["ins_missing_a", "ins_missing_b"], 2);
+    renderList();
+    expect(screen.getByText("工作中 · 2")).toBeTruthy();
+    expect(screen.queryByText("没有在跑的会话")).toBeNull();
+    expect(screen.getByTestId("home-working-pending")).toBeTruthy();
+  });
+
   it("is a skeleton with 「工作中 · –」 before the first glance, never an empty state", () => {
     hub.instances = [row("ins_a", 1)];
     hub.glance = null;

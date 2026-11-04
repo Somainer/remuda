@@ -96,12 +96,16 @@ export function SessionList({
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
   const allowed = availableConditions(scope);
 
-  // home.md §5.2 / the 最近 caption: child sessions are never desktop rows.
-  // Global scope searches every top-level instance the hub knows about; a
-  // Space-pinned list renders the caller's instances minus children, so the ①
-  // 工作中 count (TOP_LEVEL_WORKING) always equals the rows a tap can show.
-  const source = (global ? hub.instances : (instances ?? hub.instances))
-    .filter((instance) => instance.parent == null);
+  // home.md §5.2/§5.3: the unfiltered board lists top-level sessions only
+  // (children are never plain desktop rows). The ① rank tap, however, filters
+  // by the SAME rank the owner glance counted, and that count spans the
+  // owner's whole world — children included (⑥ lists them too) — so a
+  // rank-filtered board INCLUDES child sessions. The count and the tapped rows
+  // therefore always agree.
+  const rankFiltered = conditions.rank.length > 0;
+  const source = (global ? hub.instances : (instances ?? hub.instances)).filter(
+    (instance) => rankFiltered || instance.parent == null,
+  );
 
   // Children that are still running lift their idle parent into awaiting-wake.
   // The child's own rank decides (blocked/working/starting), not connectivity.

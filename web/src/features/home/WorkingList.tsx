@@ -47,8 +47,13 @@ export function WorkingList() {
       <header className={css.head}>工作中 · {total ?? "–"}</header>
       {total === null ? (
         <div className={css.skeleton} aria-hidden="true" />
-      ) : rows.length === 0 ? (
+      ) : total === 0 ? (
         <p className={css.empty}>没有在跑的会话</p>
+      ) : rows.length === 0 ? (
+        // A non-zero count with no paintable row (the session row has not
+        // arrived yet): never claim nothing is running under a number that
+        // says otherwise.
+        <div className={css.skeleton} aria-hidden="true" data-testid="home-working-pending" />
       ) : (
         <ul className={css.list}>
           {rows.slice(0, WORKING_ROWS).map((row) => (

@@ -97,8 +97,10 @@ vi.mock("../../lib/store", async (importOriginal) => {
       hostName: () => "alpha",
       usageRollupOf: () => null,
       summaryOf: () => undefined,
-      // home-glance-d060: the row body's phrase is the glance's headline.
+      // home-glance-d060: the row body's phrase is the glance's headline, and
+      // the ① row owns the shared glance poll (§5.3).
       glanceHeadlineOf: () => undefined,
+      refreshGlance: () => Promise.resolve(undefined),
       resume: (...args: unknown[]) => resumeMock(...args),
       refreshScreens: rowReads.refreshScreens,
       hydrateRowSummaries: rowReads.hydrateRowSummaries,

@@ -911,10 +911,15 @@ export type HubState = {
    * home-glance-d060: `GET /v1/owner/glance`, the one owner-scope projection
    * the home's ① counts, the desktop 今日完成 segment, ⑥ and the ledger row
    * headlines read. `null` until the first successful read (the row then
-   * paints 「–」, never a derived guess). A failed refresh keeps the last value:
-   * §8's stale path owns the freshness signal, not this slice.
+   * paints 「–」, never a derived guess). A failed refresh keeps the last value
+   * so the row can name when it was last true; `glanceFailed` is what greys
+   * it (§8), never a silent freeze.
    */
   glance: import("../types/generated").OwnerGlance | null;
+  /** Local ms of the last SUCCESSFUL glance read; null before the first. */
+  glanceAt: number | null;
+  /** The most recent glance read failed (its numbers are the last good ones). */
+  glanceFailed: boolean;
   /** Number of outbox rows pending/inflight (offline banner). */
   outboxPending: number;
   /**
@@ -965,6 +970,8 @@ const initial: HubState = {
   outboxPending: 0,
   summaries: {},
   glance: null,
+  glanceAt: null,
+  glanceFailed: false,
   lineages: {},
 };
 
@@ -1695,7 +1702,13 @@ class HubStore {
         authed: false,
         session: null,
         connection: "offline",
+        // home-glance-d060: the previous owner's projection dies with the
+        // identity; the next login must not paint it.
+        glance: null,
+        glanceAt: null,
+        glanceFailed: false,
       });
+      this.glanceIndex = null;
     }
     this.disposeOutboxForAuthChange();
   }
@@ -6116,8 +6129,14 @@ class HubStore {
     this.emit({
       session: readSession(),
       error: null,
-      ...(identityChanged ? { instances: [] } : {}),
+      // home-glance-d060: a different owner's device must not inherit the
+      // previous identity's glance (the single reason `instances` is cleared
+      // here applies to the projection too).
+      ...(identityChanged
+        ? { instances: [], glance: null, glanceAt: null, glanceFailed: false }
+        : {}),
     });
+    if (identityChanged) this.glanceIndex = null;
     // Gate 49 item 6 (low): recheck the issuing epoch AFTER every
     // publication-bearing helper too — a subscriber invoked synchronously by
     // the emit above (or the earlier applyAuthIdentityChange) may have logged
@@ -6212,9 +6231,9 @@ class HubStore {
       if (!this.state.authed) return;
       void this.refresh();
       void this.refreshHosts().catch(() => undefined);
-      // home-glance-d060 §5.3: the home reads ONE glance per poll instead of
-      // one journal per row. Coalesced, so every mounted reader shares it.
-      void this.refreshGlance();
+      // The glance is NOT polled here: it runs only while a home surface is
+      // mounted (useOwnerGlancePoll), so a session/terminal page pays for no
+      // owner-scope projection (home-glance-d060 §5.3).
     }, 2000);
   }
 
@@ -9013,7 +9032,7 @@ class HubStore {
     if (!glance) return undefined;
     if (this.glanceIndex?.glance !== glance) {
       const index = new Map<string, import("../types/generated").OwnerGlanceRow>();
-      for (const row of [...glance.waiting, ...glance.working]) {
+      for (const row of [...(glance.waiting ?? []), ...(glance.working ?? [])]) {
         if (!index.has(row.instanceId)) index.set(row.instanceId, row);
       }
       this.glanceIndex = { glance, index };
@@ -9034,10 +9053,12 @@ class HubStore {
   private glanceInFlight: Promise<void> | null = null;
 
   /**
-   * home-glance-d060: one `GET /v1/owner/glance` per poll. Coalesced — the
-   * home's several readers share the in-flight read — and epoch-guarded, so a
+   * home-glance-d060: one `GET /v1/owner/glance` per poll. Coalesced — every
+   * mounted home reader shares the in-flight read — and epoch-guarded, so a
    * response that lands after logout cannot repaint the next identity's row.
-   * A failure keeps the last glance; §8's stale path owns the signal.
+   * A failure keeps the last numbers but marks them `glanceFailed`, which is
+   * what greys ① and names the last good time (§8); it never silently ships
+   * frozen numbers as fresh.
    */
   refreshGlance(): Promise<void> {
     if (this.glanceInFlight) return this.glanceInFlight;
@@ -9047,9 +9068,21 @@ class HubStore {
         // The owner's local-day offset, east of UTC (the Hub clamps it).
         const glance = await api.ownerGlance(-new Date().getTimezoneOffset());
         if (epoch !== this.bootGen) return;
-        this.emit({ glance });
+        // A malformed body (an older/mock Hub, a proxy page) is a failed read,
+        // never a half-populated projection the home would crash on.
+        if (
+          !glance ||
+          typeof glance.counts?.needYou !== "number" ||
+          !Array.isArray(glance.waiting) ||
+          !Array.isArray(glance.working)
+        ) {
+          this.emit({ glanceFailed: true });
+          return;
+        }
+        this.emit({ glance, glanceAt: Date.now(), glanceFailed: false });
       } catch {
-        // Keep the previous numbers; the badge/row never flips to a guess.
+        if (epoch !== this.bootGen) return;
+        this.emit({ glanceFailed: true });
       }
     })().finally(() => {
       if (this.glanceInFlight === job) this.glanceInFlight = null;

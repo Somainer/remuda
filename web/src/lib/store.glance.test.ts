@@ -69,11 +69,62 @@ it("coalesces overlapping reads into one request", async () => {
   expect(hubStore.getSnapshot().glance).toEqual(GLANCE);
 });
 
-it("keeps the last glance when a refresh fails", async () => {
+it("keeps the last glance but marks it failed, and clears the mark on recovery", async () => {
   const { api, hubStore } = await fresh();
   vi.spyOn(api, "ownerGlance").mockResolvedValueOnce(GLANCE);
   await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glanceAt).toBeTypeOf("number");
+  expect(hubStore.getSnapshot().glanceFailed).toBe(false);
+
   vi.spyOn(api, "ownerGlance").mockRejectedValueOnce(new Error("offline"));
   await hubStore.refreshGlance();
+  const failed = hubStore.getSnapshot();
+  expect(failed.glance).toEqual(GLANCE);
+  // Frozen numbers are NOT fresh: the row greys and names the last good read.
+  expect(failed.glanceFailed).toBe(true);
+  expect(failed.glanceAt).toBeTypeOf("number");
+
+  vi.spyOn(api, "ownerGlance").mockResolvedValueOnce(GLANCE);
+  await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glanceFailed).toBe(false);
+});
+
+it("forgets the previous identity's glance when the identity changes", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(GLANCE);
+  await hubStore.refreshGlance();
   expect(hubStore.getSnapshot().glance).toEqual(GLANCE);
+
+  // The one retirement helper every external identity change passes through
+  // (logout, peer tab, 401) — and the re-login emit beside it in `login`.
+  hubStore.applyAuthIdentityChangeForTest();
+
+  const after = hubStore.getSnapshot();
+  expect(after.glance).toBeNull();
+  expect(after.glanceAt).toBeNull();
+  expect(after.glanceFailed).toBe(false);
+  expect(hubStore.glanceRowOf(id("ins_work"))).toBeUndefined();
+});
+
+it("a re-login under a different device clears the glance (the login path)", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as never);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(hubStore, "flushAllOutbox").mockImplementation(() => undefined as never);
+  vi.spyOn(api, "ownerGlance").mockResolvedValue(GLANCE);
+  vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_owner_a", token: "t", name: "a" } as never);
+  await hubStore.login("bootstrap", "code-a", "a");
+  await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glance).toEqual(GLANCE);
+
+  vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_owner_b", token: "t2", name: "b" } as never);
+  await hubStore.login("bootstrap", "code-b", "b");
+  expect(hubStore.getSnapshot().glance).toBeNull();
 });

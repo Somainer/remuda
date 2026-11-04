@@ -22,7 +22,14 @@ vi.mock("../../lib/store", async (importOriginal) => {
   return {
     ...actual,
     useHub: () => fake.state,
-    hubStore: { ...actual.hubStore, titleOf: (id: string) => id, getSnapshot: () => fake.state },
+    hubStore: {
+      ...actual.hubStore,
+      titleOf: (id: string) => id,
+      getSnapshot: () => fake.state,
+      // The ① row owns the home's glance poll (§5.3); the unit tests drive
+      // the store through the fake state instead of a network tick.
+      refreshGlance: vi.fn(() => Promise.resolve(undefined)),
+    },
   };
 });
 
@@ -52,6 +59,8 @@ function hub(overrides: Partial<HubState> = {}): HubState {
     workspaces: [],
     answering: {},
     glance: null,
+    glanceAt: null,
+    glanceFailed: false,
     ...overrides,
   } as unknown as HubState;
 }
@@ -109,6 +118,27 @@ describe("HomeGlance", () => {
     expect(screen.getByTestId("home-glance")).toHaveAttribute("data-stale", "1");
     expect(screen.getByTestId("glance-updated")).toHaveTextContent("更新于 09:05");
     expect(container.querySelector('[data-stale="1"]')).toBeTruthy();
+  });
+
+  it("greys the row and names the last good read when only the glance failed", () => {
+    const lastGood = new Date(2026, 9, 31, 9, 5).getTime();
+    fake.state = hub(
+      { glance: glance({ needYou: 2 }), glanceAt: lastGood, glanceFailed: true },
+    );
+    fake.freshness = { state: "fresh", lastOkAt: Date.now(), failingSince: null };
+    render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
+    // The main refresh is healthy, but these numbers are frozen: never fresh.
+    expect(screen.getByTestId("home-glance")).toHaveAttribute("data-stale", "1");
+    expect(screen.getByTestId("glance-updated")).toHaveTextContent("更新于 09:05");
+    expect(screen.getByTestId("glance-need-you")).toHaveTextContent("2 需要你");
+  });
+
+  it("greys the row when the last good read is past the §8 threshold", () => {
+    fake.state = hub({ glance: glance({ needYou: 1 }), glanceAt: Date.now() - 60_000 });
+    fake.freshness = { state: "fresh", lastOkAt: Date.now(), failingSince: null };
+    render(<HomeGlance placement="phone" onNeedYou={noop} onWorking={noop} />);
+    expect(screen.getByTestId("home-glance")).toHaveAttribute("data-stale", "1");
+    expect(screen.getByTestId("glance-updated")).toBeTruthy();
   });
 
   it("never shows the stamp for a foreground grace", () => {

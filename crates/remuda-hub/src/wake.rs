@@ -381,6 +381,10 @@ pub(crate) struct WakeState {
     /// Test seam: while set, the scheduler's ticks are skipped.
     #[cfg(any(test, feature = "test-faults"))]
     pub(crate) hold_tick: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: while set, a check's answer is dropped unwritten, as if
+    /// the Hub had stopped between the claim and the answer (a crash).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) drop_check_answers: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2910,6 +2914,14 @@ async fn run_check(state: &AppState, claim: CheckClaim) {
         Ok(None) => CheckReport::NotSent,
         Err(_) => CheckReport::Lost,
     };
+    #[cfg(any(test, feature = "test-faults"))]
+    if state
+        .wake
+        .drop_check_answers
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     let run_id = claim.run_id;
     let settled = state
         .store

@@ -2484,6 +2484,9 @@ async fn a_hub_restart_mid_check_interrupts_it_and_never_replays_it() -> Result<
     assert_eq!(runs[0]["state"], "running", "{runs:#?}");
     assert_eq!(runs[0]["check"]["state"], "running");
 
+    // A crash between the claim and the answer: whatever the old process
+    // hears from its Node is never written, so only the boot rule ends it.
+    ctx.hub.test_drop_wake_check_answers(true);
     let ctx = ctx.restart().await?;
     ctx.check_tick(&shift(&first, 2)).await?;
     let runs = ctx.runs(&seat).await?;

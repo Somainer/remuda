@@ -1550,6 +1550,19 @@ impl RunningHub {
         Ok(outcome.fired)
     }
 
+    /// Test-only (cb-wake-check): while set, every wake check's answer is
+    /// dropped unwritten, as if the Hub stopped between the claim and the
+    /// answer; the boot rule (interrupted, never replayed) is then the only
+    /// thing that ends the run.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_drop_wake_check_answers(&self, dropped: bool) {
+        self.state
+            .wake
+            .drop_check_answers
+            .store(dropped, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Test-only (cb-wake-check): wait until no wake check is waiting for
     /// its Node's answer, then for the writer to settle what they wrote.
     #[doc(hidden)]

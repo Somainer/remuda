@@ -58,7 +58,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (instance_id, scope)
         );",
     )?;
-    ensure_column(conn, "instances", "turn_end_seq", "INTEGER")
+    ensure_column(conn, "instances", "turn_end_seq", "INTEGER")?;
+    // home-glance-d060: the local-day 今日完成 count reads WHEN the latest
+    // settled turn ended, not only its seq. Written in the same transaction as
+    // `turn_end_seq`, so the two can never disagree.
+    ensure_column(conn, "instances", "turn_end_at", "TEXT")
 }
 
 /// Owner clients currently showing a session, keyed by instance then device.
@@ -236,8 +240,14 @@ pub(crate) fn fold_turn_end(
     now: &str,
 ) -> Result<Option<SeenView>, rusqlite::Error> {
     conn.execute(
-        "UPDATE instances SET turn_end_seq = MAX(COALESCE(turn_end_seq, ?1), ?1) WHERE id = ?2",
-        params![seq, instance_id],
+        "UPDATE instances
+            SET turn_end_seq = MAX(COALESCE(turn_end_seq, ?1), ?1),
+                turn_end_at = CASE
+                    WHEN turn_end_seq IS NULL OR ?1 >= turn_end_seq THEN ?3
+                    ELSE turn_end_at
+                END
+          WHERE id = ?2",
+        params![seq, instance_id, now],
     )?;
     if visible {
         advance_seen(conn, instance_id, seq, now)?;

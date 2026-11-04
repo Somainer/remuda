@@ -360,7 +360,23 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - 当日完成数；
 - 每个会话一句确定性的 headline，取自 D-060 的 worker digest 字段，不由 Hub 调模型生成。
 
-行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。
+**范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义，不新增来源：
+
+- **Main 子树**：`address-owner` 持有者血缘的当前章节（没有现行章节时取最近一版）所在的 `lineage_id` 及以此起点的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。
+- **owner 亲手开的会话（hand-opened）**：没有 Agent 创建者的会话。Hub 在创建时把创建者实例写进 `spec.parentInstanceId`，所以「没有 `parentInstanceId`」就是 Human/Bot/操作员直接开的根会话；D-026 恢复由操作员发起（`require_operator`），恢复出来的会话带 `spec.resumedFrom`，也算 hand-opened。
+- **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
+
+**各段计数。** 与首页推导同口径，由 Hub 在范围上算：
+- `needYou`（§5.1 N）= 范围内 `state=pending` 且截止时间未过的交互数 A，加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计）；
+- `doneUnseen`（§5.2 ◉）= 范围内按 §3.1 排在第 2 档（idle、owner 未看、最近回合未失败）的会话数；Main 血缘内只有 `resolveMain` 指向的现行章节计入（§7）；
+- `working`（§5.2 ●）= 范围内按 §3.1 排在第 3 档（live 且 activity 为 working/draining，或 activity 未分类）的会话数，子会话也计；
+- `doneToday`（§5.2 今日完成）= 范围内「最近一次结算的根回合结束时间」（`instances.turn_end_at`，与 ◉ 的 `turn_end_seq` 同一事务写入）落在 owner 本地日内的会话数。选根回合而不选任务，因为任务行没有完成时间戳。客户端用 `tzOffsetMinutes`（`-Date().getTimezoneOffset()`，UTC 以东分钟数，服务端夹到 ±14 h）告诉 Hub 本地日从哪开始。
+
+**行。** `waiting` 与 `working` 各按会话一行，各至多 50 行，溢出的数量在 `more.waiting` / `more.working`。每行一句 headline：等待行取待处理交互的 kind 加它的提问摘录，工作中行取最近一条助手文本的首行，没有文本时退回最近一次回合结果，再没有就是会话标题。headline 复用 digest 的脱敏与截断，Hub 不调模型。等待行按最近的交互从新到旧，工作中行按 `updatedAt` 从新到旧，id 作并列时的次序。客户端把 headline 用作台账行的正文；glance 里没有行的会话（idle/exited）不再逐行读 journal。
+
+**授权。** 只有 owner 自己的 Human 设备能读：Agent、Bot、以及带 `x-remuda-instance-id` 被降级成 Agent 的 Human 凭据都得到 403。
+
+行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。一次调用的开销是一组有界查询：范围递归一次、实例页一次、范围内的 pending 交互一次、阻塞任务一次，以及至多 50 条工作中会话各自一段有界 journal（与 digest 的 256 行上限相同）。
 
 ## 6 Main 卡与「问 Main」
 

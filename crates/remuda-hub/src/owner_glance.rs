@@ -1,0 +1,914 @@
+//! home-glance-d060 (H10): `GET /v1/owner/glance`, the owner's world as one
+//! read-only projection (home.md §5.3).
+//!
+//! D-060's `GET /v1/lineages/{id}/glance` covers one lineage. The home needs
+//! the owner's whole world instead: **Main's lineage subtree plus the sessions
+//! the owner opened by hand** (documented in home.md §5.3). This route is
+//! Human-only — an Agent, a Bot and a narrowed Human (a Human credential that
+//! names an instance and is re-stamped Agent by [`crate::agent_scope::caller`])
+//! all get 403.
+//!
+//! Everything here is derived from rows the Hub already stores: the instance
+//! index, its pending interactions, the task ledger, the owner's seen seq and a
+//! bounded journal tail per working row. The Hub never calls a model, and every
+//! string a session or a tool produced is untrusted data; the headline reuses
+//! the worker digest's redaction and clips.
+//!
+//! Cost is one bounded query set per call: one recursive scope query, one
+//! instance page, the pending interactions of that scope, the blocked tasks,
+//! and at most [`OWNER_GLANCE_ROW_CAP`] journal tails bounded exactly as the
+//! digest bounds them ([`crate::digest::JOURNAL_TAIL_EVENTS`]).
+
+use crate::AppState;
+use crate::agent_scope::{caller, origin};
+use crate::auth::require_origin;
+use crate::error::HubError;
+use crate::http::map_store;
+use crate::store::{InteractionRecord, Store};
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::routing::get;
+use axum::{Json, Router};
+use remuda_protocol::{
+    GlanceMore, InputOrigin, OWNER_GLANCE_ROW_CAP, OwnerGlance, OwnerGlanceCounts, OwnerGlanceRow,
+};
+use rusqlite::params;
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
+use time::{OffsetDateTime, UtcOffset};
+
+/// RFC3339 timestamps are fixed-width, so a text comparison is chronological.
+const OWNER_SCOPE: &str = "owner";
+/// A headline is one line; this bounds it.
+const HEADLINE_CHARS: usize = 120;
+/// The title a row carries; the digest clips a name to 64.
+const TITLE_CHARS: usize = 64;
+
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new().route("/v1/owner/glance", get(owner_glance))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlanceQuery {
+    /// The owner's local-day offset in minutes east of UTC. Absent reads as
+    /// UTC; the range is clamped to the real-world ±14 h.
+    #[serde(default)]
+    tz_offset_minutes: Option<i32>,
+}
+
+/// 403 for anything but the owner's own Human device (§5.3 authority).
+fn owner_only() -> HubError {
+    HubError::Forbidden.with_next(
+        "owner-only",
+        crate::error::NextStep::new(
+            crate::error::action::ASK_OWNER,
+            "the owner glance is read only from the owner's own device; do not retry with \
+             this credential",
+        ),
+    )
+}
+
+async fn owner_glance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GlanceQuery>,
+) -> Result<Json<OwnerGlance>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    if origin(&device) != InputOrigin::Human {
+        tracing::info!(category = "owner-glance", outcome = "refused-not-human");
+        return Err(owner_only());
+    }
+    let offset_minutes = query
+        .tz_offset_minutes
+        .unwrap_or(0)
+        .clamp(-14 * 60, 14 * 60);
+    Ok(Json(collect_owner_glance(&state, offset_minutes).await?))
+}
+
+/// The owner's local-day start (00:00 local), expressed in UTC so the
+/// UTC-written `turn_end_at` stamp compares textually.
+fn local_day_start(now: OffsetDateTime, offset_minutes: i32) -> OffsetDateTime {
+    // The route clamps to ±14 h, so this is always a real offset; a value that
+    // somehow is not falls back to UTC rather than failing the glance.
+    let offset =
+        UtcOffset::from_whole_seconds(offset_minutes.saturating_mul(60)).unwrap_or(UtcOffset::UTC);
+    now.to_offset(offset)
+        .replace_time(time::Time::MIDNIGHT)
+        .to_offset(UtcOffset::UTC)
+}
+
+/// Render the owner glance at `offset_minutes` east of UTC.
+pub(crate) async fn collect_owner_glance(
+    state: &AppState,
+    offset_minutes: i32,
+) -> Result<OwnerGlance, HubError> {
+    let now = OffsetDateTime::now_utc();
+    // The owner's local day start, expressed in UTC so the turn-end stamp
+    // (written in UTC) compares textually.
+    let day_start = local_day_start(now, offset_minutes);
+    let day_start = crate::config::rfc3339(day_start);
+    let now_str = crate::config::rfc3339(now);
+    let snapshot = state
+        .store
+        .owner_glance_snapshot(day_start, now_str, now.unix_timestamp())
+        .await
+        .map_err(map_store)?;
+    Ok(render_owner_glance(
+        snapshot,
+        now.unix_timestamp(),
+        offset_minutes,
+    ))
+}
+
+// ── the snapshot ────────────────────────────────────────────────────────────
+
+/// One instance of the owner scope, as the counts and rows read it.
+pub(crate) struct ScopeInstance {
+    pub instance_id: String,
+    pub title: Option<String>,
+    pub lifecycle: String,
+    pub activity: String,
+    pub updated_at: String,
+    pub task_id: Option<String>,
+    pub has_turn_error: bool,
+    pub in_main_lineage: bool,
+    pub unseen: bool,
+    pub done_today: bool,
+}
+
+/// One pending interaction of the owner scope.
+pub(crate) struct PendingInteraction {
+    pub record: InteractionRecord,
+    /// The deadline passed: the inbox projects it `expired`, so §5.1 does not
+    /// count it and neither does this projection.
+    pub expired: bool,
+}
+
+/// One owner-blocked task (unarchived, with a blocked reason).
+pub(crate) struct BlockedTask {
+    pub task_id: String,
+}
+
+/// Everything the route reads, in one consistent snapshot.
+pub(crate) struct OwnerGlanceSnapshot {
+    pub instances: Vec<ScopeInstance>,
+    pub pending: Vec<PendingInteraction>,
+    pub blocked_tasks: Vec<BlockedTask>,
+    /// Bounded journal tail per session that ranks working (id → events).
+    pub journals: HashMap<String, Vec<Value>>,
+    /// Session the resolved Main chapter is, when the Hub has a Main.
+    pub main_instance: Option<String>,
+}
+
+impl Store {
+    /// The owner-scope rows the glance needs, read in one transaction.
+    pub(crate) async fn owner_glance_snapshot(
+        &self,
+        day_start: String,
+        now: String,
+        now_unix: i64,
+    ) -> Result<OwnerGlanceSnapshot, crate::store::StoreError> {
+        self.read("owner_glance_snapshot", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            // The Main seat: one active address-owner holder (§2.5). The
+            // newest generation wins when a chapter races its successor.
+            let main: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT COALESCE(lineage_id, id), id FROM instances
+                      WHERE grants_json LIKE '%\"address-owner\"%'
+                        AND fenced_at IS NULL
+                      ORDER BY generation DESC, updated_at DESC, id ASC
+                      LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            let main_lineage = main.as_ref().map(|(lineage, _)| lineage.clone());
+            // §5.3 scope: Main's lineage subtree, plus the sessions the owner
+            // opened by hand. A hand-opened session is one with no Agent
+            // creator — the Hub stamps the creator instance as
+            // `spec.parentInstanceId`, so a root has none — or an
+            // operator-only resume (`spec.resumedFrom`; an Agent may never
+            // resume). The subtree is walked from Main's lineage chapters; a
+            // hand-opened session is in scope by itself, never through its own
+            // dispatched children (those are that session's private lineage).
+            let mut scope_stmt = tx.prepare(
+                "WITH RECURSIVE main_scope(id) AS (
+                     SELECT id FROM instances WHERE COALESCE(lineage_id, id) = ?1
+                     UNION
+                     SELECT i.id FROM instances i
+                       JOIN main_scope s
+                         ON json_extract(i.spec_json, '$.parentInstanceId') = s.id
+                 )
+                 SELECT id FROM main_scope
+                 UNION
+                 SELECT id FROM instances
+                  WHERE json_extract(spec_json, '$.parentInstanceId') IS NULL
+                     OR json_extract(spec_json, '$.resumedFrom') IS NOT NULL",
+            )?;
+            let scope: Vec<String> = scope_stmt
+                .query_map(params![main_lineage], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(scope_stmt);
+            let scope_json = serde_json::to_string(&scope)
+                .map_err(|err| crate::store::StoreError::Id(err.to_string()))?;
+            // Every scope instance the rank/count rules read. `turn_end_at` is
+            // the local-day "done today" stamp (see `seen::fold_turn_end`).
+            let mut rows_stmt = tx.prepare(
+                "SELECT i.id, i.title, i.lifecycle, i.activity, i.updated_at,
+                        i.task_id, i.turn_error_json, i.lineage_id, i.durable_seq,
+                        (SELECT v.seen_seq FROM instance_views v
+                          WHERE v.instance_id = i.id AND v.scope = ?2),
+                        i.turn_end_seq, i.turn_end_at
+                   FROM instances i
+                   JOIN json_each(?1) s ON s.value = i.id",
+            )?;
+            let instances = rows_stmt
+                .query_map(params![scope_json, OWNER_SCOPE], |row| {
+                    let id: String = row.get(0)?;
+                    let title: Option<String> = row.get(1)?;
+                    let lifecycle: String = row.get(2)?;
+                    let activity: String = row.get(3)?;
+                    let updated_at: String = row.get(4)?;
+                    let task_id: Option<String> = row.get(5)?;
+                    let turn_error: Option<String> = row.get(6)?;
+                    let lineage: Option<String> = row.get(7)?;
+                    let _durable: i64 = row.get(8)?;
+                    let seen_seq: Option<i64> = row.get(9)?;
+                    let turn_end_seq: Option<i64> = row.get(10)?;
+                    let turn_end_at: Option<String> = row.get(11)?;
+                    Ok(ScopeInstance {
+                        instance_id: id,
+                        title,
+                        lifecycle,
+                        activity,
+                        updated_at,
+                        task_id,
+                        has_turn_error: turn_error
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .and_then(|value| {
+                                value
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .map(|text| !text.is_empty())
+                            })
+                            .unwrap_or(false),
+                        in_main_lineage: lineage
+                            .as_deref()
+                            .is_some_and(|value| Some(value) == main_lineage.as_deref()),
+                        unseen: turn_end_seq.is_some_and(|end| end > seen_seq.unwrap_or(-1)),
+                        done_today: turn_end_seq.is_some()
+                            && turn_end_at.is_some_and(|at| at >= day_start && at <= now),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows_stmt.finalize().ok();
+            // Only the working page's journal tail is read (bounded exactly as
+            // the digest bounds it); the caps keep the cost to the page.
+            let mut working_ids: Vec<String> = instances
+                .iter()
+                .filter(|row| rank_working(&row.lifecycle, &row.activity))
+                .map(|row| row.instance_id.clone())
+                .collect();
+            working_ids.sort();
+            working_ids.truncate(OWNER_GLANCE_ROW_CAP);
+            let mut pending = Vec::new();
+            let mut pending_stmt = tx.prepare(
+                "SELECT i.id, i.instance_id, i.host_id, i.kind, i.state, i.blocking,
+                        i.payload_json, i.created_at, i.updated_at
+                   FROM interactions i
+                   JOIN json_each(?1) s ON s.value = i.instance_id
+                  WHERE i.state = 'pending'",
+            )?;
+            let pending_rows = pending_stmt
+                .query_map(params![scope_json], |row| {
+                    let payload: String = row.get(6)?;
+                    let blocking: i64 = row.get(5)?;
+                    Ok(InteractionRecord {
+                        interaction_id: row.get(0)?,
+                        instance_id: row.get(1)?,
+                        host_id: row.get(2)?,
+                        kind: row.get(3)?,
+                        state: row.get(4)?,
+                        blocking: blocking != 0,
+                        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            pending_stmt.finalize().ok();
+            for record in pending_rows {
+                let expired = interaction_deadline_passed(&record, now_unix);
+                pending.push(PendingInteraction { record, expired });
+            }
+            let mut blocked_tasks = Vec::new();
+            let mut task_stmt = tx.prepare(
+                "SELECT id FROM tasks
+                  WHERE json_extract(doc_json, '$.archivedAt') IS NULL
+                    AND COALESCE(json_extract(doc_json, '$.blockedReason'), '') <> ''",
+            )?;
+            blocked_tasks.extend(
+                task_stmt
+                    .query_map([], |row| {
+                        Ok(BlockedTask {
+                            task_id: row.get(0)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            task_stmt.finalize().ok();
+            // The working rows' headlines: one bounded journal tail each, the
+            // same 256-event window the worker digest reads.
+            let mut journals = HashMap::new();
+            for id in &working_ids {
+                journals.insert(
+                    id.clone(),
+                    journal_tail(&tx, id, crate::digest::JOURNAL_TAIL_EVENTS)?,
+                );
+            }
+            tx.commit()?;
+            Ok(OwnerGlanceSnapshot {
+                instances,
+                pending,
+                blocked_tasks,
+                journals,
+                main_instance: main.map(|(_, instance)| instance),
+            })
+        })
+        .await
+    }
+}
+
+fn interaction_deadline_passed(record: &InteractionRecord, now: i64) -> bool {
+    let deadline = record
+        .payload
+        .pointer("/payload/interaction/deadline")
+        .or_else(|| record.payload.pointer("/interaction/deadline"));
+    let Some(deadline) = deadline else {
+        return false;
+    };
+    if deadline.get("state").and_then(Value::as_str) != Some("known") {
+        return false;
+    }
+    deadline
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(|value| {
+            OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .is_some_and(|value| value.unix_timestamp() < now)
+}
+
+fn journal_tail(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    cap: i64,
+) -> Result<Vec<Value>, crate::store::StoreError> {
+    // The newest `cap` rows, returned ascending so `scan_tail` sees them in
+    // journal order.
+    let mut stmt = conn.prepare_cached(
+        "SELECT payload_json FROM (
+             SELECT payload_json, seq FROM journal
+              WHERE instance_id = ?1
+              ORDER BY seq DESC LIMIT ?2
+         ) ORDER BY seq",
+    )?;
+    let rows = stmt
+        .query_map(params![instance_id, cap], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|raw| serde_json::from_str(&raw).ok())
+        .collect())
+}
+
+// ── rank (home.md §3.1) ─────────────────────────────────────────────────────
+
+fn rank_is_live(lifecycle: &str) -> bool {
+    !matches!(
+        lifecycle,
+        "requested"
+            | "preparing"
+            | "starting"
+            | "unknown"
+            | "reconciling"
+            | "exited"
+            | "failed"
+            | "closing"
+    )
+}
+
+fn activity_is_waiting(activity: &str) -> bool {
+    // The store writes `blocked`; the wire projection calls it
+    // waiting-interaction. Both are rank 1.
+    matches!(activity, "blocked" | "waiting-interaction")
+}
+
+/// §3.1 rank 3: a live turn, or a live session whose activity the Hub has not
+/// classified (that row is treated as working, never idle).
+fn rank_working(lifecycle: &str, activity: &str) -> bool {
+    if !rank_is_live(lifecycle) || activity_is_waiting(activity) {
+        return false;
+    }
+    matches!(activity, "working" | "draining")
+        || !matches!(activity, "idle" | "working" | "draining")
+}
+
+/// §3.1 rank 2: idle, the owner has not opened the last settled turn, and the
+/// turn did not fail.
+fn rank_done_unseen(instance: &ScopeInstance) -> bool {
+    rank_is_live(&instance.lifecycle)
+        && instance.activity == "idle"
+        && instance.unseen
+        && !instance.has_turn_error
+}
+
+// ── rendering ───────────────────────────────────────────────────────────────
+
+fn clip(text: &str, cap: usize) -> String {
+    let text: String = text.chars().take(cap).collect();
+    text
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A redacted, single-line, clipped sentence.
+fn headline_text(text: &str) -> String {
+    clip(
+        &one_line(&crate::digest::redact_secrets(text)),
+        HEADLINE_CHARS,
+    )
+}
+
+fn render_owner_glance(
+    snapshot: OwnerGlanceSnapshot,
+    now: i64,
+    offset_minutes: i32,
+) -> OwnerGlance {
+    let queued: std::collections::HashSet<&str> = snapshot
+        .pending
+        .iter()
+        .filter(|pending| !pending.expired)
+        .map(|pending| pending.record.instance_id.as_str())
+        .collect();
+    let mut sessions_by_task: HashMap<&str, Vec<&str>> = HashMap::new();
+    for instance in &snapshot.instances {
+        if let Some(task) = instance.task_id.as_deref() {
+            sessions_by_task
+                .entry(task)
+                .or_default()
+                .push(instance.instance_id.as_str());
+        }
+    }
+    let blocked_without_interaction = snapshot
+        .blocked_tasks
+        .iter()
+        .filter(|task| {
+            !sessions_by_task
+                .get(task.task_id.as_str())
+                .is_some_and(|sessions| sessions.iter().any(|id| queued.contains(id)))
+        })
+        .count();
+    let need_you = queued.len() + blocked_without_interaction;
+
+    let mut done_unseen = 0;
+    let mut working = 0;
+    let mut done_today = 0;
+    let mut working_rows: Vec<&ScopeInstance> = Vec::new();
+    for instance in &snapshot.instances {
+        if instance.done_today {
+            done_today += 1;
+        }
+        if rank_working(&instance.lifecycle, &instance.activity) {
+            working += 1;
+            working_rows.push(instance);
+        } else if rank_done_unseen(instance) && shows_done_unseen(instance, &snapshot) {
+            done_unseen += 1;
+        }
+    }
+
+    // Waiting rows: one per session with a live pending interaction, newest
+    // interaction first (the inbox queue's order).
+    let mut by_instance: HashMap<&str, Vec<&PendingInteraction>> = HashMap::new();
+    for pending in &snapshot.pending {
+        if pending.expired {
+            continue;
+        }
+        by_instance
+            .entry(pending.record.instance_id.as_str())
+            .or_default()
+            .push(pending);
+    }
+    let mut waiting_pairs: Vec<(&str, &&PendingInteraction)> = by_instance
+        .iter()
+        .filter_map(|(instance, rows)| {
+            let newest = rows.iter().max_by(|a, b| {
+                (
+                    a.record.created_at.as_str(),
+                    a.record.interaction_id.as_str(),
+                )
+                    .cmp(&(
+                        b.record.created_at.as_str(),
+                        b.record.interaction_id.as_str(),
+                    ))
+            })?;
+            Some((*instance, newest))
+        })
+        .collect();
+    waiting_pairs.sort_by(|(a_id, a), (b_id, b)| {
+        (b.record.created_at.as_str(), *a_id).cmp(&(a.record.created_at.as_str(), *b_id))
+    });
+    let waiting_total = waiting_pairs.len();
+    let waiting: Vec<OwnerGlanceRow> = waiting_pairs
+        .into_iter()
+        .take(OWNER_GLANCE_ROW_CAP)
+        .map(|(instance_id, pending)| {
+            let (kind, question) = crate::digest::interaction_question(&pending.record);
+            let title = snapshot
+                .instances
+                .iter()
+                .find(|row| row.instance_id == instance_id)
+                .and_then(|row| row.title.as_deref())
+                .map(|title| {
+                    clip(
+                        &one_line(&crate::digest::redact_secrets(title)),
+                        TITLE_CHARS,
+                    )
+                });
+            let headline = if question.trim().is_empty() {
+                headline_text(&kind)
+            } else {
+                headline_text(&format!("{kind}: {question}"))
+            };
+            OwnerGlanceRow {
+                instance_id: instance_id.to_string(),
+                title,
+                since: since_secs(&pending.record.created_at, now),
+                kind,
+                headline,
+                task_id: snapshot
+                    .instances
+                    .iter()
+                    .find(|row| row.instance_id == instance_id)
+                    .and_then(|row| row.task_id.clone()),
+            }
+        })
+        .collect();
+
+    // Working rows: newest activity first, deterministic id tiebreak.
+    working_rows.sort_by(|a, b| {
+        (b.updated_at.as_str(), a.instance_id.as_str())
+            .cmp(&(a.updated_at.as_str(), b.instance_id.as_str()))
+    });
+    let working_total = working_rows.len();
+    let working_out: Vec<OwnerGlanceRow> = working_rows
+        .iter()
+        .take(OWNER_GLANCE_ROW_CAP)
+        .map(|row| {
+            let tail = snapshot.journals.get(&row.instance_id);
+            let last_text = tail
+                .and_then(|events| crate::digest::last_assistant_text(events))
+                .filter(|text| !text.trim().is_empty());
+            let turn = tail.and_then(|events| crate::digest::last_turn_result(events));
+            let title = row.title.as_deref().map(|title| {
+                clip(
+                    &one_line(&crate::digest::redact_secrets(title)),
+                    TITLE_CHARS,
+                )
+            });
+            let headline = match (last_text, turn) {
+                (Some(text), _) => headline_text(&text),
+                (None, Some(result)) => headline_text(&format!("turn: {result}")),
+                (None, None) => title.clone().unwrap_or_else(|| "运行中".to_string()),
+            };
+            OwnerGlanceRow {
+                instance_id: row.instance_id.clone(),
+                title,
+                since: since_secs(&row.updated_at, now),
+                kind: "working".to_string(),
+                headline,
+                task_id: row.task_id.clone(),
+            }
+        })
+        .collect();
+
+    OwnerGlance {
+        generated_at: crate::config::rfc3339(OffsetDateTime::now_utc()),
+        timezone_offset_minutes: offset_minutes,
+        counts: OwnerGlanceCounts {
+            need_you: u32::try_from(need_you).unwrap_or(u32::MAX),
+            done_unseen,
+            working: u32::try_from(working).unwrap_or(u32::MAX),
+            done_today: u32::try_from(done_today).unwrap_or(u32::MAX),
+        },
+        more: GlanceMore {
+            waiting: u32::try_from(waiting_total.saturating_sub(waiting.len())).unwrap_or(u32::MAX),
+            working: u32::try_from(working_total.saturating_sub(working_out.len()))
+                .unwrap_or(u32::MAX),
+        },
+        waiting,
+        working: working_out,
+    }
+}
+
+/// §7: only Main's current chapter shows ◉ among the Main lineage; a session
+/// outside that lineage counts whenever it ranks done-unseen.
+fn shows_done_unseen(instance: &ScopeInstance, snapshot: &OwnerGlanceSnapshot) -> bool {
+    if !instance.in_main_lineage {
+        return true;
+    }
+    snapshot.main_instance.as_deref() == Some(instance.instance_id.as_str())
+}
+
+fn since_secs(stamp: &str, now: i64) -> Option<i64> {
+    OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+        .map(|at| (now - at.unix_timestamp()).max(0))
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: i64 = 1_793_236_200; // 2026-10-29T01:10:00Z
+
+    fn instance(id: &str, lifecycle: &str, activity: &str) -> ScopeInstance {
+        ScopeInstance {
+            instance_id: id.to_string(),
+            title: Some(format!("session {id}")),
+            lifecycle: lifecycle.to_string(),
+            activity: activity.to_string(),
+            updated_at: "2026-10-29T01:00:00.000Z".to_string(),
+            task_id: None,
+            has_turn_error: false,
+            in_main_lineage: false,
+            unseen: false,
+            done_today: false,
+        }
+    }
+
+    fn pending(id: &str, instance_id: &str, request: Value) -> PendingInteraction {
+        PendingInteraction {
+            record: InteractionRecord {
+                interaction_id: id.to_string(),
+                instance_id: instance_id.to_string(),
+                host_id: "hst_fixture".to_string(),
+                kind: "permission".to_string(),
+                state: "pending".to_string(),
+                blocking: true,
+                payload: json!({ "payload": { "interaction": {
+                    "id": id, "state": "pending", "request": request,
+                    "deadline": { "state": "unknown" }
+                }}}),
+                created_at: "2026-10-29T01:00:00.000Z".to_string(),
+                updated_at: "2026-10-29T01:00:00.000Z".to_string(),
+            },
+            expired: false,
+        }
+    }
+
+    fn snapshot(instances: Vec<ScopeInstance>) -> OwnerGlanceSnapshot {
+        OwnerGlanceSnapshot {
+            instances,
+            pending: Vec::new(),
+            blocked_tasks: Vec::new(),
+            journals: HashMap::new(),
+            main_instance: None,
+        }
+    }
+
+    fn render(snapshot: OwnerGlanceSnapshot) -> OwnerGlance {
+        render_owner_glance(snapshot, NOW, 0)
+    }
+
+    #[test]
+    fn the_scope_count_rules_read_one_rank_table() {
+        assert!(rank_working("running", "working"));
+        assert!(rank_working("running", "draining"));
+        // A live row whose activity the Hub has not classified is working.
+        assert!(rank_working("ready", "unknown"));
+        // Starting and ended ranks are neither working nor done-unseen.
+        assert!(!rank_working("starting", "working"));
+        assert!(!rank_working("requested", "idle"));
+        assert!(!rank_working("exited", "idle"));
+        // A pending interaction is rank 1, never rank 3.
+        assert!(!rank_working("running", "blocked"));
+        assert!(!rank_working("running", "waiting-interaction"));
+    }
+
+    #[test]
+    fn a_failed_turn_is_a_queue_card_not_done_unseen() {
+        let mut failed = instance("ins_failed", "running", "idle");
+        failed.unseen = true;
+        failed.has_turn_error = true;
+        let mut unseen = instance("ins_unseen", "running", "idle");
+        unseen.unseen = true;
+        let mut opened = instance("ins_opened", "running", "idle");
+        opened.unseen = true;
+        opened.in_main_lineage = true;
+        let mut older_chapter = instance("ins_older", "running", "idle");
+        older_chapter.unseen = true;
+        older_chapter.in_main_lineage = true;
+        let mut snap = snapshot(vec![failed, unseen, opened, older_chapter]);
+        snap.main_instance = Some("ins_opened".to_string());
+        let glance = render(snap);
+        // ◉ counts the Main chapter and the ordinary session, never the failed
+        // turn nor Main's fenced predecessor (§7).
+        assert_eq!(glance.counts.done_unseen, 2);
+    }
+
+    #[test]
+    fn need_you_is_the_queue_plus_tasks_without_an_interaction() {
+        let mut a = instance("ins_a", "running", "blocked");
+        a.task_id = Some("tsk_a".to_string());
+        let mut b = instance("ins_b", "running", "blocked");
+        b.task_id = Some("tsk_b".to_string());
+        let mut snap = snapshot(vec![a, b]);
+        snap.pending = vec![pending(
+            "int_a",
+            "ins_a",
+            json!({ "kind": "approval", "title": "Bash", "description": "run it?" }),
+        )];
+        // Two blocked tasks; the one whose session is already queued is not
+        // counted twice (§5.1 B).
+        snap.blocked_tasks = vec![
+            BlockedTask {
+                task_id: "tsk_a".to_string(),
+            },
+            BlockedTask {
+                task_id: "tsk_b".to_string(),
+            },
+        ];
+        let glance = render(snap);
+        assert_eq!(glance.counts.need_you, 2);
+        assert_eq!(glance.counts.working, 0);
+    }
+
+    #[test]
+    fn an_expired_interaction_is_not_queued_and_not_counted() {
+        let snap = OwnerGlanceSnapshot {
+            instances: vec![instance("ins_a", "running", "blocked")],
+            pending: vec![PendingInteraction {
+                record: pending(
+                    "int_a",
+                    "ins_a",
+                    json!({ "kind": "approval", "title": "Bash" }),
+                )
+                .record,
+                expired: true,
+            }],
+            blocked_tasks: Vec::new(),
+            journals: HashMap::new(),
+            main_instance: None,
+        };
+        let glance = render(snap);
+        assert_eq!(glance.counts.need_you, 0);
+        assert!(glance.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_deadline_in_the_past_marks_the_interaction_expired() {
+        let mut row = pending(
+            "int_a",
+            "ins_a",
+            json!({ "kind": "approval", "title": "Bash" }),
+        );
+        row.record.payload = json!({ "payload": { "interaction": {
+            "id": "int_a", "state": "pending",
+            "request": { "kind": "approval", "title": "Bash" },
+            "deadline": { "state": "known", "value": "2026-10-29T00:00:00.000Z" }
+        }}});
+        assert!(interaction_deadline_passed(&row.record, NOW));
+        row.record.payload = json!({ "payload": { "interaction": {
+            "id": "int_a", "state": "pending",
+            "request": { "kind": "approval", "title": "Bash" },
+            "deadline": { "state": "known", "value": "2026-10-29T02:00:00.000Z" }
+        }}});
+        assert!(!interaction_deadline_passed(&row.record, NOW));
+    }
+
+    #[test]
+    fn the_rows_are_capped_at_fifty_with_the_overflow_counted() {
+        let mut instances = Vec::new();
+        let mut pending_rows = Vec::new();
+        for index in 0..55 {
+            let id = format!("ins_{index:02}");
+            instances.push(instance(&id, "running", "working"));
+            pending_rows.push(pending(
+                &format!("int_{index:02}"),
+                &id,
+                json!({ "kind": "approval", "title": "Bash", "description": "go?" }),
+            ));
+        }
+        let mut snap = snapshot(instances);
+        snap.pending = pending_rows;
+        let glance = render(snap);
+        assert_eq!(glance.waiting.len(), OWNER_GLANCE_ROW_CAP);
+        assert_eq!(glance.working.len(), OWNER_GLANCE_ROW_CAP);
+        assert_eq!(glance.more.waiting, 5);
+        assert_eq!(glance.more.working, 5);
+        // The count is the whole set, not the page.
+        assert_eq!(glance.counts.need_you, 55);
+        assert_eq!(glance.counts.working, 55);
+    }
+
+    #[test]
+    fn headlines_are_deterministic_and_redacted() {
+        // Assembled at run time: no line of this source may read as a token.
+        let token = format!("{}{}", "sk-", "ant-api03-QWERTYuiop1234567890");
+        let mut row = instance("ins_a", "running", "blocked");
+        row.title = Some(format!("lease {token} session"));
+        let mut snap = snapshot(vec![row]);
+        snap.pending = vec![pending(
+            "int_a",
+            "ins_a",
+            json!({ "kind": "approval", "title": "Bash",
+                     "description": format!("run with {token} now") }),
+        )];
+        let first = render(snap);
+        let again = render(OwnerGlanceSnapshot {
+            instances: vec![instance("ins_a", "running", "blocked")],
+            pending: vec![pending(
+                "int_a",
+                "ins_a",
+                json!({ "kind": "approval", "title": "Bash",
+                         "description": format!("run with {token} now") }),
+            )],
+            blocked_tasks: Vec::new(),
+            journals: HashMap::new(),
+            main_instance: None,
+        });
+        let headline = &first.waiting[0].headline;
+        assert!(headline.starts_with("approval: "), "{headline}");
+        assert!(!headline.contains(&token), "{headline}");
+        assert_eq!(headline, &again.waiting[0].headline);
+        assert!(
+            first.waiting[0]
+                .title
+                .as_deref()
+                .is_some_and(|t| !t.contains(&token))
+        );
+    }
+
+    #[test]
+    fn a_working_headline_prefers_the_assistant_tail_and_never_a_secret() {
+        let token = format!("{}{}", "ghp_", "TESTaaaa1111bbbb2222cccc3333");
+        let mut snap = snapshot(vec![instance("ins_a", "running", "working")]);
+        snap.journals.insert(
+            "ins_a".to_string(),
+            vec![
+                json!({ "kind": "message", "observedAt": "2026-10-29T01:05:00.000Z",
+                "payload": { "operation": "open", "messageId": "m1", "role": "assistant",
+                             "parentToolCallId": null,
+                             "blocks": [{ "type": "text",
+                                          "text": format!("pushing the fix with {token}") }] } }),
+            ],
+        );
+        let glance = render(snap);
+        let headline = &glance.working[0].headline;
+        assert_eq!(headline, "pushing the fix with [redacted]");
+    }
+
+    #[test]
+    fn a_working_row_without_text_falls_back_to_the_turn_result() {
+        let mut snap = snapshot(vec![instance("ins_a", "running", "working")]);
+        snap.journals.insert(
+            "ins_a".to_string(),
+            vec![json!({ "kind": "lifecycle", "payload": { "type": "native",
+                "topic": "turn", "nativeName": "result",
+                "status": { "state": "known", "value": "turn_done" } } })],
+        );
+        let glance = render(snap);
+        assert_eq!(glance.working[0].headline, "turn: turn_done");
+    }
+
+    /// §5.3 今日完成: the same instant is yesterday for one offset and today
+    /// for another at a local midnight boundary.
+    #[test]
+    fn done_today_follows_the_callers_local_day() {
+        let now = OffsetDateTime::parse(
+            "2026-11-04T00:30:00.000Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("now");
+        let stamp = "2026-11-03T22:00:00.000Z";
+        let utc_start = crate::config::rfc3339(local_day_start(now, 0));
+        let plus_two = crate::config::rfc3339(local_day_start(now, 120));
+        let now_str = crate::config::rfc3339(now);
+        assert_eq!(utc_start, "2026-11-04T00:00:00.000Z");
+        assert_eq!(plus_two, "2026-11-03T22:00:00.000Z");
+        // Not today in UTC, today at UTC+2 — the boundary the client's
+        // tzOffsetMinutes moves.
+        assert!(!(stamp >= utc_start.as_str() && stamp <= now_str.as_str()));
+        assert!(stamp >= plus_two.as_str() && stamp <= now_str.as_str());
+    }
+}

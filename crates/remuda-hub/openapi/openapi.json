@@ -7074,6 +7074,19 @@
           "name"
         ],
         "type": "object"
+      },
+      "OwnerGlance": {
+        "type": "object",
+        "description": "Generated shape: OwnerGlance in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "generatedAt",
+          "timezoneOffsetMinutes",
+          "counts",
+          "waiting",
+          "working",
+          "more"
+        ],
+        "additionalProperties": true
       }
     }
   },
@@ -14639,6 +14652,47 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/owner/glance": {
+      "get": {
+        "operationId": "ownerGlance",
+        "summary": "The owner's world: count segments, today's completions and one headline per waiting/working session",
+        "tags": [
+          "owner"
+        ],
+        "description": "Human only: an Agent (a seat, or a Human token narrowed to one) is stopped by the route middleware with `agent-route`, and a Bot credential is refused with 403 `owner-only`. The scope is Main's lineage subtree plus the sessions the owner opened by hand (home.md §5.3). At most 50 rows in each of `waiting` and `working`; the `more` counters carry the overflow. `tzOffsetMinutes` is the owner's local offset east of UTC (`-Date().getTimezoneOffset()`), used only for `counts.doneToday`. Headline text is redacted untrusted data.",
+        "parameters": [
+          {
+            "name": "tzOffsetMinutes",
+            "in": "query",
+            "required": false,
+            "description": "Minutes east of UTC for the local-day 今日完成 count (default 0, clamped to ±14 h).",
+            "schema": {
+              "type": "integer",
+              "minimum": -840,
+              "maximum": 840
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owner glance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerGlance"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
             "$ref": "#/components/responses/Error"
           }
         }

@@ -44,7 +44,7 @@ use time::OffsetDateTime;
 
 /// Journal events scanned for the digest. One turn's tail is far smaller; the
 /// cap bounds work on long-lived instances.
-const JOURNAL_TAIL_EVENTS: i64 = 256;
+pub(crate) const JOURNAL_TAIL_EVENTS: i64 = 256;
 /// Recent commands scanned for the queued count and a pending configure.
 const COMMAND_WINDOW: usize = 200;
 /// Per-value cap inside the pending-tool argument summary.
@@ -674,6 +674,12 @@ fn scan_tail(events: &[Value]) -> Tail {
 /// a delivered fact batch's quoted tail (cb-inbox-deliver).
 pub(crate) fn last_assistant_text(events: &[Value]) -> Option<String> {
     scan_tail(events).last_text
+}
+
+/// The status of the last root turn result in `events` (ascending seq), for
+/// the owner glance's deterministic headline fallback (home.md §5.3).
+pub(crate) fn last_turn_result(events: &[Value]) -> Option<String> {
+    scan_tail(events).turn.map(|(status, _)| status)
 }
 
 // ── pending interaction ────────────────────────────────────────────────────

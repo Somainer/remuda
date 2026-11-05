@@ -58,7 +58,7 @@ Design references: [hub-topology.md](../hub-topology.md)（本批权威节点）
 | bootstrap 落盘/轮转 | `crates/remuda-hub/src/auth.rs:62-68`、`auth.rs:117-121` | `0600` + sync；`rotate_bootstrap` 已存在 |
 | 轮转 CLI | `crates/remuda/src/cmd/hub.rs:52-59` | `remuda hub rotate-bootstrap` |
 | passkey RP ID 派生 | `crates/remuda-hub/src/passkeys.rs:152-156`、`passkeys.rs:170-184` | origin 完整 host 即 RP ID |
-| SIGTERM/SIGINT 处理 | `crates/remuda/src/main.rs:56-83`；`crates/remuda/src/cmd/hub.rs:117-127` | 两信号都装；退出触发优雅关闭 |
+| SIGTERM/SIGINT 处理 | `crates/remuda/src/lib.rs:65-100`；`crates/remuda/src/cmd/hub.rs:117-127` | 两信号都装；退出触发优雅关闭 |
 | Node 持久 host token 回写 | `crates/remuda-node/src/daemon.rs:688-690` | hello result `nodeToken` 落 enrollment |
 | Node 重连退避 | `crates/remuda-node/src/transport/mod.rs:36-52` | 1s→30s、±25% |
 | Node 只回 Ping 不主动发 | `crates/remuda-node/src/transport/wss.rs:529-532` | 休眠半开判定依据 |

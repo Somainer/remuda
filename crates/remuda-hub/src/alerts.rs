@@ -845,7 +845,7 @@ mod tests {
             owner_queue_count(
                 &rows,
                 &routed,
-                &[routed_task.clone()],
+                std::slice::from_ref(&routed_task),
                 &task_of_instance,
                 now()
             ),

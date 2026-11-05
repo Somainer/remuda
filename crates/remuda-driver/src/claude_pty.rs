@@ -137,6 +137,9 @@ pub struct ClaudePtyOptions {
     /// ma-skill: the Hub-stamped launch facts; the materializer installs the
     /// `remuda` skill and carries the seat's capability section from them.
     pub skill_context: Option<crate::launch::remuda_skill::SkillContext>,
+    /// cb-seat-profile: the configured skill trees the Node's launch snapshot
+    /// resolved; written into the native home by the materializer.
+    pub configured_skills: Vec<crate::launch::capabilities::ConfiguredSkill>,
 }
 
 impl ClaudePtyOptions {
@@ -171,6 +174,7 @@ impl ClaudePtyOptions {
             media_stager: None,
             memory_context: None,
             skill_context: None,
+            configured_skills: Vec::new(),
         }
     }
 }
@@ -357,6 +361,7 @@ impl ClaudePtyDriver {
             secret_policy: None,
             memory_context: self.options.memory_context.as_ref(),
             skill_context: self.options.skill_context.as_ref(),
+            configured_skills: &self.options.configured_skills,
         };
         let mut recipe = materialize(&request)?;
         apply_tty_bypass_flag(&mut recipe);

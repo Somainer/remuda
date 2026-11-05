@@ -1,0 +1,93 @@
+{
+  "launchId": "<launch>",
+  "driver": "claude-bg",
+  "binary": {
+    "absPath": "<root>/agent",
+    "version": "2.1.291 (Claude Code)",
+    "sha256": "sha256:a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf"
+  },
+  "cwd": "<root>",
+  "argv": [
+    "--bg",
+    "--permission-mode",
+    "default",
+    "--model",
+    "sonnet"
+  ],
+  "envAllowlist": [
+    {
+      "name": "CLAUDE_CONFIG_DIR",
+      "source": "native-home"
+    }
+  ],
+  "materializedFiles": [
+    {
+      "path": "<root>/instances/ins_x/native-home/skills/remuda/SKILL.md",
+      "role": "remuda-skill",
+      "mode": "0600",
+      "contentDigest": "sha256:c50b0c80e0550ccd7b23bb079dd88874de19af01e079fc55e97c35cf8b39428b",
+      "lifetime": "launch"
+    },
+    {
+      "path": "<root>/instances/ins_x/native-home/skills/remuda/.remuda-managed",
+      "role": "remuda-skill",
+      "mode": "0600",
+      "contentDigest": "sha256:e03d069fa2cfb288e7f66ca7f765e9d1328356006eb79cfbbe7c35d97a157be7",
+      "lifetime": "launch"
+    }
+  ],
+  "settingSources": [
+    "user",
+    "project",
+    "local"
+  ],
+  "nativeHome": "<root>/instances/ins_x/native-home",
+  "inputDelivery": "deferred-argv",
+  "provider": {
+    "profileId": "pvp_01993ab0-0000-7000-8000-000000000001",
+    "kind": "anthropic",
+    "baseUrl": "",
+    "delegation": "none",
+    "modelRequested": "sonnet"
+  },
+  "permission": {
+    "cliMode": "default"
+  },
+  "capabilities": [],
+  "mcpServers": [],
+  "technicalDebt": [],
+  "audit": {
+    "envNames": [
+      "CLAUDE_CONFIG_DIR"
+    ],
+    "credentialRefs": [],
+    "redactedArgv": [
+      "--bg",
+      "--permission-mode",
+      "default",
+      "--model",
+      "sonnet"
+    ],
+    "prohibitedOptionsChecked": true,
+    "binaryOverride": false,
+    "approvalAuthority": "native-tty"
+  },
+  "skill": {
+    "context": {
+      "grants": [
+        "dispatch"
+      ],
+      "herdr": true,
+      "delegatedDecisions": false,
+      "inbox": false
+    },
+    "tree": {
+      "state": "installed",
+      "root": "<root>/instances/ins_x/native-home/skills/remuda",
+      "shared": false
+    },
+    "section": {
+      "mechanism": "tree"
+    }
+  }
+}

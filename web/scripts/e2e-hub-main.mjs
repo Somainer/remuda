@@ -23,6 +23,7 @@ export const MAIN_SPECS = [
   "tests/e2e/main-ui.hub.spec.ts",
   "tests/e2e/owner-notify.hub.spec.ts",
   "tests/e2e/routed-to.hub.spec.ts",
+  "tests/e2e/seat-profile.hub.spec.ts",
 ];
 
 export const MAIN_ENV = {

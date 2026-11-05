@@ -156,6 +156,7 @@ async fn real_claude_through_native_shell_pty() {
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
+            configured_skills: Vec::new(),
             settings_overlay: None,
         },
     );
@@ -312,6 +313,7 @@ async fn scoped_home_lists_gateway_models_in_model_picker() {
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
+            configured_skills: Vec::new(),
             settings_overlay: None,
         },
     );

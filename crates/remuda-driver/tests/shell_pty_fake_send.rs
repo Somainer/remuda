@@ -193,6 +193,7 @@ fn driver_for(root: &Path, scenario_path: &Path, events_path: &Path) -> ShellPty
             binary: Some(binary),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
+            configured_skills: Vec::new(),
             settings_overlay: None,
         },
     );

@@ -88,6 +88,7 @@ mod registry;
 mod restart;
 mod root_turn;
 /// The shared secret lint (memory writes, brief lint; main-agent.md §12.5).
+pub mod seat_profile;
 pub mod secret_lint;
 mod seen;
 mod skill_context;
@@ -943,6 +944,7 @@ impl HubTestHandle {
                 // A restart never starts from a paused lineage: a close wins.
                 from_states: &["starting", "running"],
                 restart: None,
+                profile: None,
             })
             .await?;
         match result {
@@ -2842,6 +2844,7 @@ pub fn router(state: AppState) -> Router {
         .merge(owner_notify::routes())
         .merge(owner_glance::routes())
         .merge(wake::routes())
+        .merge(seat_profile::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

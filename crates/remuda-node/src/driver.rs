@@ -201,6 +201,14 @@ pub trait Driver: Send + Sync {
     fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
         None
     }
+    /// cb-seat-profile (D-063): the `launch.capabilities` snapshot the
+    /// factory computed for this agent launch, journaled before
+    /// [`Driver::start`]; a snapshot with a refusal refuses the launch.
+    /// `None` for adapters that compute none (kinds `terminal` and `generic`,
+    /// the fake drivers).
+    fn launch_capabilities(&self) -> Option<remuda_protocol::LaunchCapabilitiesPayload> {
+        None
+    }
     /// Herdr pane or local PTY for the Node TTY bridge.
     fn tty_bridge(
         &self,

@@ -117,8 +117,10 @@
   line-height: var(--lh-meta);
 }
 
+/* §8 stale: greyed by opacity, as the queue's stale card is — --fg-muted and
+   --fg-faint are nearly the same colour in the dark theme. */
 .routed[data-stale="1"] {
-  color: var(--fg-faint);
+  opacity: 0.6;
 }
 
 .line2[data-kind="reply"] {

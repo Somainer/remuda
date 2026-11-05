@@ -283,11 +283,13 @@ pub struct RouteTarget {
     pub method: String,
     /// The registered path template.
     pub path: String,
+    /// The module that registers the route: where a bare handler lives.
+    pub module: String,
     /// The handler as written (`http::get_journal`, `claim`).
     pub handler: String,
 }
 
-/// Scan `.route(...)` registrations out of Rust sources (path, source). The
+/// Scan `.route(...)` registrations out of Rust sources (module, source). The
 /// scan stops at the first `#[cfg(test)]`, and recurses through nested modules
 /// because the walk that feeds it does.
 #[must_use]
@@ -295,8 +297,8 @@ pub fn scan_route_registrations(
     sources: &[(String, String)],
 ) -> BTreeMap<(String, String), RouteTarget> {
     let mut routes = BTreeMap::new();
-    for (_, source) in sources {
-        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+    for (module, source) in sources {
+        let source = production_source(source);
         let mut cursor = 0;
         while let Some(relative) = source[cursor..].find(".route(") {
             let open = cursor + relative + ".route".len();
@@ -311,6 +313,7 @@ pub fn scan_route_registrations(
                         RouteTarget {
                             method: method.to_ascii_uppercase(),
                             path: path.to_owned(),
+                            module: module.clone(),
                             handler,
                         },
                     );
@@ -529,7 +532,7 @@ struct Function {
 fn index_functions(sources: &[(String, String)]) -> BTreeMap<(String, String), Function> {
     let mut index = BTreeMap::new();
     for (module, source) in sources {
-        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let source = production_source(source);
         for (name, body) in function_bodies(source) {
             index.entry((module.clone(), name)).or_insert(Function {
                 module: module.clone(),
@@ -544,20 +547,18 @@ fn index_functions(sources: &[(String, String)]) -> BTreeMap<(String, String), F
 /// clauses are skipped up to the body's opening brace.
 fn function_bodies(source: &str) -> Vec<(String, String)> {
     let mut bodies = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = source[cursor..].find("fn ") {
-        let start = cursor + relative + 3;
-        let rest = &source[start..];
+    for start in code_fn_positions(source) {
+        let after = start + 3;
+        let rest = &source[after..];
         let name_len = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
         if name_len == 0 {
-            cursor = start;
             continue;
         }
         let name = rest[..name_len].to_owned();
-        // Find the body's opening brace, `;` ends a declaration with no body.
-        let mut i = start + name_len;
+        // Find the body's opening brace; `;` ends a declaration with no body.
+        let mut i = after + name_len;
         let mut open = None;
         while i < source.len() {
             match source.as_bytes()[i] {
@@ -580,29 +581,77 @@ fn function_bodies(source: &str) -> Vec<(String, String)> {
             i += 1;
         }
         let Some(open) = open else {
-            cursor = start + name_len;
             continue;
         };
+        // An inherent or trait method is not a route handler.
+        if source[after + name_len..open]
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| word == "self")
+        {
+            continue;
+        }
         let Some(end) = match_delimiter(source, open, '{', '}') else {
-            break;
+            continue;
         };
         bodies.push((name, source[open + 1..end - 1].to_owned()));
-        cursor = end;
     }
     bodies
 }
 
+/// Byte offsets of `fn` keywords on a code line (a line's text before its
+/// `//` comment). Definitions start a signature line; this is steadier than a
+/// character-state machine over the whole file when strings hold `/*` or
+/// `//`.
+fn code_fn_positions(source: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let code = line.find("//").map_or(line, |at| &line[..at]);
+        let bytes = code.as_bytes();
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            if bytes[i] == b'f'
+                && bytes[i + 1] == b'n'
+                && bytes[i + 2].is_ascii_whitespace()
+                && (i == 0 || !ident_bytes(bytes, i - 1))
+            {
+                positions.push(offset + i);
+            }
+            i += 1;
+        }
+        offset += line.len();
+    }
+    positions
+}
+
+/// The source before its `#[cfg(test)] mod tests`, but not before an inline
+/// `#[cfg(test)]` helper: cutting at the first attribute would hide every
+/// handler defined after it.
+fn production_source(source: &str) -> &str {
+    let marker = "#[cfg(test)]";
+    let mut from = 0;
+    while let Some(at) = source[from..].find(marker) {
+        let absolute = from + at;
+        let rest = source[absolute + marker.len()..].trim_start();
+        if rest.starts_with("mod ") {
+            return &source[..absolute];
+        }
+        from = absolute + 1;
+    }
+    source
+}
+
+fn ident_bytes(bytes: &[u8], index: usize) -> bool {
+    bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_'
+}
+
 fn handler_gate(index: &BTreeMap<(String, String), Function>, target: &RouteTarget) -> String {
     // A bare handler lives in the module that registers the route; `http::f`
-    // names module `http`.
+    // names module `http`. A handler name is not unique across the crate
+    // (`list`, `claim`), so never fall back to every module.
     let (module, name) = match target.handler.split_once("::") {
         Some((module, name)) => (module.to_owned(), name.to_owned()),
-        None => (String::new(), target.handler.clone()),
-    };
-    let modules: Vec<&String> = if module.is_empty() {
-        index.keys().map(|(module, _)| module).collect()
-    } else {
-        vec![&module]
+        None => (target.module.clone(), target.handler.clone()),
     };
     let mut scan = GateScan {
         operator: false,
@@ -610,10 +659,7 @@ fn handler_gate(index: &BTreeMap<(String, String), Function>, target: &RouteTarg
         scope: false,
     };
     let mut visited = BTreeSet::new();
-    let mut frontier: Vec<(String, String, usize)> = modules
-        .iter()
-        .map(|module| ((*module).clone(), name.clone(), 0))
-        .collect();
+    let mut frontier: Vec<(String, String, usize)> = vec![(module, name, 0)];
     while let Some((module, name, depth)) = frontier.pop() {
         if !visited.insert((module.clone(), name.clone())) || visited.len() > 64 {
             continue;
@@ -625,7 +671,7 @@ fn handler_gate(index: &BTreeMap<(String, String), Function>, target: &RouteTarg
         if depth == 2 {
             continue;
         }
-        for callee in bare_calls(&function.body) {
+        for callee in unconditional_calls(&function.body) {
             if index.contains_key(&(function.module.clone(), callee.clone())) {
                 frontier.push((function.module.clone(), callee, depth + 1));
             }
@@ -652,48 +698,112 @@ fn handler_gate(index: &BTreeMap<(String, String), Function>, target: &RouteTarg
 }
 
 fn scan_body(body: &str, scan: &mut GateScan) {
-    if body.contains("require_operator(") {
+    // Only an unconditional call counts: a gate inside an `if` or a `match`
+    // arm applies to one branch, which the scan cannot describe honestly.
+    let depth = brace_depth(body);
+    if top_level(body, &depth, "require_operator(") {
         scan.operator = true;
     }
-    if body.contains("caller_project_scope(") || body.contains("require_project_scope(") {
+    if top_level(body, &depth, "caller_project_scope(")
+        || top_level(body, &depth, "require_project_scope(")
+    {
         scan.scope = true;
     }
     let mut cursor = 0;
     while let Some(relative) = body[cursor..].find("require_grant(") {
-        let open = cursor + relative + "require_grant".len();
+        let start = cursor + relative;
+        let open = start + "require_grant".len();
         let Some(end) = match_delimiter(body, open, '(', ')') else {
             break;
         };
-        let arguments = &body[open + 1..end - 1];
-        if let Some(grant) = grant_word(arguments) {
-            scan.grants.insert(grant);
+        if depth.get(start).copied().unwrap_or(1) == 0 {
+            // A verb chosen by a condition is still read reliably: report
+            // every verb the call can pass rather than the first one.
+            scan.grants.extend(grant_words(&body[open + 1..end - 1]));
         }
         cursor = end;
     }
 }
 
-/// The grant named by `require_grant(..)`'s arguments: `GrantVerb::Dispatch`
-/// or a `"dispatch"` literal.
-fn grant_word(arguments: &str) -> Option<String> {
-    if let Some(rest) = arguments.split("GrantVerb::").nth(1) {
+/// Whether `needle` occurs at the body's top level.
+fn top_level(body: &str, depth: &[u32], needle: &str) -> bool {
+    body.match_indices(needle)
+        .any(|(index, _)| depth.get(index).copied().unwrap_or(1) == 0)
+}
+
+/// Brace depth before each byte of `body`, ignoring strings and comments.
+fn brace_depth(body: &str) -> Vec<u32> {
+    let bytes = body.as_bytes();
+    let mut depth = vec![0u32; bytes.len()];
+    let mut level = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        depth[i] = level;
+        match bytes[i] {
+            b'{' => level += 1,
+            b'}' => level = level.saturating_sub(1),
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    depth[i] = level;
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < bytes.len() {
+                            depth[i] = level;
+                        }
+                    } else if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    depth[i] = level;
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    depth[i] = level;
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// The grants named by `require_grant(..)`'s arguments: every
+/// `GrantVerb::X` the call can pass, else a `"dispatch"` literal.
+fn grant_words(arguments: &str) -> BTreeSet<String> {
+    let mut verbs = BTreeSet::new();
+    for rest in arguments.split("GrantVerb::").skip(1) {
         let verb: String = rest
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
         if !verb.is_empty() {
-            return Some(kebab(&verb));
+            verbs.insert(kebab(&verb));
         }
     }
-    for literal in arguments.split('"').skip(1).step_by(2) {
-        if literal
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_')
-            && !literal.is_empty()
-        {
-            return Some(literal.to_owned());
+    if verbs.is_empty() {
+        for literal in arguments.split('"').skip(1).step_by(2) {
+            if literal
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_')
+                && !literal.is_empty()
+            {
+                verbs.insert(literal.to_owned());
+            }
         }
     }
-    None
+    verbs
 }
 
 /// `Dispatch` → `dispatch`, `AddressOwner` → `address-owner`.
@@ -708,14 +818,15 @@ fn kebab(name: &str) -> String {
     out
 }
 
-/// Free-function call names in a body: identifiers followed by `(`, excluding
-/// method calls (`x.f(`) and keywords.
-fn bare_calls(body: &str) -> BTreeSet<String> {
+/// Free-function call names a body makes unconditionally: an identifier
+/// followed by `(`, excluding method calls (`x.f(`) and keywords.
+fn unconditional_calls(body: &str) -> BTreeSet<String> {
+    let depth = brace_depth(body);
     let mut calls = BTreeSet::new();
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'(' {
+        if bytes[i] == b'(' && depth.get(i).copied().unwrap_or(1) == 0 {
             let mut end = i;
             while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_') {
                 end -= 1;

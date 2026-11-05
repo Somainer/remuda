@@ -235,6 +235,66 @@ async fn require_project_scope(state: &AppState, headers: &HeaderMap) -> Result<
 }
 
 #[test]
+fn the_scan_reads_only_unconditional_gates_in_the_registering_module() {
+    // Three traps the live tree hit: a handler name that also exists in
+    // another module, an inline `#[cfg(test)]` helper before the handler, and
+    // a gate inside a branch (which the scan cannot describe honestly).
+    let registering = r#"
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/a", get(list))
+        .route("/v1/b", get(guarded))
+}
+
+#[cfg(test)]
+fn only_a_test_helper() {}
+
+async fn list(State(state): State<AppState>) -> Result<Json<Value>, HubError> {
+    Ok(Json(json!({})))
+}
+
+async fn guarded(State(state): State<AppState>) -> Result<Json<Value>, HubError> {
+    if request_is_privileged() {
+        require_operator(&state, &headers).await?;
+    }
+    Ok(Json(json!({})))
+}
+"#;
+    // Another module owns a `list` that is operator-only; it must not decide
+    // the gate of the route above.
+    let other = r#"
+async fn list(State(state): State<AppState>) -> Result<Json<Value>, HubError> {
+    require_operator(&state, &headers).await?;
+    Ok(Json(json!({})))
+}
+"#;
+    let sources = vec![
+        ("registering".to_owned(), registering.to_owned()),
+        ("other".to_owned(), other.to_owned()),
+    ];
+    let clap = clap::Command::new("remuda");
+    let model = build_model(&sources, &BTreeSet::new(), &clap);
+    let gate = |path: &str| {
+        model
+            .routes
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.handler.clone())
+            .unwrap_or_else(|| panic!("{path} missing from {:#?}", model.routes))
+    };
+    assert_eq!(
+        gate("/v1/a"),
+        "handler-checked",
+        "a bare name stays in its module"
+    );
+    assert_eq!(
+        gate("/v1/b"),
+        "handler-checked",
+        "a branch gate is not a gate"
+    );
+}
+
+#[test]
 fn the_scan_covers_every_registered_route() {
     // The scan is recursive and must see the nested `bot` module, which the
     // OpenAPI document does not document today.

@@ -35,7 +35,7 @@
       "method": "DELETE",
       "path": "/v1/hosts/{id}/workspaces",
       "middleware": "refused",
-      "handler": "handler-checked"
+      "handler": "operator-only"
     },
     {
       "method": "DELETE",
@@ -103,7 +103,7 @@
       "method": "GET",
       "path": "/v1/attachments",
       "middleware": "admitted",
-      "handler": "operator-only"
+      "handler": "handler-checked"
     },
     {
       "method": "GET",
@@ -163,7 +163,7 @@
       "method": "GET",
       "path": "/v1/gate/logs/{id}",
       "middleware": "refused",
-      "handler": "handler-checked"
+      "handler": "scope"
     },
     {
       "method": "GET",
@@ -235,7 +235,7 @@
       "method": "GET",
       "path": "/v1/instances",
       "middleware": "admitted",
-      "handler": "grant: dispatch; scope"
+      "handler": "scope"
     },
     {
       "method": "GET",
@@ -306,7 +306,7 @@
       "path": "/v1/lineages/{id}/glance",
       "middleware": "owner-scoped",
       "owned": "lineage",
-      "handler": "handler-checked"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "GET",
@@ -408,7 +408,7 @@
       "method": "GET",
       "path": "/v1/projects/{id}/gate/jobs/{jobId}",
       "middleware": "admitted",
-      "handler": "handler-checked"
+      "handler": "scope"
     },
     {
       "method": "GET",
@@ -475,7 +475,7 @@
       "path": "/v1/workers/{id}/digest",
       "middleware": "owner-scoped",
       "owned": "worker",
-      "handler": "handler-checked"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "GET",
@@ -644,7 +644,7 @@
       "method": "POST",
       "path": "/v1/hosts/{id}/workspaces",
       "middleware": "refused",
-      "handler": "handler-checked"
+      "handler": "operator-only"
     },
     {
       "method": "POST",
@@ -773,25 +773,25 @@
       "method": "POST",
       "path": "/v1/projects/{id}/gate",
       "middleware": "admitted",
-      "handler": "grant: land; scope"
+      "handler": "grant: dispatch, land; scope"
     },
     {
       "method": "POST",
       "path": "/v1/projects/{id}/gate/jobs/{jobId}/cancel",
       "middleware": "admitted",
-      "handler": "grant: land; scope"
+      "handler": "grant: dispatch, land; scope"
     },
     {
       "method": "POST",
       "path": "/v1/projects/{id}/gate/jobs/{jobId}/resolve",
       "middleware": "admitted",
-      "handler": "handler-checked"
+      "handler": "operator-only; scope"
     },
     {
       "method": "POST",
       "path": "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence",
       "middleware": "admitted",
-      "handler": "handler-checked"
+      "handler": "operator-only; scope"
     },
     {
       "method": "POST",

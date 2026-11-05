@@ -907,6 +907,19 @@ export type HubState = {
   screens: Record<string, ScreenEntry>;
   /** List-row live phrases projected from each instance's journal tail. */
   summaries: Record<string, string>;
+  /**
+   * home-glance-d060: `GET /v1/owner/glance`, the one owner-scope projection
+   * the home's ① counts, the desktop 今日完成 segment, ⑥ and the ledger row
+   * headlines read. `null` until the first successful read (the row then
+   * paints 「–」, never a derived guess). A failed refresh keeps the last value
+   * so the row can name when it was last true; `glanceFailed` is what greys
+   * it (§8), never a silent freeze.
+   */
+  glance: import("../types/generated").OwnerGlance | null;
+  /** Local ms of the last SUCCESSFUL glance read; null before the first. */
+  glanceAt: number | null;
+  /** The most recent glance read failed (its numbers are the last good ones). */
+  glanceFailed: boolean;
   /** Number of outbox rows pending/inflight (offline banner). */
   outboxPending: number;
   /**
@@ -956,6 +969,9 @@ const initial: HubState = {
   /** Outbox rows still awaiting a definite Hub answer (D-055 banner count). */
   outboxPending: 0,
   summaries: {},
+  glance: null,
+  glanceAt: null,
+  glanceFailed: false,
   lineages: {},
 };
 
@@ -1046,6 +1062,26 @@ function sameArrayIdentity<T>(next: readonly T[], prev: readonly T[]): boolean {
 /** seen-hub: a turn end newer than the seen seq ("never seen" sits below 0). */
 export function seenUnseen(turnEndSeq?: U64, seenSeq?: U64): boolean {
   return turnEndSeq != null && BigInt(turnEndSeq) > (seenSeq == null ? -1n : BigInt(seenSeq));
+}
+
+/**
+ * The glance without `ids` in its ◉ set: the list and `counts.doneUnseen`
+ * shrink together, so ⑤ and ◉ stay one set (home.md §7). Returns `glance`
+ * itself when none of them is listed.
+ */
+export function withoutDoneUnseen<G extends { counts: { doneUnseen: number }; doneUnseenIds?: string[] }>(
+  glance: G,
+  ids: ReadonlySet<string>,
+): G {
+  const listed = glance.doneUnseenIds;
+  if (!Array.isArray(listed) || ids.size === 0) return glance;
+  const kept = listed.filter((id) => !ids.has(id));
+  if (kept.length === listed.length) return glance;
+  return {
+    ...glance,
+    doneUnseenIds: kept,
+    counts: { ...glance.counts, doneUnseen: Math.max(0, glance.counts.doneUnseen - (listed.length - kept.length)) },
+  };
 }
 
 function maxSeq(a?: U64, b?: U64): U64 | undefined {
@@ -1686,7 +1722,15 @@ class HubStore {
         authed: false,
         session: null,
         connection: "offline",
+        // home-glance-d060: the previous owner's projection dies with the
+        // identity; the next login must not paint it.
+        glance: null,
+        glanceAt: null,
+        glanceFailed: false,
       });
+      this.glanceIndex = null;
+      this.seenMarks.clear();
+      this.glanceRaw = null;
     }
     this.disposeOutboxForAuthChange();
   }
@@ -6107,8 +6151,18 @@ class HubStore {
     this.emit({
       session: readSession(),
       error: null,
-      ...(identityChanged ? { instances: [] } : {}),
+      // home-glance-d060: a different owner's device must not inherit the
+      // previous identity's glance (the single reason `instances` is cleared
+      // here applies to the projection too).
+      ...(identityChanged
+        ? { instances: [], glance: null, glanceAt: null, glanceFailed: false }
+        : {}),
     });
+    if (identityChanged) {
+      this.glanceIndex = null;
+      this.seenMarks.clear();
+      this.glanceRaw = null;
+    }
     // Gate 49 item 6 (low): recheck the issuing epoch AFTER every
     // publication-bearing helper too — a subscriber invoked synchronously by
     // the emit above (or the earlier applyAuthIdentityChange) may have logged
@@ -6203,6 +6257,9 @@ class HubStore {
       if (!this.state.authed) return;
       void this.refresh();
       void this.refreshHosts().catch(() => undefined);
+      // The glance is NOT polled here: it runs only while a home surface is
+      // mounted (useOwnerGlancePoll), so a session/terminal page pays for no
+      // owner-scope projection (home-glance-d060 §5.3).
     }, 2000);
   }
 
@@ -8269,14 +8326,29 @@ class HubStore {
     const optimistic = row && BigInt(durableSeq) > BigInt(row.durableSeq) ? row.durableSeq : durableSeq;
     const previous = row?.seenSeq;
     this.applySeenView({ instanceId, unseen: false, seenSeq: optimistic });
+    // ◉ and ⑤ read one glance: the mark leaves both at once, and no glance
+    // read that began before the write commits may paint it back.
+    this.seenMarks.set(instanceId, Number.POSITIVE_INFINITY);
+    this.stripGlanceNow();
     let view: SeenView;
     try {
       view = await api.instanceSeen(instanceId, durableSeq, options.visible);
       this.applySeenView(view);
     } catch (error) {
+      // Refused: the row is still unseen on the Hub, so it returns to ⑤ and
+      // ◉ (list and count) exactly as the last glance listed it.
+      this.seenMarks.delete(instanceId);
+      this.restoreGlance();
       this.rollbackSeen(instanceId, optimistic, previous);
       throw error;
     }
+    // Committed: a read that STARTS after now is the Hub's truth. A still-
+    // unseen answer (a newer turn end) needs no strip at all, and gets its
+    // row back at once.
+    if (view.unseen) {
+      this.seenMarks.delete(instanceId);
+      this.restoreGlance();
+    } else this.seenMarks.set(instanceId, this.glanceReadSeq);
     // A turn end that committed just before this report's lease reads unseen
     // in the answer although the page is showing it: cover it once, at the
     // answer's own turn end (the Hub clamps to its journal). Bounded — the
@@ -8997,6 +9069,137 @@ class HubStore {
     return this.state.summaries[instanceId] ?? api.summaryOf(instanceId);
   }
 
+  /**
+   * home-glance-d060: the owner glance's row for a session, waiting rows
+   * first. Indexed once per glance response so a ledger render does not scan
+   * the row lists per row.
+   */
+  glanceRowOf(instanceId: Id): import("../types/generated").OwnerGlanceRow | undefined {
+    const glance = this.state.glance;
+    if (!glance) return undefined;
+    if (this.glanceIndex?.glance !== glance) {
+      const index = new Map<string, import("../types/generated").OwnerGlanceRow>();
+      for (const row of [...(glance.waiting ?? []), ...(glance.working ?? [])]) {
+        if (!index.has(row.instanceId)) index.set(row.instanceId, row);
+      }
+      this.glanceIndex = { glance, index };
+    }
+    return this.glanceIndex.index.get(instanceId);
+  }
+
+  /** The one deterministic headline for a session, when the glance has one. */
+  glanceHeadlineOf(instanceId: Id): string | undefined {
+    return this.glanceRowOf(instanceId)?.headline;
+  }
+
+  /**
+   * r6 item 2: a working session's structured live phrase from the glance
+   * (`Workflow <run> · phase <label>`, else the last assistant line), or
+   * undefined. The list-row sentence reads THIS, not the headline: the
+   * headline falls back to the title, which a row already shows.
+   */
+  glancePhraseOf(instanceId: Id): string | undefined {
+    return this.glanceRowOf(instanceId)?.phrase ?? undefined;
+  }
+
+  private glanceIndex: {
+    glance: NonNullable<HubState["glance"]>;
+    index: Map<string, import("../types/generated").OwnerGlanceRow>;
+  } | null = null;
+
+  private glanceInFlight: Promise<void> | null = null;
+
+  /**
+   * r4 item 3: seen writes the glance has not caught up with yet, as instance
+   * id → the glance-read sequence at the write's commit (∞ while it is in
+   * flight). A glance read that began at or before that sequence predates the
+   * commit, so the id is stripped from its ◉ list AND its count together; the
+   * first read that began after it is the Hub's truth and retires the mark.
+   */
+  private seenMarks = new Map<string, number>();
+  private glanceReadSeq = 0;
+  /**
+   * The last glance exactly as the Hub served it, before any mark was
+   * stripped, and the read sequence it began at. Dropping a mark re-derives
+   * the painted glance from it, so the row returns where the Hub put it.
+   */
+  private glanceRaw: { glance: NonNullable<HubState["glance"]>; readSeq: number } | null = null;
+
+  private stripSeen(
+    glance: NonNullable<HubState["glance"]>,
+    readSeq: number,
+  ): NonNullable<HubState["glance"]> {
+    const drop = new Set<string>();
+    for (const [id, committedAt] of this.seenMarks) {
+      if (readSeq <= committedAt) drop.add(id);
+      else this.seenMarks.delete(id);
+    }
+    return withoutDoneUnseen(glance, drop);
+  }
+
+  /** Re-derive the painted glance from the Hub's last answer and the marks left. */
+  private restoreGlance() {
+    const raw = this.glanceRaw;
+    if (!raw || !this.state.glance) return;
+    const next = this.stripSeen(raw.glance, raw.readSeq);
+    if (next !== this.state.glance) this.emit({ glance: next });
+  }
+
+  /** Apply the pending marks to the glance already painted. */
+  private stripGlanceNow() {
+    const glance = this.state.glance;
+    if (!glance) return;
+    const next = withoutDoneUnseen(glance, new Set(this.seenMarks.keys()));
+    if (next !== glance) this.emit({ glance: next });
+  }
+
+  /**
+   * home-glance-d060: one `GET /v1/owner/glance` per poll. Coalesced — every
+   * mounted home reader shares the in-flight read — and epoch-guarded, so a
+   * response that lands after logout cannot repaint the next identity's row.
+   * A failure keeps the last numbers but marks them `glanceFailed`, which is
+   * what greys ① and names the last good time (§8); it never silently ships
+   * frozen numbers as fresh.
+   */
+  refreshGlance(): Promise<void> {
+    if (this.glanceInFlight) return this.glanceInFlight;
+    // The identity fence is BOTH coordinates: bootGen retires a pre-bootstrap
+    // read, and extEpoch retires one in flight across a peer-tab/logout/401
+    // retirement (which bumps extEpoch but not bootGen) — otherwise the
+    // retired identity's projection repaints the next owner's row.
+    const boot = this.bootGen;
+    const ext = this.extEpoch;
+    const live = () => boot === this.bootGen && ext === this.extEpoch;
+    const readSeq = ++this.glanceReadSeq;
+    const job = (async () => {
+      try {
+        // The owner's local-day offset, east of UTC (the Hub clamps it).
+        const glance = await api.ownerGlance(-new Date().getTimezoneOffset());
+        if (!live()) return;
+        // A malformed body (an older/mock Hub, a proxy page) is a failed read,
+        // never a half-populated projection the home would crash on.
+        if (
+          !glance ||
+          typeof glance.counts?.needYou !== "number" ||
+          !Array.isArray(glance.waiting) ||
+          !Array.isArray(glance.working)
+        ) {
+          this.emit({ glanceFailed: true });
+          return;
+        }
+        this.glanceRaw = { glance, readSeq };
+        this.emit({ glance: this.stripSeen(glance, readSeq), glanceAt: Date.now(), glanceFailed: false });
+      } catch {
+        if (!live()) return;
+        this.emit({ glanceFailed: true });
+      }
+    })().finally(() => {
+      if (this.glanceInFlight === job) this.glanceInFlight = null;
+    });
+    this.glanceInFlight = job;
+    return job;
+  }
+
   permissionModeOf(instanceId: Id) {
     return this.state.permissionMode[instanceId] ?? api.permissionModeOf(instanceId);
   }
@@ -9207,6 +9410,11 @@ export function useHub(): HubState {
  * - otherwise the latest chapter of the most recent address-owner lineage,
  *   which the surfaces label as paused/stopped.
  * - `null` when no address-owner lineage exists: nothing Main renders.
+ *
+ * home-glance-d060 (home.md §5.3): the Hub resolves Main for the owner glance
+ * with the SAME rule (`owner_glance::pick_main_seat`); both run the cases in
+ * `crates/remuda-hub/tests/fixtures/main_seat_cases.json`, so a paused Main's
+ * subtree is the same set on both sides. Exact ties fall to the lower id.
  */
 export type MainEntry = {
   /** The chapter Main addresses (sends, Stop, Pause, Resume target it). */
@@ -9230,8 +9438,13 @@ function mainChapterLive(instance: Instance): boolean {
   return instance.lastError === "host-contact-lost";
 }
 
-function chapterTime(instance: Instance): number {
-  const t = Date.parse(instance.updatedAt || instance.createdAt);
+/**
+ * A chapter's creation in ms: the only time Main resolution orders by. Never
+ * `updatedAt` — a host reconnect or a heartbeat bumps it, and Main must not
+ * change hands over that.
+ */
+function chapterCreated(instance: Instance): number {
+  const t = Date.parse(instance.createdAt);
   return Number.isFinite(t) ? t : 0;
 }
 
@@ -9240,28 +9453,36 @@ export function resolveMain(instances: readonly Instance[]): MainEntry | null {
   if (seats.length === 0) return null;
   const lineageOf = (row: Instance) => (row.lineageId ?? row.id) as Id;
   const generationOf = (row: Instance) => row.generation ?? 1;
-  // Newer generation first, then the more recently touched row.
-  const newer = (a: Instance, b: Instance) =>
-    generationOf(a) !== generationOf(b)
-      ? generationOf(a) > generationOf(b)
-        ? a
-        : b
-      : chapterTime(a) >= chapterTime(b)
-        ? a
-        : b;
+  // Newer generation first, then the later-created chapter, then the lower id.
+  const newer = (a: Instance, b: Instance) => {
+    if (generationOf(a) !== generationOf(b)) return generationOf(a) > generationOf(b) ? a : b;
+    const ca = chapterCreated(a);
+    const cb = chapterCreated(b);
+    if (ca !== cb) return ca > cb ? a : b;
+    return a.id <= b.id ? a : b;
+  };
   const live = seats.filter(mainChapterLive);
   let pick: Instance;
   if (live.length > 0) {
     // The Hub admits one active holder (§2.5); stay deterministic anyway.
     pick = live.reduce(newer);
   } else {
-    const latestByLineage = new Map<Id, Instance>();
+    // Per lineage: its creation (the earliest chapter's) and its newest
+    // chapter; then the lineage CREATED last, an exact tie to the lower id.
+    const byLineage = new Map<Id, { born: number; latest: Instance }>();
     for (const row of seats) {
       const key = lineageOf(row);
-      const current = latestByLineage.get(key);
-      latestByLineage.set(key, current ? newer(current, row) : row);
+      const current = byLineage.get(key);
+      byLineage.set(
+        key,
+        current
+          ? { born: Math.min(current.born, chapterCreated(row)), latest: newer(current.latest, row) }
+          : { born: chapterCreated(row), latest: row },
+      );
     }
-    pick = [...latestByLineage.values()].reduce((a, b) => (chapterTime(a) >= chapterTime(b) ? a : b));
+    pick = [...byLineage.values()].reduce((a, b) =>
+      a.born !== b.born ? (a.born > b.born ? a : b) : a.latest.id <= b.latest.id ? a : b,
+    ).latest;
   }
   const lineageId = lineageOf(pick);
   const chapterIds = instances

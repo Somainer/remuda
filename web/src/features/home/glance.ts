@@ -27,13 +27,6 @@ export type GlanceSource = {
   nowMs: number;
 };
 
-/**
- * Top-level sessions only. `/sessions` lists these (SessionList drops
- * `parent != null`, and its caption says 「子 agent 不在此列」), so its ① count
- * must use the same set; `/m`'s ledger includes children and counts them.
- */
-export const TOP_LEVEL_WORKING = (instance: Instance): boolean => instance.parent == null;
-
 export type GlanceCounts = {
   /** §5.1 N = A (interactions really waiting on the owner) + B (owner-blocked tasks with no such interaction). */
   needYou: number;
@@ -41,6 +34,13 @@ export type GlanceCounts = {
   doneUnseen: number;
   /** §5.2 ●: instances ranked working (§3.1 rank 3). */
   working: number;
+  /**
+   * §5.2 今日完成: sessions whose latest settled root turn ended in the owner's
+   * local day. Desktop only, and hidden while unknown — the client receives it
+   * from `GET /v1/owner/glance` (home-glance-d060), so an older Hub that omits
+   * it simply never paints the segment.
+   */
+  doneToday?: number;
 };
 
 /**
@@ -54,15 +54,7 @@ export type GlanceCounts = {
  * Notices and failed turns are deliberately absent: a failed turn is a queue
  * card, never ◉.
  */
-export function glanceCounts(
-  source: GlanceSource,
-  /**
-   * The instances the calling surface actually LISTS for 工作中 (default: all
-   * of them). Desktop passes top-level sessions; the phone ledger includes
-   * child sessions, so it keeps the default.
-   */
-  workingInstances: readonly Instance[] = source.instances,
-): GlanceCounts {
+export function glanceCounts(source: GlanceSource): GlanceCounts {
   const queue = deriveInboxQueue({
     interactions: [...source.interactions],
     instances: [...source.instances],
@@ -77,7 +69,7 @@ export function glanceCounts(
   const seen = new Set<string>();
   let working = 0;
   let doneUnseen = 0;
-  for (const instance of workingInstances) {
+  for (const instance of source.instances) {
     if (seen.has(instance.id)) continue;
     seen.add(instance.id);
     const homeRank = rank(instance, childLive.has(instance.id));
@@ -163,16 +155,24 @@ export type GlancePiece =
   | { key: "needYou"; count: number | null }
   | { key: "doneUnseen"; count: number | null }
   | { key: "working"; count: number | null }
+  | { key: "doneToday"; count: number }
   | { key: "greeting"; text: string }
   | { key: "hosts"; text: string };
 
 export type GlanceLineInput = {
   /**
-   * null before the first Hub snapshot. `doneUnseen` is optional so a caller
-   * that only knows the older two counts still type-checks; an omitted count
-   * reads as 0.
+   * null before anything is known. Each count may also be unknown on its own
+   * (`null` → 「–」): ①'s 需要你 is known with ④'s first snapshot, the glance's
+   * segments only with the first glance read. `doneUnseen` is optional so a
+   * caller that only knows the older two counts still type-checks; an omitted
+   * count reads as 0.
    */
-  counts: (Omit<GlanceCounts, "doneUnseen"> & { doneUnseen?: number }) | null;
+  counts: {
+    needYou: number | null;
+    doneUnseen?: number | null;
+    working: number | null;
+    doneToday?: number;
+  } | null;
   /** Local hour, injected so the greeting is testable. */
   hour: number;
   hostsOnline: number;
@@ -189,6 +189,11 @@ export type GlanceLineInput = {
    * ◉ segment stays until the second tap.
    */
   doneUnseenFilter?: boolean;
+  /**
+   * §5.2: 今日完成 is desktop-only. On the phone the segment is absent
+   * whatever the count is.
+   */
+  showDoneToday?: boolean;
 };
 
 /**
@@ -207,17 +212,33 @@ export function glancePieces(input: GlanceLineInput): GlancePiece[] {
     ];
   }
   const { needYou, working } = input.counts;
-  const doneUnseen = input.counts.doneUnseen ?? 0;
+  const doneUnseen = input.counts.doneUnseen === undefined ? 0 : input.counts.doneUnseen;
   const pieces: GlancePiece[] = [];
-  if (needYou > 0) pieces.push({ key: "needYou", count: needYou });
+  // An unknown count is a 「–」 piece; a known zero is hidden (the greeting
+  // stands in for a zero 需要你).
+  if (needYou === null || needYou > 0) pieces.push({ key: "needYou", count: needYou });
   else pieces.push({ key: "greeting", text: greetingForHour(input.hour) });
   // §5.2 order: 需要你 · 完成未看 · 工作中.
-  if (doneUnseen > 0 || input.doneUnseenFilter === true) pieces.push({ key: "doneUnseen", count: doneUnseen });
-  if (working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
+  if (doneUnseen === null || doneUnseen > 0 || input.doneUnseenFilter === true) {
+    pieces.push({ key: "doneUnseen", count: doneUnseen });
+  }
+  if (working === null || working > 0 || input.workingFilter === true) pieces.push({ key: "working", count: working });
+  // §5.2 今日完成: desktop only, hidden while unknown (`doneToday` absent), and
+  // a known zero is hidden like every other segment.
+  const doneToday = input.counts.doneToday ?? null;
+  const paintedDoneToday = input.showDoneToday === true && doneToday !== null && doneToday > 0;
+  if (paintedDoneToday && doneToday !== null) pieces.push({ key: "doneToday", count: doneToday });
   // The host tail closes a line that otherwise says nothing but the greeting.
-  // A zero segment kept alive only because its filter is active still leaves
-  // the line empty of news, so the tail stays.
-  else if (needYou === 0 && doneUnseen === 0 && input.hostsTotal > 0) {
+  // A zero ◉ segment kept alive only because its filter is active still leaves
+  // the line empty of news, so the tail stays; a painted ● segment does not.
+  if (
+    needYou === 0 &&
+    doneUnseen === 0 &&
+    working === 0 &&
+    input.workingFilter !== true &&
+    !paintedDoneToday &&
+    input.hostsTotal > 0
+  ) {
     pieces.push({ key: "hosts", text: `${input.hostsOnline}/${input.hostsTotal} 主机在线` });
   }
   return pieces;
@@ -235,6 +256,9 @@ export function glanceText(pieces: readonly GlancePiece[]): string {
       }
       if (piece.key === "working") {
         return `●${piece.count === null ? "–" : formatGlanceCount(piece.count)} 工作中`;
+      }
+      if (piece.key === "doneToday") {
+        return `今日完成 ${formatGlanceCount(piece.count)}`;
       }
       if (piece.key === "greeting") return `${piece.text} · 都处理完了`;
       return piece.text;

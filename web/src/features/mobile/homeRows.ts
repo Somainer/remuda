@@ -1,3 +1,4 @@
+import { dispatchedChild } from "../../lib/dispatched";
 import { formatListTime } from "../../lib/format";
 import { projectStatus } from "../../lib/status";
 import { endReason, type EndTone } from "../../lib/endReason";
@@ -175,13 +176,15 @@ export function childIsLive(child: Instance): boolean {
 /**
  * Parent instance ids that have at least one child in rank 1, 3 or 5, for the
  * `awaiting-wake` rule. Both surfaces derive their child set from this one
- * helper so the rule cannot drift between them.
+ * helper so the rule cannot drift between them. Only a DISPATCHED child wakes
+ * its parent: a live resume of an exited session names that session as its
+ * parent, but nothing will come back to it (`dispatchedChild`).
  */
 export function liveChildParents(instances: readonly Instance[]): Set<string> {
   const parents = new Set<string>();
   for (const instance of instances) {
     const parentId = instance.parent?.instanceId;
-    if (parentId && childIsLive(instance)) parents.add(parentId);
+    if (parentId && dispatchedChild(instance) && childIsLive(instance)) parents.add(parentId);
   }
   return parents;
 }

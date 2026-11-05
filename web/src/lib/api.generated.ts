@@ -1417,6 +1417,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/owner/glance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The owner's world: count segments, today's completions and one headline per waiting/working session
+         * @description Human only: an Agent (a seat, or a Human token narrowed to one) is stopped by the route middleware with `agent-route`, and a Bot credential is refused with 403 `owner-only`. The scope is Main's lineage subtree plus the sessions the owner opened by hand (home.md §5.3). At most 50 rows in each of `waiting` and `working`; the `more` counters carry the overflow. `tzOffsetMinutes` is the owner's local offset east of UTC (`-Date().getTimezoneOffset()`), used only for `counts.doneToday`. Headline text is redacted untrusted data.
+         */
+        get: operations["ownerGlance"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/owner/notices": {
         parameters: {
             query?: never;
@@ -2889,6 +2909,11 @@ export interface components {
             readonly chapterCause?: string | null;
             connectivity: string;
             createdAt?: string;
+            /**
+             * @description Origin of the device that created the chain ROOT (home.md §5.3): `human`, `bot`, `agent` or `hub`, or the upgrade backfill's `legacy`. A resume or continuation inherits its predecessor's stamp, so `agent` means dispatched by an Agent and a parent alone does not. Absent only on an unclassified pre-upgrade row.
+             * @enum {string}
+             */
+            readonly creatorOrigin?: "human" | "bot" | "agent" | "hub" | "legacy";
             cwd?: string | null;
             delegation?: string | null;
             driver: string;
@@ -3440,6 +3465,10 @@ export interface components {
             paths: string[];
             projectId: string;
             taskId: string;
+        };
+        /** @description Generated shape: OwnerGlance in crates/remuda-protocol/schema/protocol.schema.json. */
+        OwnerGlance: {
+            [key: string]: unknown;
         };
         /** @description One `owner notify` claim row (D-060 §11.5): what the seat (or the owner's own device) told the owner. Title and body are the writer's text. */
         OwnerNotice: {
@@ -7383,6 +7412,31 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    ownerGlance: {
+        parameters: {
+            query?: {
+                /** @description Minutes east of UTC for the local-day 今日完成 count (default 0, clamped to ±14 h). */
+                tzOffsetMinutes?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner glance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerGlance"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     ownerNotices: {

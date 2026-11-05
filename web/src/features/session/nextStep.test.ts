@@ -314,3 +314,50 @@ describe("nextStep — precedence", () => {
     expect(nextStep(instance({ activity: known("idle") }), answered).tone).toBe("idle");
   });
 });
+
+/**
+ * [r6 item 2] A list row passes the glance's live phrase (a running workflow
+ * and its phase, else the last assistant line) as `summary`. It feeds only a
+ * working row: every structured source above it keeps winning, kind by kind.
+ */
+describe("nextStep — the glance phrase never outranks a structured source", () => {
+  const phrase = "assistant line from the glance";
+
+  it("workflow: a working row says the workflow phase it is given", () => {
+    expect(nextStep(instance({ activity: known("working") }), null, undefined, "Workflow wf-native-demo · phase Review"))
+      .toEqual({ text: "Workflow wf-native-demo · phase Review", tone: "working", detail: null });
+  });
+
+  it("approval: the pending request's description beats the phrase", () => {
+    expect(nextStep(instance({ activity: known("waiting-interaction") }), approval, undefined, phrase).text).toBe(
+      "rm -rf /tmp/coord-media",
+    );
+  });
+
+  it("question: the form and its field count beat the phrase", () => {
+    expect(nextStep(instance({ activity: known("waiting-interaction") }), question, undefined, phrase).text).toBe(
+      "AskUserQuestion · 2 题待回答",
+    );
+  });
+
+  it("turn-failed: an idle row with a failed turn keeps the idle sentence (the failure is a queue card)", () => {
+    const failed = instance({ activity: known("idle"), lastTurnError: { at: "2026-09-19T00:00:00.000Z", text: "overloaded" } });
+    expect(nextStep(failed, null, undefined, phrase)).toEqual({
+      text: "回合结束、进程仍在 · 可继续发送",
+      tone: "idle",
+      detail: null,
+    });
+  });
+
+  it("working: the phrase when there is one, the constant when there is none", () => {
+    const running = instance({ activity: known("working") });
+    expect(nextStep(running, null, undefined, phrase).text).toBe(phrase);
+    expect(nextStep(running, null, undefined, undefined).text).toBe("运行中…");
+  });
+
+  it("idle: the constant, whatever the phrase", () => {
+    expect(nextStep(instance({ activity: known("idle") }), null, undefined, phrase).text).toBe(
+      "回合结束、进程仍在 · 可继续发送",
+    );
+  });
+});

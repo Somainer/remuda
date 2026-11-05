@@ -16065,6 +16065,147 @@
       ],
       "type": "object"
     },
+    "OwnerGlance": {
+      "description": "`GET /v1/owner/glance`: the owner's world as one read-only projection —\nMain's lineage subtree plus the sessions the owner opened by hand.",
+      "properties": {
+        "counts": {
+          "$ref": "#/$defs/OwnerGlanceCounts",
+          "description": "The §5.1/§5.2 count segments."
+        },
+        "doneUnseenIds": {
+          "description": "The sessions `counts.doneUnseen` counted (◉), newest first, at most\n[`OWNER_GLANCE_ROW_CAP`]. ⑤ 刚完成 lists exactly these, so the section\nand the segment are one set at every width (home.md §7).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "generatedAt": {
+          "description": "When the glance was rendered (UTC RFC3339).",
+          "type": "string"
+        },
+        "more": {
+          "$ref": "#/$defs/GlanceMore",
+          "description": "Rows beyond the caps."
+        },
+        "timezoneOffsetMinutes": {
+          "description": "The owner's local-day offset the `doneToday` count was taken in, in\nminutes east of UTC (`-Date().getTimezoneOffset()` in the browser).",
+          "format": "int32",
+          "type": "integer"
+        },
+        "waiting": {
+          "description": "Owner-scope sessions waiting on someone, at most\n[`OWNER_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/OwnerGlanceRow"
+          },
+          "type": "array"
+        },
+        "working": {
+          "description": "Owner-scope sessions making progress, at most [`OWNER_GLANCE_ROW_CAP`].",
+          "items": {
+            "$ref": "#/$defs/OwnerGlanceRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "generatedAt",
+        "timezoneOffsetMinutes",
+        "counts",
+        "doneUnseenIds",
+        "waiting",
+        "working",
+        "more"
+      ],
+      "type": "object"
+    },
+    "OwnerGlanceCounts": {
+      "description": "The ① count segments of the owner home (home.md §5.1–§5.2).",
+      "properties": {
+        "doneToday": {
+          "description": "§5.2 今日完成: owner-scope sessions whose latest settled root turn ended\ninside the owner's local day (the caller's `tzOffsetMinutes`).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "doneUnseen": {
+          "description": "§5.2 ◉: owner-scope sessions ranked done-unseen.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "needYou": {
+          "description": "§5.1 N = the interactions really waiting on the owner plus owner-blocked\ntasks with no such interaction.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "working": {
+          "description": "§5.2 ●: owner-scope sessions ranked working.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "needYou",
+        "doneUnseen",
+        "working",
+        "doneToday"
+      ],
+      "type": "object"
+    },
+    "OwnerGlanceRow": {
+      "description": "One session row of an [`OwnerGlance`].\n\nEvery string that came from a worker, a tool or a session is untrusted\ndata; `headline` is already redacted the way the worker digest redacts.",
+      "properties": {
+        "headline": {
+          "description": "ONE deterministic sentence for the row, built from the worker digest's\nfields (pending kind and its question, the live phrase, the last turn\nresult) — never a model call, never a secret. It always has text: a\nworking row with nothing in its tail falls back to the title.",
+          "type": "string"
+        },
+        "instanceId": {
+          "description": "Instance (`ins_…`) of the session.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "What the session is doing: a pending interaction kind\n(`approval`/`question`/`plan-review`/`elicitation`) or `working`.",
+          "type": "string"
+        },
+        "phrase": {
+          "description": "A working row's structured live phrase, by the client's list-row\nrules: `Workflow <run> · phase <label>` for a running workflow, else\nthe last assistant line, redacted and clipped like `headline`. Absent\nwhen the tail has neither, so a list row keeps its own constant rather\nthan repeating the title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "since": {
+          "description": "Seconds since the row's evidence last moved (the pending interaction's\ncreation for a waiting row, the session's update for a working row).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "taskId": {
+          "description": "Bound task (`tsk_…`), when the session carries one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Display title (the session's title, redacted and clipped).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "instanceId",
+        "kind",
+        "headline"
+      ],
+      "type": "object"
+    },
     "Ownership": {
       "description": "Ownership wire values; `protocol.md` §2.3.",
       "oneOf": [

@@ -31,6 +31,18 @@ pub fn origin(device: &Device) -> InputOrigin {
     }
 }
 
+/// The authenticated origin as the wire spelling (`human` / `bot` / `agent` /
+/// `hub`), for the Hub-stamped `instances.creator_origin` column
+/// (home-glance-d060, home.md §5.3).
+pub fn origin_wire(device: &Device) -> &'static str {
+    match origin(device) {
+        InputOrigin::Human => "human",
+        InputOrigin::Bot => "bot",
+        InputOrigin::Agent => "agent",
+        InputOrigin::Hub => "hub",
+    }
+}
+
 /// cb-requested-by: add the owner's own words to every `requestedBy` record in
 /// `docs`, for a Human caller only.
 ///

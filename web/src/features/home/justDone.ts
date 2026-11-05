@@ -1,45 +1,33 @@
-import type { Instance } from "../../types/instance";
-import { liveChildParents, rank } from "../mobile/homeRows";
-import { showsDoneUnseen } from "./glance";
+import type { OwnerGlance } from "../../types/generated";
+import type { Id } from "../../types/wire";
 
 /** Rows the section paints before 「+N」 (home.md §7, §9). */
 export const JUST_DONE_SHOWN = 3;
 
 export type JustDone = {
-  /** Every qualifying row, newest first. */
-  rows: Instance[];
+  /** Every listed session, newest first: the glance's ◉ set. */
+  rows: Id[];
   /** The first {@link JUST_DONE_SHOWN} of them. */
-  shown: Instance[];
-  /** How many rows sit behind 「+N」. */
+  shown: Id[];
+  /** How many of the ◉ count sit behind 「+N」 while the section is folded. */
   overflow: number;
+  /** The ◉ count itself, which the heading names. */
   total: number;
 };
 
 /**
- * ⑤ 刚完成 (home.md §7). The rows that rank done-unseen and that this surface
- * lists, newest first — the same rank and the same current-chapter rule the
- * ◉ count uses, so the section and the segment cannot disagree.
+ * ⑤ 刚完成 (home.md §7). EXACTLY the sessions the ◉ segment counted: the owner
+ * glance's `doneUnseenIds` (newest first) under its `counts.doneUnseen`. Both
+ * placements read the same set, so the section and the segment agree at every
+ * width. It is never a second derivation over the instance list, which spans
+ * more than the owner scope.
  *
- * `listed` narrows to the rows the surface shows: desktop passes top-level
- * sessions, the phone ledger keeps the default (every session).
+ * The list stops at the Hub's row cap while the count stays the total, so the
+ * total is never smaller than the list.
  */
-export function justDoneRows(
-  instances: readonly Instance[],
-  listed: (instance: Instance) => boolean = () => true,
-): JustDone {
-  const childLive = liveChildParents(instances);
-  const rows = instances
-    .filter((instance) => listed(instance))
-    .filter((instance) => rank(instance, childLive.has(instance.id)) === "done-unseen")
-    .filter((instance) => showsDoneUnseen(instance, instances))
-    .sort((a, b) => {
-      const time = (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0);
-      return time !== 0 ? time : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    });
-  return {
-    rows,
-    shown: rows.slice(0, JUST_DONE_SHOWN),
-    overflow: Math.max(0, rows.length - JUST_DONE_SHOWN),
-    total: rows.length,
-  };
+export function justDoneRows(glance: Pick<OwnerGlance, "counts" | "doneUnseenIds"> | null): JustDone {
+  const rows = (Array.isArray(glance?.doneUnseenIds) ? glance.doneUnseenIds : []) as Id[];
+  const total = Math.max(glance?.counts.doneUnseen ?? 0, rows.length);
+  const shown = rows.slice(0, JUST_DONE_SHOWN);
+  return { rows, shown, overflow: Math.max(0, total - shown.length), total };
 }

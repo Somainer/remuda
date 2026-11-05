@@ -147,6 +147,10 @@ test.describe("desktop seat profile", () => {
     await expect(bar.getByTestId("main-resume")).toBeVisible({ timeout: 20_000 });
     await bar.getByTestId("main-resume").click();
     await expect(bar.getByTestId("main-status-chapter")).toHaveText("第 2 章", { timeout: 30_000 });
+    // The status line names chapter 2 before 恢复 navigates to its page.
+    await page.waitForURL((url) => url.pathname.startsWith("/s/") && !url.pathname.includes(firstId), {
+      timeout: 30_000,
+    });
     const secondId = page.url().match(/\/s\/([^/]+)/)?.[1];
     expect(secondId).toBeTruthy();
     expect(secondId).not.toBe(firstId);

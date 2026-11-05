@@ -142,3 +142,19 @@ it("re-seeds from the current generation after a conflict", async () => {
   await hubStore.setModel("ins_cfg_reseed", "haiku");
   expect(seen).toEqual([undefined, 5, 9]);
 });
+
+it("a permission switch names and records the generation like any configure", async () => {
+  const seen: (number | undefined)[] = [];
+  let n = 0;
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _mode, extras) => {
+    seen.push(extras?.expectedGeneration);
+    n += 1;
+    return result(20 + n);
+  });
+  await hubStore.setModel("ins_cfg_perm", "opus");
+  await hubStore.setPermission("ins_cfg_perm" as Id, "acceptEdits");
+  await hubStore.setModel("ins_cfg_perm", "sonnet");
+  // Without the permission answer recorded, the last one would name 21 and
+  // the Hub (now at 22) would answer a spurious 409.
+  expect(seen).toEqual([undefined, 21, 22]);
+});

@@ -9104,8 +9104,9 @@ class HubStore {
     try {
       // Configure with permission only (no effort/model): the Node forwards it
       // as a ModelSwitch carrying permissionMode, which the PTY driver turns
-      // into a shift+tab wheel walk.
-      await api.instanceConfigure(instanceId, this.permissionModeOf(instanceId), {
+      // into a shift+tab wheel walk. It is a configure like any other, so it
+      // carries and records the runtime-config generation (cb-command-queue).
+      await this.configureWithGeneration(instanceId, this.permissionModeOf(instanceId), {
         permissionMode: mode,
       });
     } catch (error) {

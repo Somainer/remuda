@@ -605,6 +605,26 @@ fn remove_leaf(containment: &Containment) {
     }
 }
 
+/// What the sweep established, in words that claim no more than it did: an
+/// incomplete sweep left processes live, and each containment has its own
+/// residual (see [`contain`]).
+fn swept_summary(label: Label, incomplete: bool) -> String {
+    if incomplete {
+        return format!(
+            "its processes were swept ({}), but some were still live when the sweep stopped",
+            label.as_str()
+        );
+    }
+    let residual = match label {
+        Label::Cgroup => "a process that moved itself out of its cgroup could have escaped",
+        Label::Subreaper => {
+            "a process that killed its supervisor and cleared its environment could have escaped"
+        }
+        Label::ProcessGroup => "a process that left its process group could have escaped",
+    };
+    format!("its processes were swept ({}); {residual}", label.as_str())
+}
+
 /// Run one check: `sh -n`, then the command under `timeout`, contained.
 pub(crate) async fn run_check(
     command: &str,
@@ -716,9 +736,9 @@ pub(crate) async fn run_check(
                 stdout,
                 stdout_truncated,
                 summary: format!(
-                    "timed out after {} s; its processes were swept ({})",
+                    "timed out after {} s; {}",
                     timeout.as_secs(),
-                    label.as_str()
+                    swept_summary(label, incomplete)
                 ),
                 containment: Some(label),
                 containment_incomplete: incomplete,
@@ -730,8 +750,10 @@ pub(crate) async fn run_check(
                 containment_incomplete: incomplete,
                 ..CheckRun::without_output(
                     WakeCheckOutcome::Unavailable,
-                    "its exit was not seen (its supervisor shell ended first); its processes \
-                     were swept",
+                    format!(
+                        "its exit was not seen (its supervisor shell ended first); {}",
+                        swept_summary(label, incomplete)
+                    ),
                 )
             };
         }
@@ -1333,6 +1355,19 @@ mod tests {
             extra.join("src").canonicalize().unwrap()
         );
         node.shutdown().await.unwrap();
+    }
+
+    /// r4: the summary never claims more than the sweep established.
+    #[test]
+    fn the_swept_summary_follows_the_sweep() {
+        let incomplete = swept_summary(Label::Subreaper, true);
+        assert!(incomplete.contains("still live"), "{incomplete}");
+        for label in [Label::Cgroup, Label::Subreaper, Label::ProcessGroup] {
+            let complete = swept_summary(label, false);
+            assert!(complete.contains(label.as_str()), "{complete}");
+            assert!(complete.contains("could have escaped"), "{complete}");
+            assert!(!complete.contains("every process"), "{complete}");
+        }
     }
 
     #[test]

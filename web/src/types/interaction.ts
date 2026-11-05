@@ -1,4 +1,4 @@
-import type { RequestedBy, RootTurn } from "./generated";
+import type { RequestedBy, RootTurn, RoutedTo } from "./generated";
 import type { NativeRequestKey } from "./nativeRef";
 import type { ActorRef, Digest, EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
 
@@ -109,4 +109,12 @@ export type Interaction = EntityMeta & {
    * that started the turn. Display only; the decision never reads it.
    */
   requestedBy?: RequestedBy | null;
+  /**
+   * D-061 routed-to: who the item waits on, stamped by the Hub from the push
+   * decision (D-057 §8.1). `main`/`agent`: the owner was not paged, so the
+   * item is not in 「需要你」, N, the badge or the inbox nav count. Read it
+   * through `routedAway()`: a missing or unknown value (an older or a newer
+   * Hub) is `owner`, so the client degrades to today's queue.
+   */
+  routedTo?: RoutedTo | null;
 };

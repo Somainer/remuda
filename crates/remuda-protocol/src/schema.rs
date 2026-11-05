@@ -444,6 +444,7 @@ pub fn schema_document() -> Value {
         RegistrySnapshot,
         RepositoryRef,
         ResolutionState,
+        RoutedTo,
         ResourceBlock,
         ResultStage,
         ResumeCursor,

@@ -19156,6 +19156,26 @@
         }
       ]
     },
+    "RoutedTo": {
+      "description": "Who a pending interaction waits on, as the Hub stamps it on every\n`GET /v1/interactions` item (D-061 `routedTo`, home.md §5.1). `main` and\n`agent` mean the owner push was withheld because the item was routed to a\nrunning Agent parent (D-057 §8.1): Main's lineage, or another one. A\nclient reads a missing or unknown value as `owner`.",
+      "oneOf": [
+        {
+          "const": "owner",
+          "description": "Wire value `owner`: waiting on the owner (the default).",
+          "type": "string"
+        },
+        {
+          "const": "main",
+          "description": "Wire value `main`: routed to the running `address-owner` lineage.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "Wire value `agent`: routed to another running Agent parent.",
+          "type": "string"
+        }
+      ]
+    },
     "RpcError": {
       "description": "RpcError; `protocol.md` §9.1.",
       "properties": {

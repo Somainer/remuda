@@ -888,9 +888,18 @@ fn node_hello_frame(
                 // every non-route spec then hits api-via-unsupported exactly
                 // as a pre-D-048 Node would.
                 "apiRelay": std::env::var("HUB_E2E_API_ROUTE").as_deref() == Ok("1"),
+                // c-routedto: D-057 lineage fences, so a continuity seat may
+                // dispatch a child here (an Agent-origin create on a Node
+                // without them is 409 node-lacks-fence). Absent by default —
+                // every other spec keeps today's fence-less Node.
+                "lineageFence": lineage_fence_enabled(),
             }
         }
     })
+}
+
+fn lineage_fence_enabled() -> bool {
+    std::env::var("HUB_E2E_LINEAGE_FENCE").as_deref() == Ok("1")
 }
 
 /// Methods whose replies park while the e2e gate file exists. They are the
@@ -1749,6 +1758,36 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-routedto: a worker question the Hub can ROUTE. D-057
+                    // §8.1 decides from the durable row, so the card is
+                    // journaled (as a real Node does) and also held in the
+                    // live broker; a child of a running Main is then
+                    // `routedTo: "main"` with the D-051 switch on.
+                    if prompt.contains("routedto-question") {
+                        let iid = InteractionId::new();
+                        let card = fake_single_question(&instance_id, host, iid.as_id().as_str());
+                        append_n = append_interaction_requested(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &card,
+                        )
+                        .await?;
+                        pending
+                            .lock()
+                            .await
+                            .insert(iid.as_id().as_str().to_string(), card);
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // c-cardsettle: a genuinely live hook approval with an
                     // UNKNOWN deadline (nothing client-side can retire it),
                     // enabled only with HUB_E2E_CARDSETTLE=1. The spec ends
@@ -1874,9 +1913,13 @@ async fn fake_node(
                     // (a working session, an idle row) raise no interaction,
                     // so the matrix never depends on an answer RPC crossing
                     // the Node link. Showcase Node only.
-                    let cardless = profile.showcase
+                    // c-routedto: the Main seat that routed questions go to
+                    // asks nothing itself, so the owner's count moves only
+                    // with the worker's question.
+                    let cardless = (profile.showcase
                         && (prompt.contains("hshowcase-working")
-                            || prompt.contains("hshowcase-idle"));
+                            || prompt.contains("hshowcase-idle")))
+                        || prompt.contains("routedto-seat");
                     let card = if cardless {
                         Value::Null
                     } else if prompt.contains("ask-question-deadline") {
@@ -3504,6 +3547,21 @@ async fn fake_node(
                             "worktreeRemoved": true,
                             "targetRemoved": true,
                             "reclaimedBytes": "2048",
+                        }),
+                    )
+                    .await?;
+                }
+                // c-routedto: acknowledge a lineage fence the way a Node that
+                // holds nothing for it does (no PTY writes, no direct ops in
+                // flight), so a pause or close of the seat completes.
+                "lineage.fence" if lineage_fence_enabled() => {
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "fenceId": params.get("fenceId").cloned().unwrap_or(Value::Null),
+                            "closedInstanceIds": [],
+                            "outcomes": [],
                         }),
                     )
                     .await?;

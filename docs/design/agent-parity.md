@@ -45,7 +45,7 @@ Two limits recur below:
 | Send keys from the list | commands, `instance.keys` | Safety. Keystrokes: every Agent `instance.keys` needs the D-017 approval | — |
 | Close a session from the list or a space tab | commands, `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Resume a session (list, phone home, session page) | `POST /v1/instances/{id}/resume` | Workers: Agent route by another path, `POST /v1/workers/{id}/resume` (the scoped respawn helper: `dispatch`, project scope, lineage-subtree ownership, the creator rule, and the D-017 approval for a shell-driver carrier; main-agent.md §4.2 item 5). Any other instance: Gap. The public route is operator-only (D-026) | Other owned instances: `ap-resume`. Main's own Resume stays a Human control (§6.5) |
-| Search the transcripts (the session list's search box) | `GET /v1/search`, `GET /v1/search/status` | Agent route (`cb-search`). Hits only from instances whose journal the caller may read (`owns()`), joined in the query; the status route omits the Hub-wide counts for Agent origin | — |
+| Search the transcripts (the 「会话记录」 card under the session list's filter) | `GET /v1/search`, `GET /v1/search/status` | Agent route (`cb-search`). Hits only from instances whose journal the caller may read (`owns()`), joined in the query; the status route omits the Hub-wide counts for Agent origin | — |
 | Delete a session (spaces panel) | `DELETE /v1/instances/{id}` | Safety. Records are truthful: the record and journal are the evidence of what agents did. Operator-only (`delete_instance`) | — |
 
 ### Session (`/s/:id` and its tabs)

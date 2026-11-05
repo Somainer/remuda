@@ -776,3 +776,144 @@ fn snippets_are_bounded_and_centred_on_the_match() {
     );
     assert_eq!(clip_chars(&"x".repeat(500), 200).chars().count(), 200);
 }
+
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((pct / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+fn file_bytes(dir: &Path) -> u64 {
+    ["hub.sqlite", "hub.sqlite-wal"]
+        .iter()
+        .filter_map(|name| std::fs::metadata(dir.join(name)).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Measurement, not a gate (cb-search): point `REMUDA_SEARCH_BENCH_DIR` at a
+/// directory holding a COPY of a large `hub.sqlite` below the search rung.
+/// The test migrates it, backfills through the writer as the Hub does,
+/// then times queries and appends, and prints the numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement; needs REMUDA_SEARCH_BENCH_DIR"]
+async fn bench_backfill_query_and_append_on_a_large_journal() {
+    let Some(dir) = std::env::var_os("REMUDA_SEARCH_BENCH_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let before = file_bytes(&dir);
+    let opened = Instant::now();
+    let store = Store::open(&dir).unwrap();
+    println!("open+migrate ms={}", opened.elapsed().as_millis());
+    let status = store.journal_search_status(true).await.unwrap();
+    println!(
+        "before: bytes={before} journal_rows={:?} docs={:?} state={:?}",
+        status.journal_rows, status.docs, status.state
+    );
+    // Backfill, timed per writer job.
+    let started = Instant::now();
+    let mut batch_ms = Vec::new();
+    let (mut scanned, mut indexed) = (0usize, 0usize);
+    loop {
+        let t = Instant::now();
+        let step = store
+            .journal_search_backfill_batch(BACKFILL_BATCH_ROWS)
+            .await
+            .unwrap();
+        batch_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        scanned += step.scanned;
+        indexed += step.indexed;
+        if step.done {
+            break;
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    batch_ms.sort_by(f64::total_cmp);
+    println!(
+        "backfill: rows={scanned} indexed={indexed} batches={} secs={secs:.1} rows_per_sec={:.0} \
+         batch_ms p50={:.1} p95={:.1} max={:.1}",
+        batch_ms.len(),
+        scanned as f64 / secs,
+        percentile(&batch_ms, 50.0),
+        percentile(&batch_ms, 95.0),
+        batch_ms.last().copied().unwrap_or(0.0)
+    );
+    let db = Connection::open(dir.join("hub.sqlite")).unwrap();
+    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    let after = file_bytes(&dir);
+    println!(
+        "growth: before={before} after={after} delta={} ({:.1}%)",
+        after - before,
+        (after - before) as f64 * 100.0 / before as f64
+    );
+    // Queries: the owner's world and one seat's lineage.
+    let (seat, host): (String, String) = db
+        .query_row(
+            "SELECT id, host_id FROM instances
+              WHERE COALESCE(lineage_id, id) = id
+                AND json_extract(spec_json, '$.parentInstanceId') IS NULL
+              ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    for query in [
+        "journal",
+        "supervisor restart",
+        "fence generation lineage",
+        "quartermaster",
+        "迁移",
+        "id",
+        "边界 条件",
+    ] {
+        for (who, scope) in [("human", human()), ("agent", agent(&seat))] {
+            let mut ms = Vec::new();
+            let mut hits = 0;
+            let mut partial = false;
+            for _ in 0..15 {
+                let t = Instant::now();
+                let result = store
+                    .journal_search(scope.clone(), query.to_string(), 20, QUERY_BUDGET)
+                    .await
+                    .unwrap();
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                hits = result.hits.len();
+                partial |= result.partial;
+            }
+            ms.sort_by(f64::total_cmp);
+            println!(
+                "query {who:5} {query:28} hits={hits:2} partial={partial} p50_ms={:.1} p95_ms={:.1}",
+                percentile(&ms, 50.0),
+                percentile(&ms, 95.0)
+            );
+        }
+    }
+    // Append overhead: the same path and payload size, indexed (a message's
+    // complete form) versus not (a thought).
+    let text = "The supervisor restarts the chapter when the lineage fence moves; \
+                migration 0042 rolls back the journal index ";
+    let mut per_kind = Vec::new();
+    for kind in ["thought", "message", "thought", "message"] {
+        let t = Instant::now();
+        for n in 0..1000 {
+            let mut event = message(
+                &format!("bench-{kind}-{n}-{}", per_kind.len()),
+                "close",
+                "assistant",
+                text,
+            );
+            event["kind"] = json!(kind);
+            store
+                .append_journal(host.clone(), seat.clone(), None, event)
+                .await
+                .unwrap();
+        }
+        per_kind.push((kind, t.elapsed().as_secs_f64() * 1000.0 / 1000.0));
+    }
+    for (kind, ms) in &per_kind {
+        println!("append {kind:8} ms_per_event={ms:.3}");
+    }
+}

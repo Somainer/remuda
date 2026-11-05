@@ -2323,7 +2323,7 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 
 **「排队中」即「尚未送达」。** 只有能证明命令还没到达 harness 时才允许编辑与撤回，两种情形：
 - `held: "hub"`：Hub 行 `state=queued` 且 `forwarded=0`（host 离线、fence 未确认、排在 owner 输入之后等）。编辑与撤回在 Hub 的串行 writer 里对 `forwarded=0` 做 CAS；转发的 intent 标记（`mark_forward_intent*`）在同一个 writer 里只对仍为 `queued` 的行生效，所以撤回与转发恰好一方获胜：撤回在先，行结算为 `withdrawn`，转发看到它已结算就什么也不写；转发在先，撤回得 409。转发在 intent 标记之后重读行内容，所以编辑后的文本是唯一可能发出的版本。
-- `held: "node"`：PTY 承载在实例忙时把已接纳的 prompt 留在 Node 的投递队列里，此时 Hub 行为 `accepted`、未结算。编辑与撤回经 Node 的 `command.edit` / `command.withdraw`（§7.2 2026-11-05 补），Node 对投递声明做先到先得的 CAS。Node 未声明 `capabilities.heldInput`、host 离线、或 Node 答 `already-delivered` 时，Hub 回 409 `already-delivered`。附件已在 Node 接纳时登记，所以 Node 持有的 prompt 只能改文本。
+- `held: "node"`：PTY 承载在实例忙时把已接纳的 prompt 留在 Node 的投递队列里，此时 Hub 行为 `accepted`、未结算。编辑与撤回经 Node 的 `command.edit` / `command.withdraw`（§7.2 2026-11-05 补），Node 对投递声明做先到先得的 CAS。Node 未声明 `capabilities.heldInput`、host 离线、或 Node 答 `already-delivered` 时，Hub 回 409 `already-delivered`。附件已在 Node 接纳时登记，所以 Node 持有的 prompt 只能改文本。撤回前 Hub 先把撤回意图（调用方）记在行上：Node 的答复丢失时调用方得 409 `already-delivered`，但 Node 之后报告该 prompt `cancelled` 且未派发（`not-dispatched`）时，行结算为 `withdrawn`，`withdrawnBy` 为记下的调用方，再撤回一次返回该行；Node 明确答「已在投递」时意图清除。
 - 其余（已转发且没有 Node 的证据、已结算）一律 409 `already-delivered`，带 `next`；Hub 从不猜测。
 
 | 路由 | 请求 | 结果 |

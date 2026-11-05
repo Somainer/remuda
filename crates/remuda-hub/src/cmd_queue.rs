@@ -79,6 +79,10 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "commands", "original_payload_json", "TEXT")?;
     ensure_column(conn, "commands", "queued_by_device_id", "TEXT")?;
     ensure_column(conn, "commands", "withdrawn_by_json", "TEXT")?;
+    // The actor of a Node-held withdrawal asked of the Node, written before
+    // the call: a lost reply still settles `withdrawn` with this actor when
+    // the Node reports the prompt cancelled and never dispatched.
+    ensure_column(conn, "commands", "withdraw_intent_json", "TEXT")?;
     // `{prior, set}`: the values a configure replaced and the ones it set,
     // so withdrawing it restores exactly the fields it still holds.
     ensure_column(conn, "commands", "config_prior_json", "TEXT")?;
@@ -849,7 +853,7 @@ pub(crate) fn withdraw_queued(
     Ok(row)
 }
 
-fn release_memory_line(
+pub(crate) fn release_memory_line(
     conn: &Connection,
     instance_id: &str,
     command_id: &str,
@@ -954,6 +958,29 @@ async fn withdraw_on_node(
     {
         return Err(HubError::revision_conflict(&command_id, owned.row.revision));
     }
+    // The intent first, so a reply lost after the Node withdrew the prompt
+    // still ends `withdrawn` with this actor (`settle_withdraw_intent`).
+    let (id, intent) = (command_id.clone(), by.to_string());
+    let earlier_intent = state
+        .store
+        .run_named("mark_withdraw_intent", move |conn| {
+            let earlier = conn
+                .query_row(
+                    "SELECT withdraw_intent_json IS NOT NULL FROM commands WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            conn.execute(
+                "UPDATE commands SET withdraw_intent_json = ?1
+                  WHERE id = ?2 AND state <> 'settled'",
+                params![intent, id],
+            )?;
+            Ok(earlier)
+        })
+        .await
+        .map_err(map_store)?;
     let answer = state
         .nodes
         .call(
@@ -969,7 +996,30 @@ async fn withdraw_on_node(
     match answer {
         Ok(Some(frame))
             if frame.pointer("/result/outcome").and_then(Value::as_str) == Some("withdrawn") => {}
-        _ => return Err(HubError::not_queued(&command_id)),
+        // The frame went out and no answer came back: the Node may have
+        // withdrawn it. The intent stays; the Node's settlement decides.
+        Err(_) => return Err(HubError::not_queued(&command_id)),
+        // The Node's own no (or the frame never left). An intent an earlier,
+        // unanswered attempt left stays: the Node drops a withdrawn prompt on
+        // its next tick and answers no from then on.
+        _ => {
+            if !earlier_intent {
+                let id = command_id.clone();
+                state
+                    .store
+                    .run_named("clear_withdraw_intent", move |conn| {
+                        conn.execute(
+                            "UPDATE commands SET withdraw_intent_json = NULL
+                              WHERE id = ?1 AND state <> 'settled'",
+                            params![id],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(map_store)?;
+            }
+            return Err(HubError::not_queued(&command_id));
+        }
     }
     let id = command_id.clone();
     let instance_id = owned.instance.instance_id.clone();
@@ -1002,6 +1052,35 @@ async fn withdraw_on_node(
         })
         .await
         .map_err(map_store)
+}
+
+/// The Node's settlement of a prompt it held, inside the projection's writer
+/// job: a `cancelled`, never-dispatched prompt whose withdrawal was asked of
+/// the Node is the withdrawal, whether or not its reply reached the Hub.
+/// Returns the outcome to store and the actor to record.
+pub(crate) fn settle_withdraw_intent(
+    conn: &Connection,
+    command_id: &str,
+    instance_id: &str,
+    outcome: &str,
+    not_dispatched: bool,
+) -> Result<Option<String>, StoreError> {
+    if outcome != "cancelled" || !not_dispatched {
+        return Ok(None);
+    }
+    let intent: Option<String> = conn
+        .query_row(
+            "SELECT withdraw_intent_json FROM commands WHERE id = ?1 AND state <> 'settled'",
+            params![command_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if intent.is_some() {
+        // D-060: as for any withdrawal, the line never reached the chapter.
+        release_memory_line(conn, instance_id, command_id)?;
+    }
+    Ok(intent)
 }
 
 // ── runtime config and its generation ──────────────────────────────────────

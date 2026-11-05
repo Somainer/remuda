@@ -137,6 +137,10 @@ async fn connect_node(
                 continue;
             };
             script.frames.lock().unwrap().push(frame.clone());
+            // `drop`: the Node withdraws it, and the reply is lost.
+            if method == "command.withdraw" && *script.withdraw.lock().unwrap() == "drop" {
+                continue;
+            }
             let result = match method.as_str() {
                 "command.withdraw" => json!({
                     "commandId": frame["params"]["commandId"],
@@ -709,6 +713,74 @@ async fn node_held_prompts_are_edited_and_withdrawn_through_the_node() -> Result
     assert_eq!(status, 200, "{withdrawn}");
     assert_eq!(withdrawn["command"]["settlement"]["outcome"], "withdrawn");
     assert!(ctx.list(&main, "mine=1").await?.is_empty());
+    Ok(())
+}
+
+/// The Node withdrew a held prompt but its reply was lost: the caller hears
+/// 409, yet the intent recorded before the call makes the Node's later
+/// `cancelled` (never dispatched) settle `withdrawn` with that actor, and a
+/// retry returns the withdrawn row.
+#[tokio::test]
+async fn a_lost_node_withdraw_reply_still_settles_withdrawn_with_its_actor() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project().await?;
+    let (main_id, main) = ctx.coordinator(&project).await?;
+    let worker = ctx.worker(&main, &project, "claude-pty").await?;
+    let (held, sent) = ctx.send(&main, &worker, "behind a turn").await?;
+    assert_eq!(sent["command"]["state"], "accepted", "{sent}");
+
+    *ctx.script.withdraw.lock().unwrap() = "drop";
+    let (status, lost) = ctx.withdraw(&main, &held).await?;
+    assert_eq!(status, 409, "{lost}");
+    assert_eq!(lost["reason"], "already-delivered");
+    // The Node's next tick drops the withdrawn prompt and settles it.
+    ctx.journal(
+        &worker,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "command", "entityId": held,
+            "state": "settled",
+            "entity": { "commandId": held, "state": "settled",
+                        "settlement": { "state": "known", "value": {
+                            "outcome": "cancelled",
+                            "error": { "message": "withdrawn", "execution": "not-dispatched" } } } } } }),
+    )
+    .await?;
+    *ctx.script.withdraw.lock().unwrap() = "already-delivered";
+    let (status, retried) = ctx.withdraw(&main, &held).await?;
+    assert_eq!(status, 200, "{retried}");
+    assert_eq!(retried["command"]["settlement"]["outcome"], "withdrawn");
+    assert_eq!(
+        retried["command"]["settlement"]["withdrawnBy"],
+        json!({ "origin": "agent", "instanceId": main_id }),
+        "{retried}"
+    );
+    assert_eq!(ctx.script.received("command.withdraw").len(), 1);
+
+    // A prompt the Node refused to withdraw (it was delivering) and that is
+    // later cancelled for another reason is not relabelled a withdrawal.
+    let (other, _) = ctx.send(&main, &worker, "already going out").await?;
+    let (status, _) = ctx.withdraw(&main, &other).await?;
+    assert_eq!(status, 409);
+    ctx.journal(
+        &worker,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "command", "entityId": other,
+            "state": "settled",
+            "entity": { "commandId": other, "state": "settled",
+                        "settlement": { "state": "known", "value": {
+                            "outcome": "cancelled",
+                            "error": { "message": "interrupted", "execution": "not-dispatched" } } } } } }),
+    )
+    .await?;
+    let (_, rows) = ctx
+        .get(&ctx.human, &format!("/v1/instances/{worker}/commands"))
+        .await?;
+    let row = rows["commands"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["commandId"] == other.as_str()))
+        .cloned()
+        .with_context(|| format!("{rows}"))?;
+    assert_eq!(row["settlement"]["outcome"], "cancelled", "{row}");
     Ok(())
 }
 

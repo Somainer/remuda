@@ -9786,13 +9786,35 @@ fn apply_command_projection(
                 .pointer("/entity/settlement/value/error/execution")
                 .and_then(Value::as_str)
                 == Some("not-dispatched");
+            // cb-command-queue: a held prompt withdrawn through the Node whose
+            // reply was lost settles `withdrawn` with the recorded actor.
+            let withdrawn_by = crate::cmd_queue::settle_withdraw_intent(
+                conn,
+                command_id,
+                instance_id,
+                outcome,
+                not_dispatched,
+            )?;
+            let outcome = if withdrawn_by.is_some() {
+                "withdrawn"
+            } else {
+                outcome
+            };
             conn.execute(
                 "UPDATE commands
                  SET state = 'settled', resolution = 'clear',
                      settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3,
-                     settlement_not_dispatched = ?5
+                     settlement_not_dispatched = ?5,
+                     withdrawn_by_json = COALESCE(?6, withdrawn_by_json)
                  WHERE id = ?4 AND state != 'settled'",
-                params![outcome, reason, now, command_id, not_dispatched],
+                params![
+                    outcome,
+                    reason,
+                    now,
+                    command_id,
+                    not_dispatched,
+                    withdrawn_by
+                ],
             )?;
         }
         _ => {}

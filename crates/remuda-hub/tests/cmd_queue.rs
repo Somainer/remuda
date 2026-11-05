@@ -98,7 +98,7 @@ async fn connect_node(
             "params": {
                 "hostId": host_id,
                 "nodeVersion": "0.1.0-test",
-                "capabilities": { "lineageFence": true, "heldInput": true },
+                "capabilities": { "lineageFence": true, "heldInput": true, "memoryContext": true },
                 "label": format!("fake-{host_id}"),
                 "host": {
                     "hostname": format!("{host_id}.local"),
@@ -657,6 +657,63 @@ async fn node_held_prompts_are_edited_and_withdrawn_through_the_node() -> Result
     assert_eq!(status, 200, "{withdrawn}");
     assert_eq!(withdrawn["command"]["settlement"]["outcome"], "withdrawn");
     assert!(ctx.list(&main, "mine=1").await?.is_empty());
+    Ok(())
+}
+
+/// D-060: a Node-held send that carried the "memory changed" line and is
+/// then withdrawn or edited (the Node replaces every text block) gives the
+/// line back, so the chapter's next input carries it.
+#[tokio::test]
+async fn a_node_held_withdraw_or_edit_gives_the_memory_line_back() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let created = ctx
+        .ok(
+            &ctx.human,
+            "/v1/instances",
+            json!({ "hostId": ctx.host, "workspaceId": ctx.workspace, "kind": "claude",
+                    "driver": "claude-pty", "title": "Main", "prompt": "seat",
+                    "restart": { "onProcessLoss": true, "maxPerHour": 3 } }),
+        )
+        .await?;
+    let seat = created["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    let first_text = |command_id: &str| -> Result<Value> {
+        let sends = ctx.script.sends_of(command_id);
+        anyhow::ensure!(sends.len() == 1, "{command_id}: {sends:?}");
+        Ok(sends[0]["params"]["input"]["blocks"][0]["text"].clone())
+    };
+    let line = |rev: u64| json!(format!("记忆自本章开始已变更（rev {rev}）"));
+    *ctx.script.withdraw.lock().unwrap() = "withdrawn";
+    *ctx.script.edit.lock().unwrap() = "edited";
+    for (rev, withdraw) in [(1, true), (2, false)] {
+        ctx.ok(
+            &ctx.human,
+            &format!("/v1/lineages/{seat}/memory"),
+            json!({ "slug": format!("note-{rev}"), "type": "user", "title": "笔记",
+                    "description": "一条", "body": "body" }),
+        )
+        .await?;
+        let (held, sent) = ctx.send(&ctx.human, &seat, "carries the line").await?;
+        assert_eq!(sent["command"]["state"], "accepted", "{sent}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(first_text(&held)?, line(rev));
+        let (status, answer) = if withdraw {
+            ctx.withdraw(&ctx.human, &held).await?
+        } else {
+            ctx.edit(&ctx.human, &held, 0, "rewritten").await?
+        };
+        assert_eq!(status, 200, "{answer}");
+        let (next, _) = ctx.send(&ctx.human, &seat, "next input").await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            first_text(&next)?,
+            line(rev),
+            "the line rides the next input after the {}",
+            if withdraw { "withdrawal" } else { "edit" }
+        );
+    }
     Ok(())
 }
 

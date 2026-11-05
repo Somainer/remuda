@@ -697,10 +697,12 @@ async fn edit_on_node(
         object.insert("text".into(), json!(text));
     }
     let id = command_id.clone();
+    let instance_id = owned.instance.instance_id.clone();
     state
         .store
         .run_named("record_node_edit", move |conn| {
-            conn.execute(
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
                 "UPDATE commands
                     SET payload_json = ?1, revision = ?2,
                         original_payload_json = COALESCE(original_payload_json, payload_json),
@@ -713,7 +715,14 @@ async fn edit_on_node(
                     id
                 ],
             )?;
-            crate::store::load_command(conn, &id)?.ok_or_else(|| StoreError::NotQueued(id.clone()))
+            // D-060: the Node replaced every text block, the "memory changed"
+            // line the forward prefixed included, so the next input to the
+            // chapter carries it instead.
+            release_memory_line(&tx, &instance_id, &id)?;
+            let row = crate::store::load_command(&tx, &id)?
+                .ok_or_else(|| StoreError::NotQueued(id.clone()))?;
+            tx.commit()?;
+            Ok(row)
         })
         .await
         .map_err(map_store)
@@ -963,13 +972,15 @@ async fn withdraw_on_node(
         _ => return Err(HubError::not_queued(&command_id)),
     }
     let id = command_id.clone();
+    let instance_id = owned.instance.instance_id.clone();
     let by = by.to_string();
     state
         .store
         .run_named("record_node_withdraw", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // The Node's own `cancelled` settlement may land first through the
             // journal; the withdrawal is still what happened.
-            conn.execute(
+            let changed = tx.execute(
                 "UPDATE commands
                     SET state = 'settled', resolution = 'clear',
                         settlement_outcome = 'withdrawn', settlement_reason = NULL,
@@ -979,7 +990,15 @@ async fn withdraw_on_node(
                             AND COALESCE(settlement_reason, 'withdrawn') = 'withdrawn'))",
                 params![by, crate::config::now_rfc3339(), id],
             )?;
-            crate::store::load_command(conn, &id)?.ok_or_else(|| StoreError::NotQueued(id.clone()))
+            if changed > 0 {
+                // D-060: as for a Hub-held withdrawal, the line never reached
+                // the chapter.
+                release_memory_line(&tx, &instance_id, &id)?;
+            }
+            let row = crate::store::load_command(&tx, &id)?
+                .ok_or_else(|| StoreError::NotQueued(id.clone()))?;
+            tx.commit()?;
+            Ok(row)
         })
         .await
         .map_err(map_store)

@@ -220,6 +220,7 @@ stateDiagram-v2
 | `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
 | `mode?` / `promotedAt?` | `native\|promoted` / `Timestamp` | 该 Instance 如何到达当前 `kind`。`promoted` 表示 `terminal` + `shell-pty` 实例的 PTY 前台被已知 agent CLI 接管（D-025）：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，`promotedAt` 记录检测时刻。降级回 `terminal` 时 `mode` 复位为 `native` 且清空 `promotedAt`。只有 driver 的 `agent_promoted` / `agent_demoted` native lifecycle 能改这两个字段，同名 `agent_detected` diagnostic 只进 journal |
 | `launchedBy?` | `remuda\|user` | **谁敲的这条命令**（D-028 §1.0 规则 4）。只记录出身，**不表示能力等级**：user 启动的 session 与 remuda 启动的享有完全相同的信号与能力。D-028 之前写入的行没有这个字段，读取时由 `mode` / `promotedAt` 推导——`promoted` 意味着一个 login shell 的前台被 agent CLI 接管，那条命令只可能是人敲的，因此推导为 `user`，其余为 `remuda`。它与 `mode` 并存而不取代它：`mode` 回答「kind 是不是提升来的」，`launchedBy` 回答「谁启动的」 |
+| `herdrClaim?` | `HerdrClaim` | 仅 `driver = herdr-claimed`（D-062，[herdr-claim.md](./herdr-claim.md)）：认领的外部 herdr pane。`{session, socketPath, workspaceId, tabId, paneId, agent?, process?:{pid, command, startTicks?}, contact?:"ok"\|"lost"}`。认领不是托管：close/release 只脱离，绝不关 pane、杀进程或停 herdr server；`permissionMode` 记为 `"external"`，`launchedBy` 为 `user`。`process` 是认领的进程：agent kind 为 pane 的前台进程组 leader（不得是 shell，否则 409 `herdr-claim-not-ready`），`--kind shell` 为 shell 本身；`startTicks` 为 Linux 内核启动时间。pane 消失（`herdr-pane-gone`）或进程消失（扮演该角色的进程不再是记录的 pid + 启动时间，`herdr-process-gone`）是进程结束证据；Node 在每次 send、按键与 TTY 写入前也重新比对，不符则结束认领并丢弃该写入；`pane.process_info` 失败而 server 有应答为"未知"，拒绝写入，连续 3 次探测后以 `herdr-process-unknown` 结束；server 不可达只是失联（`contact:"lost"`），不终结实例 |
 | `unseen?` / `seenSeq?` / `turnEndSeq?` | `boolean` / `U64` / `U64` | 完成未看（seen-hub，H6，见本节末「完成未看」）。`turnEndSeq` 是最近一次结算回合结束的 journal seq，`seenSeq` 是 owner 已看到的 seq，`unseen = turnEndSeq > seenSeq`。按 owner 记，所有 owner 设备读到同一个值 |
 
 ~~~mermaid
@@ -1588,7 +1589,7 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 | `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
 | `wake.check`（cb-wake-check，D-060 §11.2） | Hub→Node | `{runId,command,timeoutSecs,workspaceId?,instanceId?,cwd?,env}` → `{runId,outcome:exited\|timed-out\|syntax\|unavailable\|no-workspace\|cwd-unusable,exitCode?,signal?,stdout,stdoutTruncated,summary,containment?:cgroup\|subreaper\|process-group,containmentIncomplete?}`。Node 先把命令从 stdin 交给 `sh -n` 预检（不用 `-c`：dash 对 `-c` 字符串忽略 `-n` 照样执行），语法错误报 `syntax`，什么也不执行；再作为一个外层 `sh` 的子进程运行。`timeoutSecs`（1..=3600）到时与检查退出后，Node 在回报前清扫它启动的进程。这是清理，不是安全边界：检查以被准入者的权限运行（r3 裁决）。实际生效的方式写在结果的 `containment` 里：`cgroup`（经 `/proc/<pid>/cgroup` 核实外层 shell 在为该检查单独建立的 cgroup v2 域 `<node>/remuda-wake-<id>/check` 的叶子里，对叶子与该域都 `cgroup.kill`，仍在其中的进程全部结束；残余：一个把自己的 pid 写进可写祖先（Node 被委托的 cgroup）`cgroup.procs` 的进程会离开二者，若它还清掉标记、分离并杀掉监管者，可以活过回报）；`subreaper`（其余 Linux：外层 shell 是 child subreaper，`setsid`、两次 fork、`nohup … &` 的孤儿都被收养；Node 杀掉全部存活后代与本用户中带检查标记 `REMUDA_WAKE_RUN=<runId>.<nonce>` 的进程，连续两次遍历为空才停，再杀所记录的进程组，外层 shell 回收后再扫一遍组与标记）；`process-group`（其他 Unix，只杀进程组）。残余限制：没有 cgroup 时，一个故意杀掉其监管者（`kill -9 $PPID`）并分离出一个同时离开进程组、清空环境（`env -i setsid …`）的进程的检查，可以活过回报；按上述裁决这不是越权。Node 在 `timeoutSecs` + `WAKE_CHECK_NODE_OVERHEAD_SECS`（30 s）内回答。stdout 至多 4096 字节（其余读掉丢弃），stderr 不读，只回退出摘要。检查只在血缘自己在该 host 上的工作区里跑：`workspaceId`，或没有它时 `instanceId`（血缘在该 host 上的章节）所在的工作区；两者都没有就回 `no-workspace`，什么也不跑，Node 绝不自选工作区（r2）。环境从零构建：Node 自己的 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`TMPDIR`、`LANG`、`LC_ALL`、`LC_CTYPE`、`TZ`、`SSH_AUTH_SOCK`（有则带），`TERM=dumb`，以及 `env` 里以 `REMUDA_WAKE_` 开头的变量（别的名字丢弃）；不带任何 Remuda 凭证。它不是任何章节的操作，不带 initiator，不经 fence |
 
-`memoryContext` 在各启动路径上的注入机制（D-060；与 [main-agent.md §12.3](./main-agent.md#123-reading) 的表一致）。它覆盖 `materialize_inner` 里 driver match 的每个分支（:239）与之前的 shell-pty agent 分支（:229），乘以 Node 的 `validate_kind_driver`（`crates/remuda-node/src/runtime.rs:3047`）为该 driver 接受的每种 kind；其余组合在物化之前即被拒绝。此表对该 match 是穷尽的，新增 `DriverKind` 分支或新接受的组合必须同时加行。
+`memoryContext` 在各启动路径上的注入机制（D-060；与 [main-agent.md §12.3](./main-agent.md#123-reading) 的表一致）。它覆盖 `materialize_inner` 里 driver match 的每个分支（:239）与之前的 shell-pty agent 分支（:229），乘以 Node 的 `validate_kind_driver`（`crates/remuda-node/src/runtime.rs:3047`）为该 driver 接受的每种 kind；其余组合在物化之前即被拒绝。此表对该 match 是穷尽的，新增 `DriverKind` 分支或新接受的组合必须同时加行。唯一没有行的分支是 `herdr-claimed`（D-062）：Node 对任何 kind 都不在 create 时接受它，物化器的该分支直接拒绝；认领的外部 pane 从不启动，也从不收到 `memoryContext`。
 
 | # | Driver | Kind | `crates/remuda-driver/src/materializer.rs` 中的 match 分支（origin/main `c27e0eac`） | 机制 |
 |---|---|---|---|---|
@@ -1621,6 +1622,24 @@ instance.create params: "lineage": {"id": "ins_…", "generation": "3"}, "creato
 instance.create params (D-060): "memoryContext": {"rev": "12", "text": "<rendered index and about-me>"}
 instance.create params (ma-skill): "skillContext": {"grants": ["dispatch"], "herdr": true, "delegatedDecisions": true, "inbox": false}
 worker.provision params: "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "3"}, "opId": "…"
+~~~
+
+**2026-11-04 补（D-062）：认领外部 herdr pane。** 与 `host.dirs.list` 同族的加性 Hub→Node 方法，不属于上面 46 个目标方法。只有人类 operator 可经 Hub 调用（Agent、Bot、收窄到实例的 Human 一律 403，带 `reason` 与 `next`）。设计全文见 [herdr-claim.md](./herdr-claim.md)。
+
+| 方法 / 路由 | 方向 | payload / result |
+| --- | --- | --- |
+| `herdr.discover` | Hub→Node | `{session?}` → `{sessions:[{session,socketPath,reachable,error?,workspaces:[{workspaceId,label,tabs:[{tabId,label,panes:[{paneId,agent?,agentStatus,process?:{pid,command},claimedBy?}]}]}]}]}`；只读元数据，绝不调用 `pane.read`/`agent.read`；不列出 Node 自己的 session |
+| `herdr.resolve` | Hub→Node | `{session,workspaceId,tabId,paneId?,kind?}` → `{claim:HerdrClaim,kind,agentStatus,remudaWorkspaceId?,cwd?}`；只读校验 id 链（pane 在 tab 内、tab 在 workspace 内），tab 多于一个 pane 而未给 `paneId` 时拒绝并列出 pane id；`remudaWorkspaceId` 是包含 pane cwd 的已注册 workspace，Hub 以它归档该行 |
+| `instance.claim` | Hub→Node | `{instanceId,session,workspaceId,tabId,paneId,kind}` → `{instance}`；按 `instanceId` 幂等；同一 (socket, pane) 已有活认领时拒绝 |
+| `GET /v1/hosts/{id}/herdr?session=` | Client→Hub | 代理 `herdr.discover` |
+| `POST /v1/instances/claim` | Client→Hub | `{hostId,herdrSession,workspaceId,tabId,paneId?,kind?,name?,title?,projectId?}` → `{instance,claim}`；错误：id 不成链或 tab 多 pane → 400，(host, socket, pane) 已有活认领 → 409（带现有 instanceId），herdr 不可达 → 400 |
+| `POST /v1/instances/{id}/release` | Client→Hub | → `{instance,released}`；只脱离、幂等。脱离是一条 `instance.close` 命令：host 在线即转发，离线则排队，在该 host 下一次 `node.hello` 后与 Hub 每秒 tick 时转发（每条至多发送一次）。对已结束（或 host 失联）的认领实例：已有脱离送达（Node 已接受或已结清、未拒绝）或仍在排队时回 200 `released:false`；已转发而 Node 从未应答的脱离（帧可能随链路丢失）视为未确认，release 会重发并回 `released:true`，新链路上的 hello 与 tick 也会重发——重发是一条带原闸门盖章的新幂等 close，不复用旧命令 id；没有、或只有被 Node 拒绝的脱离时排队一条并回 `released:true`。判定看命令状态，不看审计行 |
+
+Node 拒绝时错误文本带稳定前缀，Hub 据此映射：`herdr-claim-invalid`、`herdr-claim-ambiguous`、`herdr-claim-own-session`、`herdr-unreachable` → 400，`herdr-claim-conflict` → 409（`already-claimed`），`herdr-claim-not-ready` → 409（`not-ready`：agent 认领时 pane 前台还没有 agent）。写入或结束认领 pane 的每条路径只认 Human 设备：Hub 闸门盖章（`claimWrite`、`origin:"human"`），排队命令与直接 RPC 各有一道兜底，Node 拒绝 `origin` 不是 `human`（含缺失）的写入帧。Hub 自身的输入（inbox 事实批、usage-resume 续写、重启通知、wake、owner-notify）绝不进入认领 pane：闸门拒绝 `origin:"hub"`，认领实例在建行时即被拒为 inbox 订阅者、wake 目标、usage-resume 行与重启目标（`optIn`/wake-up/`autoContinue` 回 409 `claimed-pane`）；owner-notify 只推送给 owner，从不写入实例。CLI：`remuda host herdr ls --host H [--session S]`、`remuda instance claim --host H --herdr-session S --workspace W --tab T [--pane P] [--kind claude|codex|grok|agy|shell] [--name N] [--project P]`、`remuda instance release <id>`。driver `herdr-claimed` 只由 `instance.claim` 产生，`instance.create` 拒绝它。
+
+~~~text
+→ {"jsonrpc":"2.0","id":"h-31","method":"instance.claim","params":{"instanceId":"ins_…","session":"work","workspaceId":"w2","tabId":"w2:t19","paneId":"w2:p5K","kind":"claude"}}
+← {"jsonrpc":"2.0","id":"h-31","result":{"instance":{"id":"ins_…","driver":"herdr-claimed","kind":"claude","herdrClaim":{"session":"work","socketPath":"…/sessions/work/herdr.sock","workspaceId":"w2","tabId":"w2:t19","paneId":"w2:p5K","agent":"claude","process":{"pid":4242,"command":"claude"}}}}}
 ~~~
 
 ### 7.3 Snapshot + seq follow 与重连补页

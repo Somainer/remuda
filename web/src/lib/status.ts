@@ -57,7 +57,8 @@ export function isGenericPty(instance: Instance): boolean {
   const pty =
     instance.driver === "generic-pty" ||
     instance.driver === "shell-pty" ||
-    instance.driver === "claude-pty";
+    instance.driver === "claude-pty" ||
+    instance.driver === "herdr-claimed";
   return pty && !hasStructuredSignal(instance);
 }
 

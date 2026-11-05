@@ -23,7 +23,10 @@ struct PendingPrompt {
 pub(super) fn is_pty(kind: DriverKind) -> bool {
     matches!(
         kind,
-        DriverKind::ClaudePty | DriverKind::GenericPty | DriverKind::ShellPty
+        DriverKind::ClaudePty
+            | DriverKind::GenericPty
+            | DriverKind::ShellPty
+            | DriverKind::HerdrClaimed
     )
 }
 

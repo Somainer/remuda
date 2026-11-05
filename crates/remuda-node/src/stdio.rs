@@ -660,6 +660,16 @@ async fn handle_stdio_frame(
                 pump_instance,
             })
         }
+        // D-062: a claim creates a live instance whose journal must flow.
+        _ if request.method == remuda_protocol::hubnode::METHOD_INSTANCE_CLAIM => {
+            let result =
+                hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;
+            let pump_instance = result.as_ref().ok().and_then(instance_id_from_result);
+            Ok(FrameOutcome {
+                response: response_for(id, result),
+                pump_instance,
+            })
+        }
         _ if request.method == "instance.purge" => {
             let result =
                 hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;
@@ -684,6 +694,8 @@ async fn handle_stdio_frame(
             // handle …" even though the shared dispatch table implements them.
             || crate::files::is_host_files_method(request.method.as_str())
             || crate::dir_browser::is_host_dirs_method(request.method.as_str())
+            // D-062 read-only herdr discovery / claim validation.
+            || crate::herdr_claim::is_herdr_claim_method(request.method.as_str())
             // Drill-in read of one subagent's sidechain transcript. Without
             // this row the ssh-stdio carrier refuses it, and the web row can
             // only say 「启动中」 forever.

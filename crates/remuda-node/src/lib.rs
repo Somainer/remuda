@@ -19,6 +19,7 @@ mod error;
 mod fence;
 mod files;
 mod gate;
+pub mod herdr_claim;
 mod hook_shim;
 mod identity;
 mod interactions;
@@ -179,7 +180,7 @@ pub use transport::{
 };
 pub use tty::{
     TTY_CHANNEL_INPUT, TTY_CHANNEL_OUTPUT, TTY_DEFAULT_COLS, TTY_DEFAULT_ROWS,
-    TTY_FRAME_HEADER_BYTES, TTY_MAX_INPUT_BYTES, TtyAttach, TtyEvent, TtyRegistry,
+    TTY_FRAME_HEADER_BYTES, TTY_MAX_INPUT_BYTES, TtyAttach, TtyEvent, TtyRegistry, TtyWriteGuard,
     decode_tty_input, encode_tty_frame, encode_tty_input,
 };
 pub use workspace_access::{

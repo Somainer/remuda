@@ -283,6 +283,10 @@ pub struct Instance {
     /// [`Instance::derived_launched_by`], which reads `mode` / `promoted_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launched_by: Option<LaunchedBy>,
+    /// `herdr_claim`; protocol §2.3 (D-062). The external herdr pane this
+    /// Instance claims; present only on `driver = herdr-claimed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_claim: Option<HerdrClaim>,
 }
 
 impl Instance {

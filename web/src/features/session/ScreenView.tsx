@@ -7,12 +7,16 @@ import css from "./screen.module.css";
 export function ScreenView({
   instance,
   events,
+  live = null,
 }: {
   instance: Instance;
   events: Observation[];
+  /** D-062: the live viewport of a claimed pane, which journals no screens. */
+  live?: string[] | null;
 }) {
   const snapshot = latestScreenFromObservations(events);
-  const lines = snapshot.lines.length ? snapshot.lines : ["(waiting for screen snapshot…)"];
+  const source = live?.length ? live : snapshot.lines;
+  const lines = source.length ? source : ["(waiting for screen snapshot…)"];
   const activity = knowledgeValue(instance.activity) ?? "unknown";
   return (
     <div className={css.screen} data-testid="screen-view" data-lifecycle={instance.lifecycle} data-activity={activity}>

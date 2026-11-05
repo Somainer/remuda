@@ -436,6 +436,28 @@ truncated: max-results cap hit after 200 match(es) across 187 file(s); narrow th
 An old Node that does not implement `host.files.search` answers with a
 JSON-RPC error which the Hub surfaces as a clean 400 — the route never hangs.
 
+## External herdr panes: discover, claim, release
+
+`remuda host herdr ls` and `remuda instance claim|release` adopt a pane a human
+started in another herdr session on the same host (D-062,
+[herdr-claim.md](./herdr-claim.md)). All three are Human-operator only.
+
+```text
+remuda host herdr ls --host <host> [--session <name|socket>] [--json]
+remuda instance claim --host <host> --herdr-session <name|socket> \
+    --workspace <w2> --tab <w2:t19> [--pane <w2:p5K>] \
+    [--kind claude|codex|grok|agy|shell] [--name <name>] [--project <project>]
+remuda instance release <instance>
+```
+
+- `ls` lists reachable sessions → workspaces → tabs → panes with herdr's agent
+  kind, status and the foreground command name. It never reads pane content.
+- `claim` without `--pane` needs a single-pane tab; otherwise it fails and
+  lists the tab's pane ids. A pane that is already claimed fails with the
+  existing instance id.
+- `release` (and `instance rm` on a claimed instance) detaches only: the pane
+  and its process keep running.
+
 ## MCP tools
 
 | Tool | Arguments | Result |

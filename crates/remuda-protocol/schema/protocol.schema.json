@@ -11649,6 +11649,435 @@
         }
       ]
     },
+    "LaunchCapabilitiesLaunch": {
+      "description": "LaunchCapabilitiesLaunch wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "create",
+          "description": "Wire value `create`.",
+          "type": "string"
+        },
+        {
+          "const": "resume",
+          "description": "Wire value `resume`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchCapabilitiesPayload": {
+      "description": "`launch.capabilities` payload; §5.5.",
+      "properties": {
+        "configured": {
+          "description": "What the spec and the Hub asked for.",
+          "items": {
+            "$ref": "#/$defs/LaunchConfiguredItem"
+          },
+          "type": "array"
+        },
+        "driver": {
+          "$ref": "#/$defs/DriverKind",
+          "description": "The carrier."
+        },
+        "harness": {
+          "$ref": "#/$defs/AgentKind",
+          "description": "The harness kind."
+        },
+        "launch": {
+          "$ref": "#/$defs/LaunchCapabilitiesLaunch",
+          "description": "`instance.create` or `instance.resume`."
+        },
+        "profileRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The lineage profile revision this chapter applied; null without one."
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchRefusal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when the Node refuses the launch."
+        },
+        "removed": {
+          "default": [],
+          "description": "Configured skill trees an earlier launch installed in this shared\nnative home that this launch's list no longer names, removed before\nthe harness starts (cb-seat-profile r2). Only Remuda-managed trees\n(with `.remuda-managed`) are ever removed. Absent on older events.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resolved": {
+          "description": "What is materialized.",
+          "items": {
+            "$ref": "#/$defs/LaunchResolvedItem"
+          },
+          "type": "array"
+        },
+        "skipped": {
+          "description": "Designed skips.",
+          "items": {
+            "$ref": "#/$defs/LaunchSkippedItem"
+          },
+          "type": "array"
+        },
+        "unavailable": {
+          "description": "What will not reach the harness.",
+          "items": {
+            "$ref": "#/$defs/LaunchUnavailableItem"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "launch",
+        "harness",
+        "driver",
+        "profileRevision",
+        "configured",
+        "resolved",
+        "skipped",
+        "unavailable",
+        "removed",
+        "refusal"
+      ],
+      "type": "object"
+    },
+    "LaunchConfiguredItem": {
+      "description": "One configured item; §5.5.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/LaunchItemClass",
+          "description": "What kind of item."
+        },
+        "name": {
+          "description": "Its name: a skill directory's base name, a grant verb, a capability\nor MCP server name, an MCP config file's base name or `inline`.",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/LaunchItemSource",
+          "description": "Who asked for it."
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "source"
+      ],
+      "type": "object"
+    },
+    "LaunchItemClass": {
+      "description": "LaunchItemClass wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "skill",
+          "description": "Wire value `skill`.",
+          "type": "string"
+        },
+        {
+          "const": "capability",
+          "description": "Wire value `capability`.",
+          "type": "string"
+        },
+        {
+          "const": "mcp-server",
+          "description": "Wire value `mcp-server`.",
+          "type": "string"
+        },
+        {
+          "const": "mcp-config",
+          "description": "Wire value `mcp-config`.",
+          "type": "string"
+        },
+        {
+          "const": "grant",
+          "description": "Wire value `grant`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchItemRoot": {
+      "description": "LaunchItemRoot wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "native-home",
+          "description": "Wire value `native-home`.",
+          "type": "string"
+        },
+        {
+          "const": "launch-dir",
+          "description": "Wire value `launch-dir`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchItemSource": {
+      "description": "LaunchItemSource wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "embedded",
+          "description": "Wire value `embedded`.",
+          "type": "string"
+        },
+        {
+          "const": "spec",
+          "description": "Wire value `spec`.",
+          "type": "string"
+        },
+        {
+          "const": "hub",
+          "description": "Wire value `hub`.",
+          "type": "string"
+        },
+        {
+          "const": "args",
+          "description": "Wire value `args`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchItemVia": {
+      "description": "LaunchItemVia wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "tree",
+          "description": "Wire value `tree`.",
+          "type": "string"
+        },
+        {
+          "const": "flag",
+          "description": "Wire value `flag`.",
+          "type": "string"
+        },
+        {
+          "const": "data-block",
+          "description": "Wire value `data-block`.",
+          "type": "string"
+        },
+        {
+          "const": "conversation",
+          "description": "Wire value `conversation`.",
+          "type": "string"
+        },
+        {
+          "const": "argv",
+          "description": "Wire value `argv`.",
+          "type": "string"
+        },
+        {
+          "const": "codex-config",
+          "description": "Wire value `codex-config`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchRefusal": {
+      "description": "Why the Node refused the launch; §5.5.",
+      "properties": {
+        "next": {
+          "$ref": "#/$defs/LaunchRefusalNext",
+          "description": "The next step."
+        },
+        "reason": {
+          "description": "[`LAUNCH_CAPABILITY_UNREADABLE`].",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "next"
+      ],
+      "type": "object"
+    },
+    "LaunchRefusalNext": {
+      "description": "What to do about a refused launch; the shape of a Hub error's `next`.",
+      "properties": {
+        "action": {
+          "description": "`ask-owner`: the configuration is the owner's to fix.",
+          "type": "string"
+        },
+        "hint": {
+          "description": "One sentence for the reader.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "hint"
+      ],
+      "type": "object"
+    },
+    "LaunchResolvedItem": {
+      "description": "One materialized item; §5.5.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/LaunchItemClass",
+          "description": "What kind of item."
+        },
+        "digest": {
+          "description": "`sha256:<hex>` of the bytes (for a tree, `skill_tree_digest`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Its name, as in `configured`.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to [`Self::root`]; never absolute.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchItemRoot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch root [`Self::path`] is relative to; null when the item has\nno file of its own under a root (a grant, a caller `--mcp-config`)."
+        },
+        "via": {
+          "$ref": "#/$defs/LaunchItemVia",
+          "description": "How the item rides the launch."
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "root",
+        "path",
+        "digest",
+        "via"
+      ],
+      "type": "object"
+    },
+    "LaunchSkipReason": {
+      "description": "LaunchSkipReason wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "operator-home",
+          "description": "Wire value `operator-home`.",
+          "type": "string"
+        },
+        {
+          "const": "no-skill-reader",
+          "description": "Wire value `no-skill-reader`.",
+          "type": "string"
+        },
+        {
+          "const": "user-owned",
+          "description": "Wire value `user-owned`.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchSkippedItem": {
+      "description": "One designed skip; §5.5. Never an error and never a refusal.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/LaunchItemClass",
+          "description": "What kind of item."
+        },
+        "name": {
+          "description": "Its name, as in `configured`.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/LaunchSkipReason",
+          "description": "Why it was skipped."
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "LaunchUnavailableItem": {
+      "description": "One item that will not reach the harness; §5.5.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/LaunchItemClass",
+          "description": "What kind of item."
+        },
+        "name": {
+          "description": "Its name, as in `configured`.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/LaunchUnavailableReason",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "class",
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "LaunchUnavailableReason": {
+      "description": "LaunchUnavailableReason wire values; `protocol.md` §5.5.",
+      "oneOf": [
+        {
+          "const": "unreadable",
+          "description": "Wire value `unreadable`.",
+          "type": "string"
+        },
+        {
+          "const": "missing",
+          "description": "Wire value `missing`.",
+          "type": "string"
+        },
+        {
+          "const": "not-a-directory",
+          "description": "Wire value `not-a-directory`.",
+          "type": "string"
+        },
+        {
+          "const": "not-a-file",
+          "description": "Wire value `not-a-file`.",
+          "type": "string"
+        },
+        {
+          "const": "too-large",
+          "description": "Wire value `too-large`.",
+          "type": "string"
+        },
+        {
+          "const": "invalid-name",
+          "description": "Wire value `invalid-name`.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported-by-harness",
+          "description": "Wire value `unsupported-by-harness`.",
+          "type": "string"
+        },
+        {
+          "const": "not-permitted",
+          "description": "Wire value `not-permitted`.",
+          "type": "string"
+        }
+      ]
+    },
     "LaunchedBy": {
       "description": "LaunchedBy wire values; `protocol.md` §2.3.",
       "oneOf": [
@@ -15289,6 +15718,23 @@
             "payload"
           ],
           "type": "object"
+        },
+        {
+          "description": "`launch.capabilities` payload; §5.5 (cb-seat-profile, D-063).",
+          "properties": {
+            "kind": {
+              "const": "launch.capabilities",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/LaunchCapabilitiesPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -15487,6 +15933,11 @@
         {
           "const": "opaque",
           "description": "Wire value `opaque`.",
+          "type": "string"
+        },
+        {
+          "const": "launch.capabilities",
+          "description": "Wire value `launch.capabilities`.",
           "type": "string"
         }
       ]
@@ -15792,6 +16243,23 @@
             },
             "payload": {
               "$ref": "#/$defs/OpaquePayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`launch.capabilities` payload; §5.5 (cb-seat-profile, D-063).",
+          "properties": {
+            "kind": {
+              "const": "launch.capabilities",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/LaunchCapabilitiesPayload"
             }
           },
           "required": [
@@ -20221,6 +20689,246 @@
     "SchemaVersion": {
       "const": 1,
       "type": "integer"
+    },
+    "SeatProfile": {
+      "description": "One lineage's profile document; protocol.md §8.4.",
+      "properties": {
+        "createdAt": {
+          "description": "When the row was created (RFC 3339).",
+          "type": "string"
+        },
+        "displayName": {
+          "description": "Display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "description": "`{name, ultracode}`, as on a create body; null: the harness decides."
+        },
+        "lineageId": {
+          "description": "The lineage (its first chapter's id).",
+          "type": "string"
+        },
+        "modelCandidates": {
+          "description": "1 to 5 model routes, the first being the default.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "permissionMode": {
+          "description": "The permission mode the next chapter launches with.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Bumped by every edit; the first edit creates revision 1.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "role": {
+          "description": "One-line role.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skills": {
+          "description": "Host-absolute skill directories, as `spec.skills`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "updatedAt": {
+          "description": "When it was last edited (RFC 3339).",
+          "type": "string"
+        },
+        "updatedBy": {
+          "description": "The Human device that made the last edit.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lineageId",
+        "revision",
+        "displayName",
+        "role",
+        "modelCandidates",
+        "effort",
+        "permissionMode",
+        "skills",
+        "createdAt",
+        "updatedAt",
+        "updatedBy"
+      ],
+      "type": "object"
+    },
+    "SeatProfileChapter": {
+      "description": "The live chapter, as the profile read reports it.",
+      "properties": {
+        "appliedRevision": {
+          "description": "The profile revision it launched with; null when it launched without\none.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "generation": {
+          "description": "Its generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instanceId": {
+          "description": "The lineage's current chapter.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instanceId",
+        "generation",
+        "appliedRevision"
+      ],
+      "type": "object"
+    },
+    "SeatProfileFacts": {
+      "description": "The profile facts a chapter launched with, stamped by the Hub inside\n`skillContext.profile`; protocol.md §7.2.",
+      "properties": {
+        "displayName": {
+          "description": "Display name, when the owner set one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelCandidates": {
+          "default": [],
+          "description": "Model routes the owner listed, the first being the default. A fact,\nnot a failover: whether to switch is the agent's own decision.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The profile revision this chapter applied."
+        },
+        "role": {
+          "description": "One-line role, when the owner set one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "revision",
+        "modelCandidates"
+      ],
+      "type": "object"
+    },
+    "SeatProfileLastLaunch": {
+      "description": "The newest `launch.capabilities` event of the lineage.",
+      "properties": {
+        "generation": {
+          "description": "Its generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instanceId": {
+          "description": "The chapter that launched.",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/LaunchCapabilitiesPayload",
+          "description": "The event's payload."
+        }
+      },
+      "required": [
+        "instanceId",
+        "generation",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "SeatProfilePutResult": {
+      "description": "`PUT /v1/lineages/{id}/profile` result; protocol.md §8.4.",
+      "properties": {
+        "changed": {
+          "description": "The fields this edit changed, by wire name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pending": {
+          "description": "As on the read.",
+          "type": "boolean"
+        },
+        "profile": {
+          "$ref": "#/$defs/SeatProfile",
+          "description": "The document after the edit."
+        }
+      },
+      "required": [
+        "profile",
+        "pending",
+        "changed"
+      ],
+      "type": "object"
+    },
+    "SeatProfileView": {
+      "description": "`GET /v1/lineages/{id}/profile`; protocol.md §8.4.",
+      "properties": {
+        "lastLaunch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeatProfileLastLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The newest launch snapshot of the lineage's chapters."
+        },
+        "lineageId": {
+          "description": "The lineage.",
+          "type": "string"
+        },
+        "liveChapter": {
+          "$ref": "#/$defs/SeatProfileChapter",
+          "description": "The lineage's current chapter."
+        },
+        "pending": {
+          "description": "A profile exists and its revision is newer than the live chapter's\napplied one: the edit waits for the next chapter (「待下一章节生效」).",
+          "type": "boolean"
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeatProfile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The document; null until the first edit."
+        }
+      },
+      "required": [
+        "lineageId",
+        "profile",
+        "liveChapter",
+        "pending",
+        "lastLaunch"
+      ],
+      "type": "object"
     },
     "SelectionReason": {
       "description": "SelectionReason wire values; `protocol.md` §4.1.",

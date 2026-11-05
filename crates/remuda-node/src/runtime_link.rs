@@ -369,6 +369,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         api_relay_endpoint: None,
         memory_context: None,
         skill_context: None,
+        skills: Vec::new(),
+        revoked_skills: Vec::new(),
     };
     request.apply_spec_launch_fields(spec);
     // D-060: the Hub-stamped memory rides the top level of the params, for
@@ -376,6 +378,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     request.take_memory_context(params);
     // ma-skill: likewise the launch facts for the capability section.
     request.take_skill_context(params);
+    // cb-seat-profile r3: likewise the lineage's own revoked skills.
+    request.take_revoked_skills(params);
     // D-057 OA1: likewise the creator stamp, top level only.
     request.take_creator_permission_mode(params);
     Ok(request)

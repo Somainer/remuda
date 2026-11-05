@@ -18,6 +18,8 @@ import {
   type MainStatus,
 } from "../home/mainStatus";
 import { ComposerConfirmDialog } from "./ComposerOptions";
+import { defaultPermissionForKind } from "./permissions";
+import { SeatProfilePanel } from "./seatProfile/SeatProfilePanel";
 import css from "./mainSessionBar.module.css";
 
 /** Journal rows an expanded earlier chapter loads (on demand only). */
@@ -158,6 +160,12 @@ function MainSessionBarBody({ entry, instance, mobile }: { entry: MainEntry; ins
         </span>
       </div>
       <MainChapters lineage={lineage} entry={entry} viewing={instance.id} instances={hub.instances} />
+      <SeatProfilePanel
+        lineageId={entry.lineageId}
+        kind={current.kind}
+        liveInstanceId={current.id}
+        currentMode={hub.permissionMode[current.id] ?? defaultPermissionForKind(current.kind)}
+      />
       <ComposerConfirmDialog
         open={confirmPause}
         variant={mobile ? "sheet" : "popover"}

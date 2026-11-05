@@ -92,6 +92,7 @@ fn recipe(
         secret_policy: None,
         memory_context: memory,
         skill_context: None,
+        configured_skills: &[],
     })
 }
 
@@ -272,6 +273,7 @@ fn a_native_resume_renders_its_own_system_prompt() {
             secret_policy: None,
             memory_context: Some(&context),
             skill_context: None,
+            configured_skills: &[],
         })
         .unwrap()
         .argv
@@ -481,6 +483,7 @@ async fn shell_pty_writes_the_block_once_and_none_on_a_native_resume() {
                 binary: Some(stub.clone()),
                 origin: LaunchOrigin::Human,
                 native_home_managed: true,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );

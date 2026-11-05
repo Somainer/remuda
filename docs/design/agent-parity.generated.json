@@ -345,6 +345,13 @@
     },
     {
       "method": "GET",
+      "path": "/v1/lineages/{id}/profile",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
       "path": "/v1/lineages/{id}/wake-ups",
       "middleware": "owner-scoped",
       "owned": "lineage",
@@ -958,6 +965,13 @@
     },
     {
       "method": "PUT",
+      "path": "/v1/lineages/{id}/profile",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PUT",
       "path": "/v1/providers/{id}/supply",
       "middleware": "refused",
       "handler": "handler-checked"
@@ -1196,6 +1210,26 @@
     },
     {
       "path": "land",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile set",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile show",
       "group": false,
       "hubRoutes": []
     },

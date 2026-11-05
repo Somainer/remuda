@@ -142,6 +142,8 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         creator_permission_mode: None,
         memory_context: None,
         skill_context: None,
+        skills: Vec::new(),
+        revoked_skills: Vec::new(),
         initiator: None,
         origin: InputOrigin::Human,
         agent_credential: None,

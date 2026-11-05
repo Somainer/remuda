@@ -177,6 +177,8 @@ fn run_child() {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Human,
             agent_credential: None,

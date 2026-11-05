@@ -2881,6 +2881,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
             from_states: &["starting", "running", "paused"],
             restart: None,
+            profile: None,
         };
         store1.continuation_resume(req).await
     });
@@ -2914,6 +2915,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
             from_states: &["starting", "running", "paused"],
             restart: None,
+            profile: None,
         };
         store2.continuation_resume(req).await
     });

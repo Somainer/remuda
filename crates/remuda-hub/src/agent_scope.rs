@@ -417,6 +417,20 @@ fn wake_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str
     admitted.then_some(id)
 }
 
+/// `GET` and `PUT /v1/lineages/{id}/profile` (cb-seat-profile): the seat
+/// reads its own profile; a PUT is admitted only so the handler answers it
+/// with the profile's own 403 (`profile-human-only`). The path id must be the
+/// caller's own lineage; the handler re-checks that.
+fn profile_target<'a>(method: &axum::http::Method, path: &'a str) -> Option<&'a str> {
+    if *method != axum::http::Method::GET && *method != axum::http::Method::PUT {
+        return None;
+    }
+    let id = path
+        .strip_prefix("/v1/lineages/")?
+        .strip_suffix("/profile")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// `GET /v1/lineages/{id}/glance` (cb-digest): the lineage read predicate,
 /// extended to the one projection hung under it. Same rule as
 /// [`lineage_read_target`]: the path id must be the caller's own lineage.
@@ -820,6 +834,17 @@ pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), Hu
         return Err(HubError::operator_field(
             "Agent seats cannot set `args` or `binaryPath`; do not retry with them — remove \
              both from the spec, or ask the owner to launch it",
+        ));
+    }
+    // cb-seat-profile: a configured skill directory is host content copied
+    // into the child's home; like an executable, only the owner chooses it.
+    if spec["skills"]
+        .as_array()
+        .is_some_and(|skills| !skills.is_empty())
+    {
+        return Err(HubError::operator_field(
+            "Agent seats cannot set `skills`; do not retry with it — remove it from the spec, \
+             or ask the owner to configure the skill",
         ));
     }
     Ok(())
@@ -1313,6 +1338,11 @@ pub fn agent_route_admission<'a>(
     }
     // cb-wake-engine: the caller's own lineage wake-ups.
     if let Some(id) = wake_target(method, path) {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+    }
+    // cb-seat-profile: the caller's own lineage profile. PUT is admitted here
+    // only so the handler answers with its own refusal (`profile-human-only`).
+    if let Some(id) = profile_target(method, path) {
         return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
     }
     let write = *method == Method::POST

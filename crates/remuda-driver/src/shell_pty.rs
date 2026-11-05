@@ -4425,6 +4425,7 @@ mod tests {
                 binary: Some(codex_bin),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: true,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );
@@ -4932,6 +4933,7 @@ mod tests {
                 binary: Some(claude_bin),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: pin_native_home,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );
@@ -5189,6 +5191,7 @@ mod tests {
                 binary: Some(claude_bin),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: pin_native_home,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );
@@ -5376,6 +5379,7 @@ mod tests {
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: true,
+                configured_skills: Vec::new(),
                 settings_overlay: Some(operator.clone()),
             },
         );
@@ -5482,6 +5486,7 @@ mod tests {
                     binary: Some(PathBuf::from("/bin/sh")),
                     origin: crate::materializer::LaunchOrigin::Human,
                     native_home_managed: true,
+                    configured_skills: Vec::new(),
                     settings_overlay: None,
                 },
             );
@@ -5669,6 +5674,7 @@ mod tests {
                     binary: Some(PathBuf::from("/bin/sh")),
                     origin: crate::materializer::LaunchOrigin::Human,
                     native_home_managed: true,
+                    configured_skills: Vec::new(),
                     settings_overlay: None,
                 },
             );
@@ -5857,6 +5863,7 @@ mod tests {
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: true,
+                configured_skills: Vec::new(),
                 settings_overlay: Some(provider_overlay.clone()),
             },
         );
@@ -5997,6 +6004,7 @@ mod tests {
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: false,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );
@@ -7908,6 +7916,7 @@ mod tests {
                 binary: Some(codex_bin),
                 origin: crate::materializer::LaunchOrigin::Human,
                 native_home_managed: false,
+                configured_skills: Vec::new(),
                 settings_overlay: None,
             },
         );

@@ -16,6 +16,7 @@
 //! (verified against claude 2.1.270: a user `SessionStart` hook and an overlay
 //! `SessionStart` hook both fire).
 
+pub mod capabilities;
 pub mod overlay;
 pub mod remuda_skill;
 pub(crate) mod runtime_dir;

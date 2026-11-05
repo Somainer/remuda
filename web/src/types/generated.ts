@@ -2625,6 +2625,91 @@ export type Knowledge9 = (({
   [key: string]: unknown;
 }));
 
+/** LaunchCapabilitiesLaunch wire values; `protocol.md` §5.5. */
+export type LaunchCapabilitiesLaunch = ("create" | "resume");
+
+/** `launch.capabilities` payload; §5.5. */
+export type LaunchCapabilitiesPayload = ({
+  "configured": ((LaunchConfiguredItem)[]);
+  "driver": DriverKind;
+  "harness": AgentKind;
+  "launch": LaunchCapabilitiesLaunch;
+  "profileRevision": (U64 | (null));
+  "refusal": (LaunchRefusal | (null));
+  "removed": (((string))[]);
+  "resolved": ((LaunchResolvedItem)[]);
+  "skipped": ((LaunchSkippedItem)[]);
+  "unavailable": ((LaunchUnavailableItem)[]);
+  [key: string]: unknown;
+});
+
+/** One configured item; §5.5. */
+export type LaunchConfiguredItem = ({
+  "class": LaunchItemClass;
+  "name": (string);
+  "source": LaunchItemSource;
+  [key: string]: unknown;
+});
+
+/** LaunchItemClass wire values; `protocol.md` §5.5. */
+export type LaunchItemClass = ("skill" | "capability" | "mcp-server" | "mcp-config" | "grant");
+
+/** LaunchItemRoot wire values; `protocol.md` §5.5. */
+export type LaunchItemRoot = ("native-home" | "launch-dir");
+
+/** LaunchItemSource wire values; `protocol.md` §5.5. */
+export type LaunchItemSource = ("embedded" | "spec" | "hub" | "args");
+
+/** LaunchItemVia wire values; `protocol.md` §5.5. */
+export type LaunchItemVia = ("tree" | "flag" | "data-block" | "conversation" | "argv" | "codex-config");
+
+/** Why the Node refused the launch; §5.5. */
+export type LaunchRefusal = ({
+  "next": LaunchRefusalNext;
+  "reason": (string);
+  [key: string]: unknown;
+});
+
+/** What to do about a refused launch; the shape of a Hub error's `next`. */
+export type LaunchRefusalNext = ({
+  "action": (string);
+  "hint": (string);
+  [key: string]: unknown;
+});
+
+/** One materialized item; §5.5. */
+export type LaunchResolvedItem = ({
+  "class": LaunchItemClass;
+  "digest": (string | null);
+  "name": (string);
+  "path": (string | null);
+  "root": (LaunchItemRoot | (null));
+  "via": LaunchItemVia;
+  [key: string]: unknown;
+});
+
+/** LaunchSkipReason wire values; `protocol.md` §5.5. */
+export type LaunchSkipReason = ("operator-home" | "no-skill-reader" | "user-owned");
+
+/** One designed skip; §5.5. Never an error and never a refusal. */
+export type LaunchSkippedItem = ({
+  "class": LaunchItemClass;
+  "name": (string);
+  "reason": LaunchSkipReason;
+  [key: string]: unknown;
+});
+
+/** One item that will not reach the harness; §5.5. */
+export type LaunchUnavailableItem = ({
+  "class": LaunchItemClass;
+  "name": (string);
+  "reason": LaunchUnavailableReason;
+  [key: string]: unknown;
+});
+
+/** LaunchUnavailableReason wire values; `protocol.md` §5.5. */
+export type LaunchUnavailableReason = ("unreadable" | "missing" | "not-a-directory" | "not-a-file" | "too-large" | "invalid-name" | "unsupported-by-harness" | "not-permitted");
+
 /** LaunchedBy wire values; `protocol.md` §2.3. */
 export type LaunchedBy = ("remuda" | "user");
 
@@ -3448,6 +3533,10 @@ export type Observation = (({
   "kind": "opaque";
   "payload": OpaquePayload;
   [key: string]: unknown;
+}) | ({
+  "kind": "launch.capabilities";
+  "payload": LaunchCapabilitiesPayload;
+  [key: string]: unknown;
 })) & ({
   "completeness": Completeness;
   "eventId": EventId;
@@ -3468,7 +3557,7 @@ export type Observation = (({
 });
 
 /** ObservationKind wire values; `protocol.md` §5.1. */
-export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "model" | "permission" | "raw_tty" | "opaque");
+export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "model" | "permission" | "raw_tty" | "opaque" | "launch.capabilities");
 
 /** ObservationPayload; `protocol.md` §5.1. */
 export type ObservationPayload = (({
@@ -3542,6 +3631,10 @@ export type ObservationPayload = (({
 }) | ({
   "kind": "opaque";
   "payload": OpaquePayload;
+  [key: string]: unknown;
+}) | ({
+  "kind": "launch.capabilities";
+  "payload": LaunchCapabilitiesPayload;
   [key: string]: unknown;
 }));
 
@@ -4599,6 +4692,65 @@ export type SandboxExecution = ({
 export type SandboxMode = ("read-only" | "workspace-write" | "danger-full-access");
 
 export type SchemaVersion = 1;
+
+/** One lineage's profile document; protocol.md §8.4. */
+export type SeatProfile = ({
+  "createdAt": (string);
+  "displayName": (string | null);
+  "effort": unknown;
+  "lineageId": (string);
+  "modelCandidates": (((string))[]);
+  "permissionMode": (string);
+  "revision": (number);
+  "role": (string | null);
+  "skills": (((string))[]);
+  "updatedAt": (string);
+  "updatedBy": (string);
+  [key: string]: unknown;
+});
+
+/** The live chapter, as the profile read reports it. */
+export type SeatProfileChapter = ({
+  "appliedRevision": (number | null);
+  "generation": (number);
+  "instanceId": (string);
+  [key: string]: unknown;
+});
+
+/** The profile facts a chapter launched with, stamped by the Hub inside `skillContext.profile`; protocol.md §7.2. */
+export type SeatProfileFacts = ({
+  "displayName"?: (string | null);
+  "modelCandidates": (((string))[]);
+  "revision": U64;
+  "role"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** The newest `launch.capabilities` event of the lineage. */
+export type SeatProfileLastLaunch = ({
+  "generation": (number);
+  "instanceId": (string);
+  "payload": LaunchCapabilitiesPayload;
+  [key: string]: unknown;
+});
+
+/** `PUT /v1/lineages/{id}/profile` result; protocol.md §8.4. */
+export type SeatProfilePutResult = ({
+  "changed": (((string))[]);
+  "pending": (boolean);
+  "profile": SeatProfile;
+  [key: string]: unknown;
+});
+
+/** `GET /v1/lineages/{id}/profile`; protocol.md §8.4. */
+export type SeatProfileView = ({
+  "lastLaunch": (SeatProfileLastLaunch | (null));
+  "lineageId": (string);
+  "liveChapter": SeatProfileChapter;
+  "pending": (boolean);
+  "profile": (SeatProfile | (null));
+  [key: string]: unknown;
+});
 
 /** SelectionReason wire values; `protocol.md` §4.1. */
 export type SelectionReason = ("pinned" | "weighted-healthy" | "explicit-recovery");

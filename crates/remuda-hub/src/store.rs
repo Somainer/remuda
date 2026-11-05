@@ -754,6 +754,9 @@ pub struct InstanceRecord {
     /// [`InstanceRecord::claude_config_dir`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_overlay_path: Option<String>,
+    /// cb-seat-profile: configured skill directories (`spec.skills`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
     /// Provider delegation persisted from the create spec (`none` / `gateway`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<String>,
@@ -1018,6 +1021,25 @@ pub struct InstanceRecord {
         rename = "creatorOrigin"
     )]
     pub creator_origin: Option<String>,
+    /// cb-seat-profile (D-063): the newest `launch.capabilities` payload the
+    /// Node journaled for this chapter; absent before its first launch event.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "launchCapabilities"
+    )]
+    pub launch_capabilities: Option<Value>,
+    /// The lineage profile revision this chapter's spec was built from;
+    /// absent when it launched without one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "profileRevision"
+    )]
+    pub profile_revision: Option<i64>,
+    /// The applied profile document (the source of `skillContext.profile`).
+    #[serde(default, skip_serializing)]
+    pub profile_json: Option<Value>,
 }
 
 /// Additive marker for a root turn that ended in failure while the process
@@ -1695,6 +1717,10 @@ pub struct ContinuationResumeRequest {
     /// failed chapter (`None` for an owner Resume). Checked and written in
     /// the same transaction as F.
     pub restart: Option<crate::restart::RestartDecision>,
+    /// cb-seat-profile (D-063): the lineage profile the successor spec was
+    /// built from, recorded on the successor row in the same transaction;
+    /// `None` without a profile.
+    pub profile: Option<crate::seat_profile::AppliedProfile>,
 }
 
 /// `chapterCause` of a chapter an owner Resume opened.
@@ -1915,7 +1941,15 @@ fn continuation_resume_tx(
     if let Some(spec) = request.spec.as_object_mut() {
         for key in ["permissionMode", "permissionEffective"] {
             let missing = spec.get(key).is_none_or(Value::is_null);
+            // cb-seat-profile: the observed effective mode describes the
+            // predecessor's requested mode only. When the successor asks for
+            // another one (a profile edit), carrying it over would make OA1
+            // read the old mode for the seat's children until the successor's
+            // transcript says otherwise.
+            let same_mode = key != "permissionEffective"
+                || spec.get("permissionMode") == predecessor_spec.get("permissionMode");
             if missing
+                && same_mode
                 && let Some(value) = predecessor_spec.get(key).filter(|value| !value.is_null())
             {
                 spec.insert(key.to_owned(), value.clone());
@@ -1991,6 +2025,14 @@ fn continuation_resume_tx(
             current.creator_origin,
         ],
     )?;
+    // cb-seat-profile: the profile revision and document the successor's
+    // spec was built from, in the same transaction as its row.
+    if let Some(profile) = &request.profile {
+        tx.execute(
+            "UPDATE instances SET profile_revision = ?1, profile_json = ?2 WHERE id = ?3",
+            params![profile.revision, profile.doc_json.to_string(), successor_id],
+        )?;
+    }
     // 5. Queue the successor's resume create (forwarded after commit).
     let initial_input = request
         .prompt
@@ -2088,6 +2130,11 @@ impl InstanceRecord {
             }
             if let Some(index) = self.effort_index {
                 object.insert("effortIndex".into(), json!(index));
+            }
+            // cb-seat-profile: configured skill directories are create-spec
+            // facts too; a successor without a profile keeps them.
+            if let Some(skills) = self.skills.as_ref().filter(|skills| !skills.is_empty()) {
+                object.insert("skills".into(), json!(skills));
             }
             object.retain(|_, value| !value.is_null());
         }
@@ -8967,6 +9014,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // cb-usage-resume: after the inbox (its supply parks) and the commands,
     // instances and lineages its triggers read.
     crate::usage_resume::migrate(&conn)?;
+    // cb-seat-profile: the profile table and the chapter columns.
+    crate::seat_profile::migrate(&conn)?;
     // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
     // brick Hub startup. The migration is one transaction and rolls back to
     // the previously-openable shape on any error; log it and open. Usage
@@ -16442,7 +16491,8 @@ pub(crate) fn load_instance(
                 turn_error_json, turn_end_seq,
                 (SELECT seen_seq FROM instance_views
                   WHERE instance_id = instances.id AND scope = ?2),
-                auto_continue, creator_origin
+                auto_continue, creator_origin, launch_capabilities_json, profile_revision,
+                profile_json
          FROM instances WHERE id = ?1",
         params![id, crate::seen::OWNER_SCOPE],
         |row| {
@@ -16615,6 +16665,13 @@ pub(crate) fn load_instance(
                 cwd,
                 claude_config_dir,
                 settings_overlay_path,
+                skills: spec.get("skills").and_then(Value::as_array).map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                }),
                 delegation,
                 provider_profile_id,
                 provider_source,
@@ -16689,6 +16746,13 @@ pub(crate) fn load_instance(
                 turn_end_seq: seen_marks.turn_end_seq.map(|seq| seq.to_string()),
                 auto_continue: row.get(32)?,
                 creator_origin: row.get(33)?,
+                launch_capabilities: row
+                    .get::<_, Option<String>>(34)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
+                profile_revision: row.get(35)?,
+                profile_json: row
+                    .get::<_, Option<String>>(36)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
     )
@@ -16798,6 +16862,8 @@ fn append_loaded_event(
     apply_instance_projection(conn, instance_id, &event, seq, &now, &mut settlement)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
+    // cb-seat-profile: the newest launch snapshot on the instance row.
+    crate::seat_profile::fold_append(conn, instance_id, &event)?;
     // cb-rootturn: inputs and structured turn boundaries feed the instance's
     // root-turn ledger in the same transaction as the row.
     crate::root_turn::fold(conn, instance_id, &event)?;

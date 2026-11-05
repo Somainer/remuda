@@ -375,6 +375,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             workspace_id: None,
             memory_context: None,
             skill_context: None,
+            revoked_skills: Vec::new(),
         });
     let spec = parsed.spec.clone().unwrap_or_else(|| params.clone());
     let mut spec_for_request = spec.clone();
@@ -456,6 +457,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             api_relay_endpoint: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
+            revoked_skills: Vec::new(),
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is
@@ -493,6 +496,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     request.take_memory_context(&params);
     // ma-skill: likewise the launch facts for the capability section.
     request.take_skill_context(&params);
+    request.take_revoked_skills(&params);
     // D-057 OA1: top-level `creatorPermissionMode` only, never the spec's.
     request.take_creator_permission_mode(&params);
     request.agent_credential = params

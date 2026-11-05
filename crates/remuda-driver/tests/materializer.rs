@@ -58,6 +58,7 @@ fn request<'a>(
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: &[],
         spec,
         profile,
         launch_dir: launch.to_path_buf(),

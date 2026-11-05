@@ -159,6 +159,12 @@ pub struct CreateInstanceRequest {
     /// unknown values. Never inherited or implied by installed host software.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// cb-seat-profile (D-063): host-absolute skill directories to install
+    /// into the native home, from the Hub-stored `spec.skills` (a Human or Bot
+    /// create, or the lineage profile at the next chapter). Read once by the
+    /// launch snapshot; empty means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
     /// Resolved model-API route the Hub placed on the spec (D-047). `None` (or
     /// `mode: direct`) means the listener is never started and the launch is a
     /// plain direct delivery. A `via` request missing its host is invalid: the
@@ -185,6 +191,12 @@ pub struct CreateInstanceRequest {
     /// `memoryContext`, and kept out of the payload digest.
     #[serde(skip)]
     pub skill_context: Option<remuda_protocol::hubnode::SkillContext>,
+    /// cb-seat-profile r3: the Hub-stamped `revokedSkills` — configured skill
+    /// names this lineage's earlier chapter installed and this launch no
+    /// longer names. Read only from the top level of the create/resume
+    /// params; the launch removes exactly these managed trees, nothing else.
+    #[serde(skip)]
+    pub revoked_skills: Vec<String>,
     /// D-057 OA1: the Hub-stamped `creatorPermissionMode` of an Agent-origin
     /// create or resume — the creator chapter's effective mode, read at the
     /// create's commit point. Read only from the top level of the forwarded
@@ -214,6 +226,23 @@ impl CreateInstanceRequest {
             .get("skillContext")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
+    }
+
+    /// Carry the Hub-stamped `revokedSkills` from the top level of the
+    /// forwarded create/resume `params` (cb-seat-profile r3). A copy nested in
+    /// the spec is not the Hub's and is ignored; non-strings are dropped.
+    pub fn take_revoked_skills(&mut self, params: &serde_json::Value) {
+        self.revoked_skills = params
+            .get(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     /// Carry the Hub-stamped `creatorPermissionMode` from the top level of
@@ -361,6 +390,17 @@ impl CreateInstanceRequest {
             if !copied.is_empty() {
                 self.capabilities = copied;
             }
+        }
+        // cb-seat-profile: configured skill directories, verbatim from the
+        // Hub-stored spec. An older Hub omits the field: no configured skill.
+        if self.skills.is_empty()
+            && let Some(skills) = spec.get("skills").and_then(Value::as_array)
+        {
+            self.skills = skills
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
         }
         if self.api_route.is_none() {
             self.api_route = spec

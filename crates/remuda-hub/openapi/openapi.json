@@ -1304,6 +1304,14 @@
           "autoContinue": {
             "type": "boolean",
             "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Any creator may set it: an Agent for the child it creates, the owner for any instance."
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "cb-seat-profile (D-063): host-absolute skill directories the Node installs into the native home. Human and Bot creators only (an Agent gets 403, as for binaryPath)."
           }
         },
         "type": "object"
@@ -1875,6 +1883,21 @@
           },
           "herdrClaim": {
             "$ref": "#/components/schemas/HerdrClaim"
+          },
+          "launchCapabilities": {
+            "$ref": "#/components/schemas/LaunchCapabilities",
+            "description": "cb-seat-profile: the newest launch.capabilities payload of this chapter; absent before its first launch event."
+          },
+          "profileRevision": {
+            "type": "integer",
+            "description": "cb-seat-profile: the lineage profile revision this chapter's spec was built from; absent without one."
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "cb-seat-profile: configured skill directories (spec.skills)."
           }
         },
         "required": [
@@ -7407,6 +7430,469 @@
         ],
         "additionalProperties": true
       },
+      "SeatProfile": {
+        "type": "object",
+        "description": "Generated shape: SeatProfile in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "lineageId",
+          "revision",
+          "displayName",
+          "role",
+          "modelCandidates",
+          "effort",
+          "permissionMode",
+          "skills",
+          "createdAt",
+          "updatedAt",
+          "updatedBy"
+        ],
+        "properties": {
+          "lineageId": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "displayName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modelCandidates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 5
+          },
+          "effort": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "ultracode": {
+                "type": "boolean"
+              }
+            }
+          },
+          "permissionMode": {
+            "type": "string"
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "updatedBy": {
+            "type": "string"
+          }
+        }
+      },
+      "SeatProfileChapter": {
+        "type": "object",
+        "description": "Generated shape: SeatProfileChapter in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "instanceId",
+          "generation",
+          "appliedRevision"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "appliedRevision": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      },
+      "LaunchCapabilities": {
+        "type": "object",
+        "description": "Generated shape: LaunchCapabilitiesPayload in crates/remuda-protocol/schema/protocol.schema.json (the launch.capabilities journal payload, protocol.md §5.5).",
+        "required": [
+          "launch",
+          "harness",
+          "driver",
+          "profileRevision",
+          "configured",
+          "resolved",
+          "skipped",
+          "unavailable",
+          "refusal"
+        ],
+        "properties": {
+          "launch": {
+            "type": "string",
+            "enum": [
+              "create",
+              "resume"
+            ]
+          },
+          "harness": {
+            "type": "string"
+          },
+          "driver": {
+            "type": "string"
+          },
+          "profileRevision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "U64 decimal string"
+          },
+          "configured": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "class",
+                "name",
+                "source"
+              ],
+              "properties": {
+                "class": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "resolved": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "class",
+                "name",
+                "root",
+                "path",
+                "digest",
+                "via"
+              ],
+              "properties": {
+                "class": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "root": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "digest": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "via": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "class",
+                "name",
+                "reason"
+              ],
+              "properties": {
+                "class": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "unavailable": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "class",
+                "name",
+                "reason"
+              ],
+              "properties": {
+                "class": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "refusal": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "next": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "hint": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured skill trees removed from the shared native home before this launch (r2); absent on older events."
+          }
+        }
+      },
+      "SeatProfileView": {
+        "type": "object",
+        "description": "Generated shape: SeatProfileView in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "lineageId",
+          "profile",
+          "liveChapter",
+          "pending",
+          "lastLaunch"
+        ],
+        "properties": {
+          "lineageId": {
+            "type": "string"
+          },
+          "profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SeatProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "liveChapter": {
+            "$ref": "#/components/schemas/SeatProfileChapter"
+          },
+          "pending": {
+            "type": "boolean"
+          },
+          "lastLaunch": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "instanceId",
+                  "generation",
+                  "payload"
+                ],
+                "properties": {
+                  "instanceId": {
+                    "type": "string"
+                  },
+                  "generation": {
+                    "type": "integer"
+                  },
+                  "payload": {
+                    "$ref": "#/components/schemas/LaunchCapabilities"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "SeatProfilePutResult": {
+        "type": "object",
+        "description": "Generated shape: SeatProfilePutResult in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "profile",
+          "pending",
+          "changed"
+        ],
+        "properties": {
+          "profile": {
+            "$ref": "#/components/schemas/SeatProfile"
+          },
+          "pending": {
+            "type": "boolean"
+          },
+          "changed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SeatProfileUpdate": {
+        "type": "object",
+        "required": [
+          "expectedRevision"
+        ],
+        "properties": {
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0 creates the profile"
+          },
+          "displayName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modelCandidates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 5
+          },
+          "effort": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "ultracode": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "permissionMode": {
+            "type": "string"
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16
+          }
+        },
+        "additionalProperties": false
+      },
+      "SeatProfileConflict": {
+        "type": "object",
+        "required": [
+          "error",
+          "code",
+          "currentRevision",
+          "reason",
+          "next"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "PROFILE_REVISION_CONFLICT"
+            ]
+          },
+          "currentRevision": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "next": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "hint": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "QueuedCommands": {
         "properties": {
           "commands": {
@@ -10052,6 +10538,102 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/lineages/{id}/profile": {
+      "get": {
+        "operationId": "getLineageProfile",
+        "summary": "A lineage's seat profile, whether an edit waits for the next chapter, and the newest launch snapshot",
+        "description": "cb-seat-profile (D-063, main-agent.md §3.4.2). Human devices may read any lineage; an Agent may read only its own lineage (the seat reads its own profile); a Bot credential gets 403. `pending` is true while the live chapter's applied revision is older than the profile's (「待下一章节生效」). `lastLaunch` is the newest launch.capabilities event of the lineage's chapters.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Seat profile view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeatProfileView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      },
+      "put": {
+        "operationId": "putLineageProfile",
+        "summary": "Edit a lineage's seat profile with a revision compare-and-set",
+        "description": "Only an unnarrowed Human device: an Agent (the seat itself included), a Bot or a Human token narrowed with x-remuda-instance-id gets 403 reason profile-human-only. expectedRevision 0 creates the profile from the live chapter's spec; a stale revision gets 409 PROFILE_REVISION_CONFLICT with currentRevision. An absent field keeps its value. The edit takes effect at the next chapter (restart or resume), never mid-chapter. Each edit writes an audit row lineage.profile.set with the changed field names only.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeatProfileUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Profile after the edit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeatProfilePutResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "description": "Stale expectedRevision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeatProfileConflict"
+                }
+              }
+            }
+          },
+          "422": {
             "$ref": "#/components/responses/Error"
           }
         },

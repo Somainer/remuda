@@ -202,6 +202,16 @@ struct TreeWrite {
 }
 
 impl SkillPlan {
+    /// `skill_tree_digest` of the files [`Self::write`] would write (the
+    /// marker excluded), when a tree is planned (cb-seat-profile).
+    pub(crate) fn tree_digest(&self) -> Option<String> {
+        let tree = self.write.as_ref()?;
+        let entries = tree_entries(tree.appended.as_deref());
+        Some(crate::launch::skills::skill_tree_digest(
+            entries.iter().map(|(rel, bytes)| (*rel, bytes.as_slice())),
+        ))
+    }
+
     /// Write the planned tree, if any, and return the files written.
     pub(crate) fn write(&self) -> DriverResult<Vec<MaterializedFile>> {
         let mut files = Vec::new();
@@ -243,8 +253,7 @@ pub(crate) fn plan(request: &SkillRequest<'_>) -> Option<SkillPlan> {
         }
     } else {
         let root = request.native_home.join("skills").join(SKILL_DIR);
-        let parent_linked = root.parent().is_some_and(is_symlink);
-        if parent_linked || user_owned(&root) {
+        if tree_blocked(&root) {
             SkillTree::Skipped {
                 reason: TreeSkip::UserOwned,
             }
@@ -294,6 +303,12 @@ fn framed(section: &str) -> String {
         "{SKILL_CONTEXT_OPEN}>\n{}\n{SKILL_CONTEXT_CLOSE}",
         body.trim_end()
     )
+}
+
+/// Whether a managed tree at `root` (`<home>/skills/<name>`) must not be
+/// written: `skills` is a symlink, or the tree is the user's ([`user_owned`]).
+pub(crate) fn tree_blocked(root: &Path) -> bool {
+    root.parent().is_some_and(is_symlink) || user_owned(root)
 }
 
 /// A `skills/remuda` Remuda must not write: a symlink, a tree with Remuda's
@@ -367,21 +382,56 @@ fn is_symlink(path: &Path) -> bool {
 fn refuse_user_owned(skills_root: &Path, root: &Path) -> DriverResult<()> {
     if is_symlink(skills_root) || user_owned(root) {
         return Err(DriverError::SettingsIsolationUnavailable(format!(
-            "refusing to write the remuda skill: {} is a symlink or a tree Remuda did not \
-             write; the launch runs without a skill tree",
+            "refusing to write the skill tree: {} is a symlink or a tree Remuda did not \
+             write; the launch runs without it",
             root.display()
         )));
     }
     Ok(())
 }
 
+/// The embedded files, with the section appended to `SKILL.md` when given.
+fn tree_entries(appended: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
+    EMBEDDED_SKILL
+        .iter()
+        .map(|embedded| match appended {
+            Some(section) if embedded.rel == "SKILL.md" => {
+                let mut bytes = embedded.bytes.to_vec();
+                bytes.push(b'\n');
+                bytes.extend_from_slice(section.as_bytes());
+                (embedded.rel, bytes)
+            }
+            _ => (embedded.rel, embedded.bytes.to_vec()),
+        })
+        .collect()
+}
+
 /// Write the embedded tree (and, for a per-instance home, the section appended
-/// to `SKILL.md`) owner-only. Each file is written to a temporary name and
-/// renamed, so a seat sharing the home never reads a half-written file.
+/// to `SKILL.md`) owner-only.
 fn write_tree(
     root: &Path,
     shared: bool,
     appended: Option<&str>,
+    files: &mut Vec<MaterializedFile>,
+) -> DriverResult<()> {
+    let entries = tree_entries(appended);
+    let entries: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(rel, bytes)| (*rel, bytes.as_slice()))
+        .collect();
+    write_managed_tree(root, shared, &entries, FileRole::RemudaSkill, files)
+}
+
+/// Write one Remuda-managed skill tree at `root` (`<home>/skills/<name>`):
+/// the marker first, then every file owner-only through a temporary name and
+/// a rename, so a seat sharing the home never reads a half-written file. The
+/// embedded `remuda` skill and every configured skill (cb-seat-profile) go
+/// through here.
+pub(crate) fn write_managed_tree(
+    root: &Path,
+    shared: bool,
+    entries: &[(&str, &[u8])],
+    role: FileRole,
     files: &mut Vec<MaterializedFile>,
 ) -> DriverResult<()> {
     let skills_root = root.parent().ok_or_else(|| {
@@ -420,38 +470,32 @@ fn write_tree(
     // cleanup then reads a tree that still has its marker.
     let marker_record = MaterializedFile {
         path: marker.to_string_lossy().into_owned(),
-        role: FileRole::RemudaSkill,
+        role,
         mode: "0600".into(),
         content_digest: hash_bytes(MARKER_TEXT)?,
         lifetime,
     };
-    let mut write = |rel: &str, bytes: &[u8]| -> DriverResult<()> {
+    for (rel, bytes) in entries {
         let dest = root.join(rel);
-        if let Some(parent) = dest.parent()
-            && parent != root
-        {
-            ensure_dir(parent)?;
+        // Each directory between the root and the file, outermost first, so
+        // a nested configured tree gets 0700 on every level it creates.
+        let mut dirs: Vec<&Path> = dest
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != root)
+            .collect();
+        dirs.reverse();
+        for dir in dirs {
+            ensure_dir(dir)?;
         }
         write_atomic(&dest, bytes)?;
         files.push(MaterializedFile {
             path: dest.to_string_lossy().into_owned(),
-            role: FileRole::RemudaSkill,
+            role,
             mode: "0600".into(),
             content_digest: hash_bytes(bytes)?,
             lifetime,
         });
-        Ok(())
-    };
-    for embedded in EMBEDDED_SKILL {
-        match appended {
-            Some(section) if embedded.rel == "SKILL.md" => {
-                let mut bytes = embedded.bytes.to_vec();
-                bytes.push(b'\n');
-                bytes.extend_from_slice(section.as_bytes());
-                write(embedded.rel, &bytes)?;
-            }
-            _ => write(embedded.rel, embedded.bytes)?,
-        }
     }
     files.push(marker_record);
     Ok(())
@@ -540,6 +584,32 @@ pub fn render_section(context: &SkillContext) -> String {
             .join(", ")
     };
     out.push_str(&format!("Grants: {grants}.\n\n"));
+    // cb-seat-profile (D-063): the owner's profile for this chapter, as a
+    // fact. The candidates are not a failover list: nothing in Remuda
+    // switches a model on its own.
+    if let Some(profile) = &context.profile {
+        out.push_str(&format!(
+            "Profile (revision {}, set by the owner; edits take effect at your next chapter):",
+            profile.revision.0
+        ));
+        if let Some(name) = &profile.display_name {
+            out.push_str(&format!(" name {name};"));
+        }
+        if let Some(role) = &profile.role {
+            out.push_str(&format!(" role {role};"));
+        }
+        let models = profile
+            .model_candidates
+            .iter()
+            .map(|model| format!("`{model}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            " model candidates {models}, the first being the default. They are a fact, not an \
+             instruction: whether to switch model is your decision, and Remuda never switches \
+             it for you. `remuda lineage profile show` reads the profile again.\n\n"
+        ));
+    }
 
     out.push_str(
         "Any seat:\n\

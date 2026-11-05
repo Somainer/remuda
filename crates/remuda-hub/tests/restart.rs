@@ -603,6 +603,60 @@ async fn a_process_exit_after_running_restarts_once_as_a_native_claude_sdk_resum
     Ok(())
 }
 
+/// cb-seat-profile (D-063, main-agent.md §6.3.1): a C1 restart builds the
+/// successor's spec from the lineage profile at its current revision — the
+/// first model candidate, the profile's effort and mode — and records the
+/// revision on the successor, exactly as an owner Resume does. The edit made
+/// while the chapter ran changed nothing live.
+#[tokio::test]
+async fn a_restart_successor_takes_the_lineage_profile_and_records_its_revision() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, true).await?;
+    let seat = ctx.seat(&mut node).await?;
+    ctx.report_running(&node, &seat, SESSION).await?;
+    let edited: Value = ctx
+        .http
+        .put(format!("{}/v1/lineages/{seat}/profile", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(
+            &json!({"expectedRevision": 0, "modelCandidates": ["model-x", "model-y"],
+                      "effort": {"name": "high"}, "permissionMode": "manual"}),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(edited["profile"]["revision"], json!(1));
+    assert_eq!(
+        ctx.instance(&seat).await?["model"],
+        json!("claude-test-model")
+    );
+
+    ctx.report_killed(&node, &seat).await?;
+    let decided = ctx.supervise().await;
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    let successor = decided[0]["successorInstanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    let (method, create) = node.next_launch().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(create["spec"]["model"], json!("model-x"), "{create}");
+    assert_eq!(
+        create["spec"]["permissionMode"],
+        json!("manual"),
+        "{create}"
+    );
+    assert_eq!(
+        create["spec"]["effort"],
+        json!({"name": "high", "ultracode": false}),
+        "{create}"
+    );
+    assert_eq!(ctx.instance(&successor).await?["profileRevision"], json!(1));
+    Ok(())
+}
+
 // ── §6.3 row 2: start failure ────────────────────────────────────────────
 
 /// A chapter that never started is a start failure (`start-failed`), and

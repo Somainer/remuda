@@ -245,6 +245,7 @@ fn inject_hook_writes_launch_dir_not_native_home_and_keeps_sources() {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: &[],
         spec: &{
             let cwd = tmp.path().join("work");
             fs::create_dir_all(&cwd).unwrap();
@@ -326,6 +327,7 @@ fn tty_bypass_strips_print_flag() {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: &[],
         spec: &spec,
         profile: &profile(),
         launch_dir: launch,
@@ -431,6 +433,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: Vec::new(),
         instance_id: None,
         media_stager: None,
         profile: profile(),
@@ -523,6 +526,7 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: Vec::new(),
         instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),
@@ -637,6 +641,7 @@ async fn bg_attach_before_dispatch_would_wake() {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: Vec::new(),
         instance_id: None,
         profile: profile(),
         launch_dir: launch,

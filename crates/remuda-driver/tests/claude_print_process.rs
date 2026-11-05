@@ -175,6 +175,7 @@ impl KindName for remuda_protocol::ObservationKind {
             Self::Permission => "permission",
             Self::RawTty => "raw_tty",
             Self::Opaque => "opaque",
+            Self::LaunchCapabilities => "launch.capabilities",
         }
     }
 }

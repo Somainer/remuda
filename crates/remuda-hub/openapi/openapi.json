@@ -1468,6 +1468,11 @@
           "durableSeq": {
             "type": "string"
           },
+          "configureSeq": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "cb-command-queue (protocol.md §8.5): the runtime-config generation; each committed instance.configure spec merge (and each restore by a withdrawal) adds one. A configure's expectedGeneration is compared against it."
+          },
           "effortIndex": {
             "description": "Legacy per-harness table index. Preserved for older clients; never used to derive the tier, because the old tables differed in length per harness.",
             "type": [

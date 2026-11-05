@@ -9,9 +9,11 @@
  */
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandResult } from "../types/command";
-import { api } from "./api";
+import { api, mapInstance } from "./api";
+import type { components } from "./api.generated";
 import { HubHttpError } from "./httpError";
 import { hubStore } from "./store";
+import type { Id } from "../types/wire";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -79,4 +81,64 @@ it("keeps the Hub's deferred boundary on the pending switch", async () => {
   vi.spyOn(api, "instanceConfigure").mockResolvedValue(result(3, "next-turn"));
   await hubStore.setModel("ins_cfg_deferred", "opus");
   expect(hubStore.modelPendingOf("ins_cfg_deferred")?.deferred).toBe("next-turn");
+});
+
+/** Boot the store on one Hub instance record, as a fresh page load does. */
+async function boot(record: components["schemas"]["InstanceRecord"]) {
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [mapInstance(record)], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(api, "settlementSubscribe").mockReturnValue(() => undefined);
+  await hubStore.bootstrap();
+}
+
+function record(id: string, configureSeq: number): components["schemas"]["InstanceRecord"] {
+  return {
+    instanceId: id, hostId: "hst_cfg", kind: "claude", driver: "claude-pty", lifecycle: "running",
+    activity: "idle", connectivity: "connected", journalId: "obj_cfg", durableSeq: "1",
+    lineageId: id, generation: 1, configureSeq,
+  };
+}
+
+it("maps the Hub's configureSeq, so a fresh page's first configure names it", async () => {
+  expect(mapInstance(record("ins_cfg_map", 4)).configureSeq).toBe(4);
+  const seen: (number | undefined)[] = [];
+  try {
+    await boot(record("ins_cfg_fresh", 7));
+    vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _mode, extras) => {
+      seen.push(extras?.expectedGeneration);
+      return result(8);
+    });
+    await hubStore.setModel("ins_cfg_fresh" as Id, "opus");
+    expect(seen).toEqual([7]);
+  } finally {
+    hubStore.logout();
+  }
+});
+
+it("re-seeds from the current generation after a conflict", async () => {
+  const seen: (number | undefined)[] = [];
+  let n = 0;
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _mode, extras) => {
+    seen.push(extras?.expectedGeneration);
+    n += 1;
+    if (n === 2) {
+      throw new HubHttpError(409, "CONFIG_GENERATION_CONFLICT", "runtime config is at generation 9");
+    }
+    return result(n === 1 ? 5 : 10);
+  });
+  vi.spyOn(api, "instanceConfig").mockResolvedValue({
+    instanceId: "ins_cfg_reseed", generation: 9, model: null, effort: null,
+    permissionMode: null, effective: {}, pending: [],
+  } as never);
+  vi.spyOn(hubStore, "refresh").mockResolvedValue(undefined as never);
+  await hubStore.setModel("ins_cfg_reseed", "opus");
+  await hubStore.setModel("ins_cfg_reseed", "sonnet");
+  await hubStore.setModel("ins_cfg_reseed", "haiku");
+  expect(seen).toEqual([undefined, 5, 9]);
 });

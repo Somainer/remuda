@@ -3080,6 +3080,8 @@ export interface components {
             readonly autoContinue?: boolean;
             /** @description D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance. */
             readonly chapterCause?: string | null;
+            /** @description cb-command-queue (protocol.md §8.5): the runtime-config generation; each committed instance.configure spec merge (and each restore by a withdrawal) adds one. A configure's expectedGeneration is compared against it. */
+            configureSeq?: number;
             connectivity: string;
             createdAt?: string;
             /**

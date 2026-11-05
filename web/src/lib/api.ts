@@ -485,6 +485,8 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     // D-057 §5 lineage fields, verbatim (ma-main-ui resolves Main from them).
     ...(typeof rec.lineageId === "string" && rec.lineageId ? { lineageId: rec.lineageId as Id } : {}),
     ...(typeof rec.generation === "number" ? { generation: rec.generation } : {}),
+    // cb-command-queue: the runtime-config generation a configure is based on.
+    ...(typeof rec.configureSeq === "number" ? { configureSeq: rec.configureSeq } : {}),
     ...(typeof rec.chapterCause === "string" ? { chapterCause: rec.chapterCause } : {}),
     ...(typeof rec.fencedAt === "string" ? { fencedAt: rec.fencedAt } : {}),
     ...(Array.isArray(extra.grants)

@@ -8539,7 +8539,13 @@ class HubStore {
       return result;
     } catch (error) {
       if (error instanceof HubHttpError && error.code === "CONFIG_GENERATION_CONFLICT") {
-        this.configureGenerations.delete(instanceId);
+        // Re-seed from the current generation, so the user's next choice is
+        // again a CAS against what they were just shown.
+        const current = await api
+          .instanceConfig(instanceId)
+          .then((view) => view.generation, () => undefined);
+        if (typeof current === "number") this.configureGenerations.set(instanceId, current);
+        else this.configureGenerations.delete(instanceId);
         await this.refresh().catch(() => undefined);
         throw new HubHttpError(409, error.code, "配置已在别处被修改，已载入当前值，请按当前值重新选择");
       }

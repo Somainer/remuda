@@ -53,6 +53,23 @@ class AffectedTests(unittest.TestCase):
         self.assertEqual(affected.select_crates(self.graph, [])[0], [])
         self.assertEqual(affected.select_crates(self.graph, ["crates/cli/README.md"])[0], ["cli"])
 
+    def test_the_parity_ledger_selects_the_crates_that_read_it(self):
+        # `--affected` must not skip the drift check (remuda) or the skill test
+        # (remuda-driver) when a branch touches only the ledger.
+        graph = metadata({"remuda": [], "remuda-driver": [], "other": []})
+        self.assertEqual(
+            affected.select_crates(graph, ["docs/design/agent-parity.md"])[0],
+            ["remuda", "remuda-driver"])
+        self.assertEqual(
+            affected.select_crates(graph, ["docs/design/agent-parity.generated.json"])[0],
+            ["remuda"])
+        self.assertEqual(affected.select_crates(graph, ["docs/design/loop.md"])[0], [])
+        # A crate the ledger names but the workspace does not have is skipped,
+        # never invented.
+        graph = metadata({"remuda": []})
+        self.assertEqual(
+            affected.select_crates(graph, ["docs/design/agent-parity.md"])[0], ["remuda"])
+
     def test_nested_packages_use_deepest_owner_and_paths_have_boundaries(self):
         self.assertEqual(len(affected.select_crates(self.graph, ["crates/cli-other/a.rs"])[0]), 5)
         self.graph["packages"][0]["manifest_path"] = "/repo/Cargo.toml"

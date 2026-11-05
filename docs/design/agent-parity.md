@@ -1,6 +1,33 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Derived from origin/main `c27e0eac`: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Coverage was checked mechanically against that tree: every exported method of `web/src/lib/api.ts` (71), every Hub route (126 method-and-path pairs, plus the static web fallback) and every clap entry (98, of which 14 are pure command groups) maps to a row below, to "Hub routes no human action calls", or to "Not agent actions". The machine half is a later task: a table generated from the Hub router, `restrict_agent_routes` and the clap registry, with a gate check that the two halves do not drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
+
+## The two halves
+
+This file is the **human half**: a person reads a row, its class, and what is planned. `docs/design/agent-parity.generated.json` beside it is the **machine half**, generated — never edited — from three live sources:
+- every Hub route registration under `crates/remuda-hub/src` (recursively, so nested modules count), unioned with the documented OpenAPI paths (which alone carry the nest-mounted `/push` carrier);
+- the middleware's own predicate, `agent_route_admission` in `crates/remuda-hub/src/agent_scope.rs` — the function `restrict_agent_routes` calls for every Agent-origin request — so the `middleware` column is the enforcement path itself, not a reading of it;
+- the `remuda` clap tree from `Command::get_subcommands`.
+
+It is JSON and not a second markdown table because it is the machine's copy: the check compares its bytes for staleness, and JSON has one canonical serialization — no escaping or column-width ambiguity — for a reader as much as for the code.
+
+Each route records `middleware` (`admitted`, `owner-scoped` with the ownership it is pinned to, `refused`, or `skipped` when the middleware resolves no caller and the handler decides) and `handler`, the closest gate the source scan can read reliably (`operator-only`, `grant: <verb>`, `scope`, or `handler-checked` when it cannot). A command records its clap path and whether it is a group; its `hubRoutes` is empty because the clap registry holds an argv shape, not the REST calls a command makes — the Hub route column above is that record.
+
+Regenerate after changing a route, a handler gate or the clap tree:
+
+```sh
+cargo run -p remuda --example gen_parity            # rewrite the generated file
+cargo run -p remuda --example gen_parity -- --check # stale file or drift fails
+```
+
+The drift check (in the `remuda` test suite, so the gate runs it) fails, naming the row or route and the file to fix, when:
+
+- the generated file is stale;
+- a Hub route or a clap leaf appears in neither this file nor a commented "no human row" entry;
+- a row names a route no Hub route registers;
+- a row's class contradicts the machine half. A Today cell that begins exactly `Agent route.` claims its Hub routes are middleware-admitted, and **every** Today cell that begins `Agent route` must carry that claim for each route it names: a prefix the check cannot read fails it. A `Gap.` or `Safety.` cell that names a middleware refusal ("not admitted", "restrict_agent_routes", "`read_target`", "the middleware") claims the opposite for its routes, unless the cell also names a segment where the route is admitted. A row that mixes admitted and refused paths ("Agent route by another path", "Gap without `--project`") is listed by name with its reason in `AGENT_ROUTE_EXEMPTIONS` (`crates/remuda/src/parity.rs`); an exemption that no longer matches a row fails too.
+
+The check does not decide the class for you: a handler-level refusal (`require_operator`, a missing grant) is a `Safety`/`Gap` row with no middleware claim, exactly as the columns below describe.
 
 ## The rule
 
@@ -10,7 +37,7 @@ The ledger makes that rule auditable, and it keeps the seat's skill (`ma-skill`,
 
 ## Columns and classes
 
-- **Today (origin/main)** is what an Agent-origin caller gets on origin/main `c27e0eac`, with every prerequisite the code checks. It starts with one class:
+- **Today (origin/main)** is what an Agent-origin caller gets on origin/main today, with every prerequisite the code checks. It starts with one class:
   - **Agent route.** The middleware admits the path for Agent origin, and the handler admits it under the grant, scope and posture listed. Per-call D-017 approvals are listed too.
   - **Safety.** A real safety property stops it, and the row names the property:
     - approvals are answered only by humans (D-017, D-051(a));
@@ -54,26 +81,43 @@ Two limits recur below:
 | Read the transcript; load earlier; the events tab | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | Follow the session live | `GET /v1/follow` (WebSocket) | Agent route by another path: the socket is not admitted for Agent origin, and an agent reads the same journal by cursor (`remuda instance read`, `remuda instance wait`) | Phase 2 facts push changes to the parent (`cb-inbox-facts`, `cb-inbox-deliver`) |
 | See usage and context | `GET /v1/instances/{id}` (the projection's `usageRollup`) | Agent route. Owned targets | — |
+| See what the session remembered (`已记住` receipts, the transcript's write rows) | `GET /v1/instances/{id}/memory-writes` | Gap. Not admitted for Agent origin (`restrict_agent_routes` has no shape for it), although the rows are one writer chapter's own writes; the handler admits Human and Bot (`crates/remuda-hub/src/memory.rs`). An agent reads the entries themselves through the memory routes below | `ap-memory-writes` |
+| Mark the session seen on this device | `POST /v1/instances/{id}/seen` | Safety. Records are truthful: the seen mark records what the owner looked at (D-060 `seen-hub`); only a Human device credential may advance it (`crates/remuda-hub/src/instances.rs`) | — |
 | Send a new turn | commands, `instance.send` | Agent route. The send rule | — |
 | Queue a prompt while the session works | held in the browser, then `instance.send` in queue mode | Agent route. The send rule | — |
 | Steer with a held prompt | `instance.send` in steer mode | Agent route. The send rule | — |
 | See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
-| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
+| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
 | Answer an approval inline | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans (D-017, D-051(a)) | — |
 | Change the model | commands, `instance.configure` | Gap. `authorize_command` admits only send, cancel, close, `tty.write` and keys for Agent origin | `ap-configure` |
 | Change the effort | commands, `instance.configure` | Gap. As above | `ap-configure` |
 | Toggle ultracode, independently of effort (D-056; `onUltracode` in `web/src/pages/SessionPage.tsx`) | commands, `instance.configure` | Gap. As above | `ap-configure` |
 | Change the permission mode | commands, `instance.configure` | Gap. As above | `ap-configure-mode`, after an owner decision on how OA1 applies to a mode change |
+| Turn auto-continue on or off for a session | `PATCH /v1/instances/{id}` | Safety. Act only on what you own: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device only, and an agent turns it on for its own children when it dispatches them | — |
 | Attach a file | `POST /v1/objects` | Gap. Operator-only (`upload` in `crates/remuda-hub/src/objects.rs`) | `ap-attachments` |
 | Open an attachment | `GET /v1/objects/{id}` | Gap. Operator-only for devices; an agent reads only its own session's attachments, through `GET /v1/attachments/{objectId}/content` (D-028) | `ap-attachments` (owned targets) |
 | Send keys from the key bar | commands, `instance.keys` | Safety. Keystrokes | — |
 | Type into the terminal | `/v1/follow?tty=1` | Safety. Keystrokes: the socket is not admitted for Agents, and `tty.write` always needs the D-017 approval | — |
 | See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/diff`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
 | Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Gap. Refused by `read_target`, as for command reads, though the handler re-checks ownership | `ap-subagent-read` |
-| See Main's seat profile, its pending badge and the last launch snapshot (cb-seat-profile, D-063) | `GET /v1/lineages/{id}/profile` | Agent route for the caller's own lineage only (the seat reads its own profile and model candidates; main-agent.md §3.4.2) | — |
+| See Main's seat profile, its pending badge and the last launch snapshot (cb-seat-profile, D-063) | `GET /v1/lineages/{id}/profile` | Agent route. The caller's own lineage only (the seat reads its own profile and model candidates; main-agent.md §3.4.2) | — |
 | Edit Main's seat profile (identity, model candidates, effort, permission mode, skills) | `PUT /v1/lineages/{id}/profile` with `expectedRevision` | Safety. Delegation never widens authority: the profile holds the permission mode its next chapter launches with, so only an unnarrowed Human edits it; an Agent (the seat itself included) gets 403 `profile-human-only` (OA1, OA2) | — |
+
+### Memory, inbox and wake-ups (`/memory`, `/`)
+
+D-060 landed these on the Hub; the PWA surfaces are `cb-memory-ui` (memory), `home-wakes` (the wake rows on the home page) and `cb-owner-notify` (the "to you" cards).
+
+| Human action | Hub route | Today (origin/main) | Planned |
+|---|---|---|---|
+| Browse, search and edit the lineage's memory entries | `GET /v1/lineages/{id}/memory`, `POST /v1/lineages/{id}/memory`, `GET /v1/lineages/{id}/memory/entries/{slug}`, `PUT /v1/lineages/{id}/memory/entries/{slug}`, `DELETE /v1/lineages/{id}/memory/entries/{slug}`, `GET /v1/lineages/{id}/memory/index`, `GET /v1/lineages/{id}/memory/search`, `POST /v1/lineages/{id}/memory/consolidate` | Agent route. The caller's own lineage (`memory_target`); a write is admitted only from the lineage's current chapter (`memory_caller`), every write is a revision CAS, and the owner writes the same entries from the PWA | PWA editor: `cb-memory-ui` |
+| Restore archived entries; the owner's one-time import; the entries a deleted journal row derived | `POST /v1/lineages/{id}/memory/restore`, `POST /v1/lineages/{id}/memory/import`, `GET /v1/memory/derived` | Safety. Owner-only, and not admitted for Agent origin: restoring re-opens archived records, `import` is the Phase 1 file import, and `derived` is the privacy-deletion view (`crates/remuda-hub/src/memory.rs`) | — |
+| Read and tune the lineage's fact inbox | `GET /v1/lineages/{id}/inbox`, `PATCH /v1/lineages/{id}/inbox` | Agent route. The caller's own lineage; only a Human caller may change the owner's opt-in | — |
+| Manage wake-ups | `GET /v1/lineages/{id}/wake-ups`, `POST /v1/lineages/{id}/wake-ups`, `DELETE /v1/lineages/{id}/wake-ups/{wake}` | Agent route. The caller's own lineage; a write runs the initiating-turn check | PWA rows: `home-wakes` |
+| Tell the owner | `POST /v1/owner/notify` | Agent route. Requires `address-owner` and the initiator check; a Bot is refused whatever instance it names | — |
+| Read the "to you" cards and acknowledge them | `GET /v1/owner/notices`, `POST /v1/owner/notices/{id}/ack` | Safety. Act only on what you own: the cards are addressed to the owner and can carry another chapter's words; the handler takes an owner device | "to you" card: `cb-owner-notify` |
+| See the owner's glance (counts, today's completions) | `GET /v1/owner/glance` | Safety. Act only on what you own: the glance spans Main's subtree and the owner's own sessions, wider than any one lineage; a seat reads its own lineage through `GET /v1/lineages/{id}/glance` | — |
 
 ### New session (`/sessions/new`)
 
@@ -93,8 +137,9 @@ Two limits recur below:
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | List pending items | `GET /v1/interactions`; settlement frames on `GET /v1/follow` (`settlementSubscribe`) | Agent route under the D-051 limits for the list. The settlement frames ride the follow socket, which is not admitted for Agent origin; an agent re-reads the list instead | — |
-| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
+| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
 | Answer an approval | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans | — |
+| Resolve an unknown Landing, or attach a gate job's evidence | `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve`, `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence` | Safety. Approvals and records are the owner's: the handler calls `require_operator`, so an Agent caller is stopped even holding `land`, and the outcome is recorded against the device | — |
 
 ### Board and projects (`/board`, `/projects`)
 
@@ -125,6 +170,9 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Change a host's provider binding | `GET /v1/providers` (filtered by `hostId`), then `PATCH /v1/hosts/{id}` | Safety. Credentials: it picks which provider credential every session on the host uses | — |
 | Change a host's launch defaults: default args, Claude binary, default TUI | `PATCH /v1/hosts/{id}` | Safety. An agent never chooses argv or an executable (`restrict_launch_overrides`), and the defaults apply to every session on the host | — |
 | Unregister a workspace | `DELETE /v1/hosts/{id}/workspaces` | Safety. Act only on what you own, as for registering | — |
+| List a host's external herdr panes (D-062) | `GET /v1/hosts/{id}/herdr` | Safety. Cross-host: a Human operator only, and the middleware refuses the path for Agent origin | — |
+| Claim a herdr pane as an instance | `POST /v1/instances/claim` | Safety. Delegation never widens authority: a claimed pane runs with a permission mode and credentials Remuda never set (`docs/design/herdr-claim.md` §1), and the middleware refuses the path for Agent origin | — |
+| Release a claimed pane (detach only) | `POST /v1/instances/{id}/release` | Safety. As claiming: the pane and its process keep running, and the middleware refuses the path for Agent origin | — |
 
 ### Providers (`/providers`)
 
@@ -163,13 +211,16 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
 | `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
-| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | — |
+| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
 | `instance stop` | commands, `instance.cancel` or `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | `instance rm` | commands, `instance.close` | Agent route. As `instance stop` | — |
-| `lineage profile show` | `GET /v1/lineages/{id}/profile` (and `GET /v1/caller` when the lineage is omitted) | Agent route for the caller's own lineage, as the PWA read | — |
+| `instance set` | `PATCH /v1/instances/{id}` | Safety. Owner-only: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device, and an agent asks for it on the children it dispatches | — |
+| `instance claim` | `POST /v1/instances/claim` | Safety. As "Claim a herdr pane as an instance": a Human operator only (D-062) | — |
+| `instance release` | `POST /v1/instances/{id}/release` | Safety. As "Release a claimed pane": a Human operator only (D-062) | — |
+| `lineage profile show` | `GET /v1/lineages/{id}/profile` (and `GET /v1/caller` when the lineage is omitted) | Agent route. The caller's own lineage, as the PWA read | — |
 | `lineage profile set` | `GET`, then `PUT /v1/lineages/{id}/profile` | Safety. As the PWA edit: only an unnarrowed Human | — |
 
 ### Projects, tasks and ownership
@@ -212,14 +263,14 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route for the worker part: `observe` is scope-wide under `dispatch`. Gap for the cross-project gate read, which is not admitted | `ap-gate-reads` |
 | `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route for `GET /v1/workers` (scope-wide under `dispatch`). Gap without `--project`: the gate read is refused | `ap-gate-reads` |
 | `retire` | `POST /v1/workers/{id}/retire` | Agent route. `dispatch`, project scope, and the worker in the caller's lineage subtree (main-agent.md §4.2 item 1) | — |
-| `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route, as `retire` | — |
-| `worker answer` | `POST /v1/workers/{id}/answer` | Agent route, as `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
-| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Agent route, as `retire` | — |
-| `worker resume` | `POST /v1/workers/{id}/resume` | Agent route, as `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
-| `worker replace` | `POST /v1/workers/{id}/replace` | Agent route, as `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
-| `worker stop` | `POST /v1/workers/{id}/stop` | Agent route, as `retire` | — |
+| `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route. As `retire` | — |
+| `worker answer` | `POST /v1/workers/{id}/answer` | Agent route. As `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
+| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Agent route. As `retire` | — |
+| `worker resume` | `POST /v1/workers/{id}/resume` | Agent route. As `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
+| `worker replace` | `POST /v1/workers/{id}/replace` | Agent route. As `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
+| `worker stop` | `POST /v1/workers/{id}/stop` | Agent route. As `retire` | — |
 | `worker digest` | `GET /v1/workers/{id}/digest` | Agent route. `dispatch` and project scope, like the other scope-wide worker reads (main-agent.md §10.2); a fact batch's footer points at it | — |
-| `brief send` | `POST /v1/workers/{id}/brief` | Agent route, as `retire` | — |
+| `brief send` | `POST /v1/workers/{id}/brief` | Agent route. As `retire` | — |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 
 ### Fleet, host files and diagnostics
@@ -227,11 +278,12 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `fleet run` | `POST /v1/fleet/instances` | Agent route. `dispatch`, checked as each child is inserted (`validate_child_delegation`); the D-017 approval when any chosen host is not the caller's host or the driver is a shell driver (`create_fleet`); the permission mode follows "never beyond the creator" (OA1) | — |
-| `fleet send` | `POST /v1/fleet/broadcast`, `instance.send` | Agent route, as "Broadcast a prompt"; `--all` is refused | — |
+| `fleet send` | `POST /v1/fleet/broadcast`, `instance.send` | Agent route. As "Broadcast a prompt"; `--all` is refused | — |
 | `fleet keys` | `POST /v1/fleet/broadcast`, `tty.write` | Safety. Keystrokes | — |
 | `host files list` | `GET /v1/hosts/{id}/files` | Safety. Cross-host, as for workspace changes (`host_files.rs`) | — |
 | `host files get` | `POST /v1/hosts/{id}/files/read`, `GET /v1/objects/{id}` | Safety. Cross-host, as above | — |
 | `host files search` | `POST /v1/hosts/{id}/files/search` | Safety. Cross-host, as above | — |
+| `host herdr list` | `GET /v1/hosts/{id}/herdr` | Safety. Cross-host: a Human operator only, and the middleware refuses the path for Agent origin (D-062) | — |
 | `doctor` | `GET /v1/hosts/{id}/doctor` | Gap. Operator-only (`doctor_host`) | `ap-host-read` (hosts in the caller's scope) |
 
 ### Providers and supply: `remuda profile`
@@ -246,6 +298,24 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | `profile event` (report observed supply evidence: a 429 cools a window) | `POST /v1/providers/{id}/supply/events` | Gap. Not admitted for Agent origin | `ap-supply-event`: evidence from workers the caller owns, recorded with the caller |
 | `profile declare` | `PUT /v1/providers/{id}/supply` | Safety. Act only on what you own: it rewrites the supply envelope every session on that provider is admitted against | — |
 | `profile delivery` | `PATCH /v1/providers/{id}` (`delivery`) | Safety. Credentials: it moves where a provider credential's traffic leaves from (D-047) | — |
+
+### Memory, wake-ups and glance (D-060)
+
+| Subcommand | Hub route | Today (origin/main) | Planned |
+|---|---|---|---|
+| `memory write` | `POST /v1/lineages/{id}/memory` (create), `PUT /v1/lineages/{id}/memory/entries/{slug}` (revision CAS update) | Agent route. The caller's own lineage; a create or update only from the lineage's current chapter | — |
+| `memory read` | `GET /v1/lineages/{id}/memory/entries/{slug}` | Agent route. The caller's own lineage | — |
+| `memory search` | `GET /v1/lineages/{id}/memory/search` | Agent route. The caller's own lineage | — |
+| `memory index` | `GET /v1/lineages/{id}/memory/index` | Agent route. The caller's own lineage | — |
+| `memory rm` | `DELETE /v1/lineages/{id}/memory/entries/{slug}` | Agent route. The caller's own lineage; the delete carries the revision it replaces | — |
+| `memory consolidate` | `POST /v1/lineages/{id}/memory/consolidate` | Agent route. The caller's own lineage; one writer transaction merges the sources | — |
+| `memory restore` | `POST /v1/lineages/{id}/memory/restore` | Safety. Owner-only, and not admitted for Agent origin: restoring re-opens archived records | — |
+| `memory import` | `POST /v1/lineages/{id}/memory/import` | Safety. The owner's one-time Phase 1 file import; not admitted for Agent origin | — |
+| `wake add` | `POST /v1/lineages/{id}/wake-ups` | Agent route. The caller's own lineage; the initiating-turn check applies, and a `check` on the creator's own host follows OA1 | — |
+| `wake list` | `GET /v1/lineages/{id}/wake-ups` | Agent route. The caller's own lineage | — |
+| `wake rm` | `DELETE /v1/lineages/{id}/wake-ups/{wake}` | Agent route. The caller's own lineage | — |
+| `glance` | `GET /v1/lineages/{id}/glance` | Agent route. The caller's own lineage; read-only, capped at 50 rows per list | — |
+| `owner notify` | `POST /v1/owner/notify` | Agent route. Requires `address-owner` and the initiating-turn check; a Bot is refused whatever instance it names | — |
 
 ### Processes and local commands
 
@@ -306,14 +376,14 @@ These change only a person's own browser or device:
 
 ## Agent-first verbs from D-060
 
-These are not on origin/main. Each is built for the seat first; the owner's counterpart is listed.
+These were built for the seat first, and they have all landed: the rows are in "Memory, wake-ups and glance" (CLI) and "Memory, inbox and wake-ups" (PWA). What remains is the owner's counterpart, not the Agent route.
 
 | Verb | Hub route | Owner counterpart | Task |
 |---|---|---|---|
-| `remuda memory write`, `read`, `search`, `rm`, `consolidate` | `/v1/lineages/{id}/memory…` (protocol.md §8.4) | PWA memory page, `about-me` editor | `cb-memory-core`, `cb-memory-ui` |
+| `remuda memory write`, `read`, `search`, `rm`, `consolidate` | `POST /v1/lineages/{id}/memory`, `GET /v1/lineages/{id}/memory/entries/{slug}` | PWA memory page, `about-me` editor | `cb-memory-ui` |
 | `remuda worker digest`, `remuda glance` | `GET /v1/workers/{id}/digest`, `GET /v1/lineages/{id}/glance` | PWA board projection | `cb-digest` |
-| `remuda wake add`, `list`, `rm` | `/v1/lineages/{id}/wake-ups…` (main-agent.md §11.9, protocol.md §8.4; built by `cb-wake-engine`, the check is `cb-wake-check`) | wake-ups shown in Main's status | `cb-wake-engine`, `cb-wake-check` |
-| `remuda owner notify` | owner-notify route (main-agent.md §11.5), `address-owner` only | "to you" cards | `cb-owner-notify` |
+| `remuda wake add`, `list`, `rm` | `GET /v1/lineages/{id}/wake-ups`, `POST /v1/lineages/{id}/wake-ups`, `DELETE /v1/lineages/{id}/wake-ups/{wake}` (main-agent.md §11.9, protocol.md §8.4) | wake-ups shown in Main's status | `home-wakes` |
+| `remuda owner notify` | `POST /v1/owner/notify` (main-agent.md §11.5), `address-owner` only | "to you" cards | `cb-owner-notify` |
 
 ## Gap index
 
@@ -329,6 +399,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
 | `ap-subagent-read` | a subagent's transcript |
+| `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |
 | `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |
 | `ap-supply-read` | `profile catalog`, `list`, `show`, `usage`, `probe`; the provider list; the model and supply catalog |

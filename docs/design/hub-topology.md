@@ -154,7 +154,7 @@ doc comment 留锚，`crates/remuda-hub/src/store.rs:4768-4780`）：
 ### 5.1 一致性前提：先停后拷
 
 推荐且迁移时**必须**的顺序是先让 Hub 干净退出：CLI 同时安装 SIGTERM/SIGINT
-处理（`crates/remuda/src/main.rs:56-83`），退出触发优雅关闭
+处理（`crates/remuda/src/lib.rs:65-100`），退出触发优雅关闭
 （`crates/remuda/src/cmd/hub.rs:117-127`），writer 线程在 Stop 时执行
 `PRAGMA wal_checkpoint(TRUNCATE)`（`crates/remuda-hub/src/store.rs:1496`）。
 脚本对在线库只做**尽力** checkpoint（本机有 `sqlite3` 时尝试
@@ -280,7 +280,7 @@ doc comment 留锚，`crates/remuda-hub/src/store.rs:4768-4780`）：
 **顺序硬约束**：
 
 1. **旧机先 SIGTERM**：等待优雅退出完成（信号处理
-   `crates/remuda/src/main.rs:56-83`、优雅关闭 `crates/remuda/src/cmd/hub.rs:117-127`、
+   `crates/remuda/src/lib.rs:65-100`、优雅关闭 `crates/remuda/src/cmd/hub.rs:117-127`、
    WAL checkpoint `crates/remuda-hub/src/store.rs:1496`），并确认进程已不在——
    §3 的 hub.lock 实现后这一步同时让出单例锁；
 2. 再做加密备份（§5）、带外传至新机、校验解密（§6.1 步骤 1–3）；

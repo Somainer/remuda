@@ -5020,10 +5020,13 @@ pub(crate) async fn forward_if_online(
     object.remove(CREATOR_PERMISSION_MODE_FIELD);
     // ma-skill: likewise the seat's launch facts.
     object.remove("skillContext");
+    // cb-seat-profile r3: and the lineage's revoked skills.
+    object.remove(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD);
     if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("memoryContext");
         spec.remove(CREATOR_PERMISSION_MODE_FIELD);
         spec.remove("skillContext");
+        spec.remove(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD);
     }
     if command.operation == "instance.send"
         && let Some(rev) = state
@@ -5094,6 +5097,23 @@ pub(crate) async fn forward_if_online(
                         .map_err(|error| HubError::Internal(error.to_string()))?,
                 );
             }
+        }
+        // cb-seat-profile r3: the configured skills this lineage installed
+        // in an earlier chapter and this launch no longer names; the Node
+        // removes exactly these (main-agent.md §3.4.2). None for a first
+        // chapter or a non-chapter instance.
+        let configured = crate::seat_profile::configured_names(
+            object.get("spec").unwrap_or(&Value::Null),
+        );
+        let revoked = state
+            .store
+            .revoked_skills(instance_id.clone(), configured)
+            .await?;
+        if !revoked.is_empty() {
+            object.insert(
+                remuda_protocol::hubnode::REVOKED_SKILLS_FIELD.into(),
+                serde_json::json!(revoked),
+            );
         }
         // D-057 OA1: an Agent-origin create carries its creator's mode, as
         // committed on the instance row at the create's commit point — never

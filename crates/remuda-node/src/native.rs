@@ -421,10 +421,10 @@ impl DriverFactory for NativeClaudeFactory {
             .unwrap_or_default();
         let launch_capabilities = snapshot.map(|snapshot| {
             let mut payload = snapshot.payload;
-            // r2: a skill dropped from the list leaves the shared home before
-            // this launch starts, unless the launch is refused (a refused
-            // launch changes nothing). Only Remuda-managed trees, and only in
-            // a home Remuda manages.
+            // r3: a skill this lineage dropped leaves the home before this
+            // launch starts, unless the launch is refused (a refused launch
+            // changes nothing). Exactly the Hub's `revokedSkills`, never
+            // another seat's tree, and only in a home Remuda manages.
             if payload.refusal.is_none()
                 && home_managed
                 && launch.request.kind == remuda_protocol::AgentKind::Claude
@@ -433,8 +433,11 @@ impl DriverFactory for NativeClaudeFactory {
                     .iter()
                     .map(|skill| skill.name.clone())
                     .collect();
-                payload.removed =
-                    remuda_driver::launch::capabilities::remove_stale_skills(&native_home, &keep);
+                payload.removed = remuda_driver::launch::capabilities::remove_revoked_skills(
+                    &native_home,
+                    &launch.request.revoked_skills,
+                    &keep,
+                );
             }
             payload
         });
@@ -1997,6 +2000,7 @@ mod tests {
                 memory_context: None,
                 skill_context: None,
                 skills: Vec::new(),
+                revoked_skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2215,6 +2219,7 @@ mod tests {
                 memory_context: None,
                 skill_context: None,
                 skills: Vec::new(),
+                revoked_skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2430,6 +2435,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2586,6 +2592,7 @@ mod tests {
                 memory_context: None,
                 skill_context: None,
                 skills: Vec::new(),
+                revoked_skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2651,6 +2658,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2707,6 +2715,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2767,6 +2776,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -2831,6 +2841,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3318,6 +3329,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3746,6 +3758,7 @@ mod tests {
                 memory_context: None,
                 skill_context: None,
                 skills: Vec::new(),
+                revoked_skills: Vec::new(),
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3756,6 +3769,7 @@ mod tests {
                 memory_context: None,
                 skill_context: None,
                 skills: Vec::new(),
+                revoked_skills: Vec::new(),
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3768,6 +3782,7 @@ mod tests {
             memory_context: None,
             skill_context: None,
             skills: Vec::new(),
+            revoked_skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,

@@ -304,6 +304,95 @@ fn doc_from_spec(kind: &str, spec: &Value) -> Doc {
     }
 }
 
+/// cb-seat-profile r3: the configured skills a chapter launch must remove
+/// from its native home — the names the lineage's newest earlier chapter
+/// with a launch snapshot resolved and installed there (a configured skill,
+/// `spec` source, under `native-home`), minus the names this launch
+/// configures (`configured`, base names). A first chapter, or an instance
+/// with no lineage history, gets none: removal is the lineage's own
+/// revocation, never a sweep of a shared home other seats use.
+pub(crate) fn revoked_skills(
+    conn: &Connection,
+    instance_id: &str,
+    configured: &[String],
+) -> Result<Vec<String>, StoreError> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT lineage_id, generation FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(lineage_id), generation)) = row else {
+        return Ok(Vec::new());
+    };
+    if generation <= 1 {
+        return Ok(Vec::new());
+    }
+    let earlier: Option<String> = conn
+        .query_row(
+            "SELECT launch_capabilities_json FROM instances
+             WHERE lineage_id = ?1 AND generation < ?2 AND launch_capabilities_json IS NOT NULL
+             ORDER BY generation DESC, created_at DESC LIMIT 1",
+            params![lineage_id, generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) =
+        earlier.and_then(|raw| serde_json::from_str::<LaunchCapabilitiesPayload>(&raw).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(installed_minus(&payload, configured))
+}
+
+/// The configured skills `payload` installed in the native home, minus
+/// `configured`, sorted.
+pub(crate) fn installed_minus(
+    payload: &LaunchCapabilitiesPayload,
+    configured: &[String],
+) -> Vec<String> {
+    use remuda_protocol::{LaunchItemClass, LaunchItemRoot, LaunchItemSource};
+    let from_spec: std::collections::BTreeSet<&str> = payload
+        .configured
+        .iter()
+        .filter(|item| {
+            item.class == LaunchItemClass::Skill && item.source == LaunchItemSource::Spec
+        })
+        .map(|item| item.name.as_str())
+        .collect();
+    let mut out: Vec<String> = payload
+        .resolved
+        .iter()
+        .filter(|item| {
+            item.class == LaunchItemClass::Skill
+                && item.root == Some(LaunchItemRoot::NativeHome)
+                && from_spec.contains(item.name.as_str())
+                && !remuda_protocol::RESERVED_SKILL_NAMES.contains(&item.name.as_str())
+                && !configured.contains(&item.name)
+        })
+        .map(|item| item.name.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The base names of a spec's configured skill directories.
+pub(crate) fn configured_names(spec: &Value) -> Vec<String> {
+    spec.get("skills")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|path| std::path::Path::new(path).file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ── store ────────────────────────────────────────────────────────────────
 
 /// One edit, as the writer applies it.
@@ -348,6 +437,18 @@ impl Store {
     ) -> Result<Option<SeatProfileView>, StoreError> {
         self.read("seat_profile_view", move |conn| view(conn, &lineage_id))
             .await
+    }
+
+    /// [`revoked_skills`] on the reader pool.
+    pub(crate) async fn revoked_skills(
+        &self,
+        instance_id: String,
+        configured: Vec<String>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.read("revoked_skills", move |conn| {
+            revoked_skills(conn, &instance_id, &configured)
+        })
+        .await
     }
 
     /// The lineage's profile, for building a successor spec.
@@ -934,5 +1035,54 @@ async fn put_profile(
         EditOutcome::Stale { current } => Err(PutError::Stale(current)),
         EditOutcome::NoLineage => Err(HubError::NotFound.into()),
         EditOutcome::Invalid(message) => Err(bad(message).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(value: Value) -> LaunchCapabilitiesPayload {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// r3: the revoked set is what the earlier chapter installed from its
+    /// own configuration (spec source, under the native home), minus what
+    /// this launch configures; skips, unavailable items, embedded trees and
+    /// reserved names never count.
+    #[test]
+    fn revoked_skills_are_the_earlier_installs_minus_this_launch() {
+        let earlier = payload(json!({
+            "launch": "create", "harness": "claude", "driver": "claude-sdk",
+            "profileRevision": null,
+            "configured": [
+                {"class": "skill", "name": "remuda", "source": "hub"},
+                {"class": "skill", "name": "kit-a", "source": "spec"},
+                {"class": "skill", "name": "kit-b", "source": "spec"},
+                {"class": "skill", "name": "kit-c", "source": "spec"},
+                {"class": "skill", "name": "kit-d", "source": "spec"}
+            ],
+            "resolved": [
+                {"class": "skill", "name": "remuda", "root": "native-home", "path": "skills/remuda", "digest": null, "via": "tree"},
+                {"class": "skill", "name": "kit-a", "root": "native-home", "path": "skills/kit-a", "digest": null, "via": "tree"},
+                {"class": "skill", "name": "kit-b", "root": "native-home", "path": "skills/kit-b", "digest": null, "via": "tree"}
+            ],
+            "skipped": [{"class": "skill", "name": "kit-c", "reason": "user-owned"}],
+            "unavailable": [{"class": "skill", "name": "kit-d", "reason": "missing"}],
+            "refusal": null
+        }));
+        assert_eq!(
+            installed_minus(&earlier, &["kit-b".to_owned()]),
+            vec!["kit-a".to_owned()]
+        );
+        assert_eq!(
+            installed_minus(&earlier, &[]),
+            vec!["kit-a".to_owned(), "kit-b".to_owned()]
+        );
+        assert!(installed_minus(&earlier, &["kit-a".to_owned(), "kit-b".to_owned()]).is_empty());
+        assert_eq!(
+            configured_names(&json!({"skills": ["/srv/skills/kit-a", "/x/kit-b"]})),
+            vec!["kit-a".to_owned(), "kit-b".to_owned()]
+        );
     }
 }

@@ -877,3 +877,75 @@ async fn a_control_off_mode_is_refused_for_a_computer_use_seat() -> Result<()> {
     assert_eq!(status, 200, "{body}");
     Ok(())
 }
+
+/// r3: the Hub computes `revokedSkills` for a chapter launch from its
+/// lineage's earlier snapshot: a skill the seat installed and its profile
+/// then dropped is revoked at the next chapter. A first chapter, and a
+/// worker with no lineage history, get none — removal is never a sweep of
+/// a shared home.
+#[tokio::test]
+async fn a_dropped_skill_is_revoked_at_the_next_chapter_and_nothing_else_is() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, false, capable()).await?;
+    let (lineage, first) = seat(
+        &ctx,
+        &mut node,
+        json!({"skills": ["/srv/skills/kit-a", "/srv/skills/kit-b"]}),
+    )
+    .await?;
+    assert!(
+        first.get("revokedSkills").is_none(),
+        "a first chapter revokes nothing: {first}"
+    );
+    // A plain worker launch on the same host: no lineage history.
+    let (_, worker) = ctx
+        .create(&mut node, "claude", "claude-sdk", json!({}))
+        .await?;
+    assert!(worker.get("revokedSkills").is_none(), "{worker}");
+    // The seat's launch snapshot: both trees installed in its home.
+    let resolved = |name: &str| {
+        json!({"class": "skill", "name": name, "root": "native-home",
+               "path": format!("skills/{name}"), "digest": null, "via": "tree"})
+    };
+    node.appends.send((
+        lineage.clone(),
+        json!({"kind": "launch.capabilities", "payload": {
+            "launch": "create", "harness": "claude", "driver": "claude-sdk",
+            "profileRevision": null,
+            "configured": [{"class": "skill", "name": "kit-a", "source": "spec"},
+                           {"class": "skill", "name": "kit-b", "source": "spec"}],
+            "resolved": [resolved("kit-a"), resolved("kit-b")],
+            "skipped": [], "unavailable": [], "refusal": null
+        }}),
+    ))?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if ctx
+                .get(&format!("/v1/instances/{lineage}"))
+                .await?
+                .get("launchCapabilities")
+                .is_some()
+            {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    let (status, body) = put(
+        &ctx,
+        &lineage,
+        &ctx.human,
+        json!({"expectedRevision": 0, "skills": ["/srv/skills/kit-b"]}),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    ctx.end(&node, &lineage).await?;
+    ctx.ok(&format!("/v1/instances/{lineage}/resume"), json!({}))
+        .await?;
+    let params = node.next("instance.resume").await?;
+    assert_eq!(params["revokedSkills"], json!(["kit-a"]), "{params}");
+    assert!(params["spec"].get("revokedSkills").is_none(), "{params}");
+    assert_eq!(params["spec"]["skills"], json!(["/srv/skills/kit-b"]));
+    Ok(())
+}

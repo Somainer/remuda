@@ -191,6 +191,12 @@ pub struct CreateInstanceRequest {
     /// `memoryContext`, and kept out of the payload digest.
     #[serde(skip)]
     pub skill_context: Option<remuda_protocol::hubnode::SkillContext>,
+    /// cb-seat-profile r3: the Hub-stamped `revokedSkills` — configured skill
+    /// names this lineage's earlier chapter installed and this launch no
+    /// longer names. Read only from the top level of the create/resume
+    /// params; the launch removes exactly these managed trees, nothing else.
+    #[serde(skip)]
+    pub revoked_skills: Vec<String>,
     /// D-057 OA1: the Hub-stamped `creatorPermissionMode` of an Agent-origin
     /// create or resume — the creator chapter's effective mode, read at the
     /// create's commit point. Read only from the top level of the forwarded
@@ -220,6 +226,23 @@ impl CreateInstanceRequest {
             .get("skillContext")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
+    }
+
+    /// Carry the Hub-stamped `revokedSkills` from the top level of the
+    /// forwarded create/resume `params` (cb-seat-profile r3). A copy nested in
+    /// the spec is not the Hub's and is ignored; non-strings are dropped.
+    pub fn take_revoked_skills(&mut self, params: &serde_json::Value) {
+        self.revoked_skills = params
+            .get(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     /// Carry the Hub-stamped `creatorPermissionMode` from the top level of

@@ -323,25 +323,26 @@ async fn a_login_shell_journals_no_snapshot() {
     close(&node, &created.instance.meta.id).await;
 }
 
-/// r2 item 2: a skill dropped from the list leaves the shared home before the
-/// next launch starts, and the event names it; a tree without Remuda's
-/// marker is the user's and stays byte for byte.
+/// r3: removal is the launching lineage's own revocation (`revokedSkills`
+/// from the Hub). A launch with none — a worker sharing the home — leaves
+/// another seat's managed tree in place; a revocation removes exactly the
+/// named managed tree and lists it; a marker-less tree and a symlinked tree
+/// are never removed, even when named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_revoked_skill_leaves_the_shared_home_and_a_user_tree_stays() {
+async fn only_the_lineages_own_revocation_leaves_the_shared_home() {
     let dir = tempfile::tempdir().expect("tmp");
     let node = node(dir.path());
     let home = dir.path().join("home");
     let source = skill_source(dir.path(), "kit-a");
-    let first = node
+    let seat = node
         .create_instance(request(
             &home,
             vec![source.to_string_lossy().into_owned()],
             Vec::new(),
         ))
         .await
-        .expect("create a");
-    let (snapshot, _) = wait_snapshot(&node, &first.instance).await;
-    assert!(snapshot.removed.is_empty());
+        .expect("seat with kit-a");
+    let _ = wait_snapshot(&node, &seat.instance).await;
     // The materializer writes the tree when the driver starts, just after
     // the event is journaled.
     tokio::time::timeout(TIMEOUT, async {
@@ -351,17 +352,34 @@ async fn a_revoked_skill_leaves_the_shared_home_and_a_user_tree_stays() {
     })
     .await
     .expect("installed");
-    close(&node, &first.instance.meta.id).await;
 
-    // The user's own tree beside it, without the marker.
-    std::fs::create_dir_all(home.join("skills/kit-b")).unwrap();
-    std::fs::write(home.join("skills/kit-b/SKILL.md"), b"mine").unwrap();
-
-    let second = node
+    // A worker on the same shared home, with no skills and no history.
+    let worker = node
         .create_instance(request(&home, Vec::new(), Vec::new()))
         .await
-        .expect("create without skills");
-    let (snapshot, _) = wait_snapshot(&node, &second.instance).await;
+        .expect("worker");
+    let (snapshot, _) = wait_snapshot(&node, &worker.instance).await;
+    assert!(snapshot.removed.is_empty(), "{:?}", snapshot.removed);
+    assert!(
+        home.join("skills/kit-a/SKILL.md").is_file(),
+        "another seat's skill stays while it runs"
+    );
+    close(&node, &worker.instance.meta.id).await;
+    close(&node, &seat.instance.meta.id).await;
+
+    // A user tree without the marker, and a link to a managed tree.
+    std::fs::create_dir_all(home.join("skills/kit-b")).unwrap();
+    std::fs::write(home.join("skills/kit-b/SKILL.md"), b"mine").unwrap();
+    let elsewhere = dir.path().join("elsewhere/kit-c");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join(".remuda-managed"), b"x").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.join("skills/kit-c")).unwrap();
+
+    // The seat's next chapter dropped kit-a: the Hub names it revoked.
+    let mut next = request(&home, Vec::new(), Vec::new());
+    next.revoked_skills = vec!["kit-a".to_owned(), "kit-b".to_owned(), "kit-c".to_owned()];
+    let chapter = node.create_instance(next).await.expect("next chapter");
+    let (snapshot, _) = wait_snapshot(&node, &chapter.instance).await;
     assert_eq!(snapshot.removed, vec!["kit-a".to_owned()]);
     assert!(
         !home.join("skills/kit-a").exists(),
@@ -372,5 +390,13 @@ async fn a_revoked_skill_leaves_the_shared_home_and_a_user_tree_stays() {
         b"mine",
         "a marker-less tree is never touched"
     );
-    close(&node, &second.instance.meta.id).await;
+    assert!(
+        std::fs::symlink_metadata(home.join("skills/kit-c"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a link is never removed"
+    );
+    assert!(elsewhere.join(".remuda-managed").is_file(), "nor followed");
+    close(&node, &chapter.instance.meta.id).await;
 }

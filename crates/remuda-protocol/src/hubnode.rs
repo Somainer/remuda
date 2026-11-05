@@ -1006,7 +1006,17 @@ pub struct InstanceCreateParams {
     /// top level only, never in `spec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_context: Option<SkillContext>,
+    /// cb-seat-profile r3: configured skill names this lineage's earlier
+    /// chapter installed and this launch no longer configures. Hub-stamped,
+    /// top level only, never in `spec`; the Node removes exactly these
+    /// Remuda-managed trees from the native home and nothing else. Empty
+    /// (absent) for a first chapter or a non-chapter instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_skills: Vec<String>,
 }
+
+/// The top-level create/resume param carrying [`InstanceCreateParams::revoked_skills`].
+pub const REVOKED_SKILLS_FIELD: &str = "revokedSkills";
 
 /// Kind of a staged attachment (D-027b, 2026-09-15).
 ///

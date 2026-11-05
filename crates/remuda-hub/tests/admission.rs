@@ -1497,6 +1497,88 @@ async fn an_agent_respawns_its_worker_keeping_parent_carrier_and_modes() {
     assert_eq!(spec["cwd"], "/srv/wt/again", "the same worktree");
 }
 
+/// [home-glance-d060 r4 item 6] A worker respawn keeps the worker's creator
+/// stamp, whoever presses resume: the stamp is the chain root's (home.md
+/// §5.3), and "dispatched by an Agent" must survive the owner's resume. The
+/// scoped respawn is a successor (`resumedFrom`); the operator relaunch is a
+/// fresh launch with no chain link, yet it is the same worker, so a Bot's
+/// worker relaunched by the owner never turns into a hand-opened root.
+#[tokio::test]
+async fn a_respawn_keeps_the_workers_creator_stamp_whoever_resumes_it() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let origin = |instance: &Value| instance["creatorOrigin"].as_str().map(str::to_string);
+
+    // An Agent's worker, resumed by the OWNER: the scoped respawn.
+    let seat = ctx.seat("claude", "auto").await;
+    let first = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("stamped")),
+            &seat.token,
+            &[],
+        )
+        .await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let old = first.body["instanceId"].as_str().unwrap().to_string();
+    assert_eq!(origin(&ctx.instance(&old).await).as_deref(), Some("agent"));
+    let resumed = ctx
+        .request("POST", "/v1/workers/stamped/resume", Some(json!({})))
+        .await;
+    assert_eq!(resumed.status, 200, "{}", resumed.body);
+    let new = resumed.body["instanceId"].as_str().unwrap().to_string();
+    let instance = ctx.instance(&new).await;
+    assert_eq!(instance["resumedFrom"], old.as_str(), "the scoped respawn");
+    assert_eq!(
+        origin(&instance).as_deref(),
+        Some("agent"),
+        "still the Agent's worker, though a human resumed it: {instance}"
+    );
+
+    // A Bot's worker, relaunched by the owner (no Agent parent, no
+    // transcript): the operator relaunch path.
+    let login: Value = ctx
+        .http
+        .post(format!("http://{}/v1/login", ctx.hub.addr))
+        .json(&json!({ "bootstrapToken": ctx.hub.bootstrap_token,
+                       "deviceName": "stamp-bot", "deviceKind": "bot" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bot = login["token"].as_str().unwrap().to_string();
+    let dispatched = ctx
+        .send(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body("botwork")),
+            &bot,
+            &[],
+        )
+        .await;
+    assert_eq!(dispatched.status, 200, "{}", dispatched.body);
+    let old = dispatched.body["instanceId"].as_str().unwrap().to_string();
+    assert_eq!(origin(&ctx.instance(&old).await).as_deref(), Some("bot"));
+    let relaunched = ctx
+        .request("POST", "/v1/workers/botwork/resume", Some(json!({})))
+        .await;
+    assert_eq!(relaunched.status, 200, "{}", relaunched.body);
+    assert_eq!(relaunched.body["mode"], "relaunch");
+    let new = relaunched.body["instanceId"].as_str().unwrap().to_string();
+    let instance = ctx.instance(&new).await;
+    assert!(
+        instance.get("resumedFrom").is_none_or(Value::is_null),
+        "{instance}"
+    );
+    assert_eq!(
+        origin(&instance).as_deref(),
+        Some("bot"),
+        "the Bot's worker stays the Bot's, not a hand-opened root: {instance}"
+    );
+}
+
 /// A respawn applies the same rules as any Agent create: another lineage's
 /// worker is not the caller's to respawn, the kept mode is re-admitted under
 /// the caller's current mode, and a shell-driver carrier asks the owner

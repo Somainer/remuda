@@ -3509,6 +3509,39 @@ export type OutstandingWork = ({
   [key: string]: unknown;
 });
 
+/** `GET /v1/owner/glance`: the owner's world as one read-only projection — Main's lineage subtree plus the sessions the owner opened by hand. */
+export type OwnerGlance = ({
+  "counts": OwnerGlanceCounts;
+  "doneUnseenIds": (((string))[]);
+  "generatedAt": (string);
+  "more": GlanceMore;
+  "timezoneOffsetMinutes": (number);
+  "waiting": ((OwnerGlanceRow)[]);
+  "working": ((OwnerGlanceRow)[]);
+  [key: string]: unknown;
+});
+
+/** The ① count segments of the owner home (home.md §5.1–§5.2). */
+export type OwnerGlanceCounts = ({
+  "doneToday": (number);
+  "doneUnseen": (number);
+  "needYou": (number);
+  "working": (number);
+  [key: string]: unknown;
+});
+
+/** One session row of an [`OwnerGlance`].  Every string that came from a worker, a tool or a session is untrusted data; `headline` is already redacted the way the worker digest redacts. */
+export type OwnerGlanceRow = ({
+  "headline": (string);
+  "instanceId": (string);
+  "kind": (string);
+  "phrase"?: (string | null);
+  "since"?: (number | null);
+  "taskId"?: (string | null);
+  "title"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** Ownership wire values; `protocol.md` §2.3. */
 export type Ownership = ("managed" | "adopted-control" | "observed-only");
 

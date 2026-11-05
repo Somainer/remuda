@@ -1710,6 +1710,18 @@
               "null"
             ]
           },
+          "creatorOrigin": {
+            "description": "Origin of the device that created the chain ROOT (home.md §5.3): `human`, `bot`, `agent` or `hub`, or the upgrade backfill's `legacy`. A resume or continuation inherits its predecessor's stamp, so `agent` means dispatched by an Agent and a parent alone does not. Absent only on an unclassified pre-upgrade row.",
+            "enum": [
+              "human",
+              "bot",
+              "agent",
+              "hub",
+              "legacy"
+            ],
+            "readOnly": true,
+            "type": "string"
+          },
           "chapterCause": {
             "description": "D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance.",
             "readOnly": true,
@@ -7194,6 +7206,20 @@
           "name"
         ],
         "type": "object"
+      },
+      "OwnerGlance": {
+        "type": "object",
+        "description": "Generated shape: OwnerGlance in crates/remuda-protocol/schema/protocol.schema.json.",
+        "required": [
+          "generatedAt",
+          "timezoneOffsetMinutes",
+          "counts",
+          "doneUnseenIds",
+          "waiting",
+          "working",
+          "more"
+        ],
+        "additionalProperties": true
       }
     }
   },
@@ -14759,6 +14785,47 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/owner/glance": {
+      "get": {
+        "operationId": "ownerGlance",
+        "summary": "The owner's world: count segments, today's completions and one headline per waiting/working session",
+        "tags": [
+          "owner"
+        ],
+        "description": "Human only: an Agent (a seat, or a Human token narrowed to one) is stopped by the route middleware with `agent-route`, and a Bot credential is refused with 403 `owner-only`. The scope is Main's lineage subtree plus the sessions the owner opened by hand (home.md §5.3). At most 50 rows in each of `waiting` and `working`; the `more` counters carry the overflow. `tzOffsetMinutes` is the owner's local offset east of UTC (`-Date().getTimezoneOffset()`), used only for `counts.doneToday`. Headline text is redacted untrusted data.",
+        "parameters": [
+          {
+            "name": "tzOffsetMinutes",
+            "in": "query",
+            "required": false,
+            "description": "Minutes east of UTC for the local-day 今日完成 count (default 0, clamped to ±14 h).",
+            "schema": {
+              "type": "integer",
+              "minimum": -840,
+              "maximum": 840
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owner glance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerGlance"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
             "$ref": "#/components/responses/Error"
           }
         }

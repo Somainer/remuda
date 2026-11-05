@@ -245,6 +245,74 @@ async function inBand(page: Page, regionSelector: string, selector: string): Pro
 }
 
 test.describe("phone 390", () => {
+  /**
+   * home-glance-d060 (home.md §5.3): ① and the ledger read ONE
+   * `GET /v1/owner/glance` per poll. Counts equal the Hub's projection and the
+   * ④ queue's own derivation, and the home issues no per-row journal read.
+   */
+  test("the home renders from the glance: counts equal the queue, no per-row journal reads", async ({
+    browser,
+  }) => {
+    const baseURL = test.info().project.use.baseURL;
+    const context = await phoneContext(browser, baseURL!);
+    try {
+      const page = await context.newPage();
+      await page.goto("/m");
+      if (!(await needsFakeNode(page))) test.skip(true, "needs the in-process fake Node");
+      await createBlockedSession(page);
+      await createWorkingSession(page);
+
+      // Count the per-poll traffic only from here on: the create flow above
+      // visits /s/:id, which legitimately reads a journal.
+      const paths: string[] = [];
+      page.on("request", (request) => {
+        const url = new URL(request.url());
+        if (url.origin === new URL(baseURL!).origin && url.pathname.startsWith("/v1/")) {
+          paths.push(url.pathname);
+        }
+      });
+      await page.goto("/m");
+      await expect(page.getByTestId("glance-need-you")).toContainText(/\d+ 需要你/, {
+        timeout: 20_000,
+      });
+
+      const shownNeedYou = Number(
+        ((await page.getByTestId("glance-need-you").innerText()).match(/(\d+)\+? 需要你/) ?? [])[1],
+      );
+      // The Hub's projection is the row's number …
+      const glanceResponse = await page.request.get("/v1/owner/glance?tzOffsetMinutes=0");
+      expect(glanceResponse.ok()).toBe(true);
+      const glance = (await glanceResponse.json()) as {
+        counts: { needYou: number; working: number };
+        waiting: { instanceId: string; kind: string; headline: string }[];
+      };
+      expect(shownNeedYou).toBe(glance.counts.needYou);
+      // … and the ④ queue's existing derivation agrees with it (§5.1 A + B).
+      const queueTitle = await page.getByTestId("home-queue-title").innerText();
+      expect(Number((queueTitle.match(/(\d+)/) ?? [])[1])).toBe(shownNeedYou);
+      // The waiting row the fake Node parked is in the glance with a headline.
+      expect(glance.waiting.some((row) => row.kind === "approval" && row.headline.length > 0)).toBe(
+        true,
+      );
+
+      // A working session's ① segment is the glance's count too.
+      const working = page.getByTestId("glance-working");
+      await expect(working).toContainText(/\d+ 工作中/, { timeout: 20_000 });
+      const shownWorking = Number(((await working.innerText()).match(/(\d+) 工作中/) ?? [])[1]);
+      expect(shownWorking).toBe(glance.counts.working);
+
+      // §5.3 cost: the home's poll reads the glance, never one journal per row.
+      await expect
+        .poll(() => paths.filter((path) => path === "/v1/owner/glance").length, { timeout: 20_000 })
+        .toBeGreaterThan(0);
+      const journalReads = paths.filter((path) => /^\/v1\/instances\/[^/]+\/journal$/.test(path));
+      expect(journalReads).toEqual([]);
+    } finally {
+      await cleanup(context.request);
+      await context.close();
+    }
+  });
+
   test("the sticky head is title + ① at most 80px, and ① counts the pending approval", async ({
     browser,
   }) => {
@@ -411,7 +479,7 @@ test.describe("phone 390", () => {
       await page.goto("/m");
 
       const working = page.getByTestId("glance-working");
-      await expect(working).toContainText(/工作中/, { timeout: 20_000 });
+      await expect(working).toContainText(/\d+ 工作中/, { timeout: 20_000 });
       const count = Number(((await working.innerText()).match(/(\d+) 工作中/) ?? [])[1]);
       expect(count).toBeGreaterThanOrEqual(1);
       await working.click();
@@ -533,7 +601,7 @@ test.describe("desktop 1280", () => {
       await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");
 
       const working = page.getByTestId("glance-working");
-      await expect(working).toContainText(/工作中/, { timeout: 20_000 });
+      await expect(working).toContainText(/\d+ 工作中/, { timeout: 20_000 });
       const count = Number(((await working.innerText()).match(/(\d+) 工作中/) ?? [])[1]);
       expect(count).toBeGreaterThanOrEqual(1);
       await working.click();

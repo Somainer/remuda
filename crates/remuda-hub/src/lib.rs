@@ -71,6 +71,7 @@ mod model_catalog;
 pub use model_catalog::CATALOG_REVISION;
 mod node_ops;
 mod objects;
+mod owner_glance;
 mod owner_notify;
 mod passkeys;
 mod placement;
@@ -468,6 +469,7 @@ pub mod store_test_support {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         })
     }
 
@@ -498,6 +500,7 @@ pub mod store_test_support {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         }
     }
 
@@ -2805,6 +2808,7 @@ pub fn router(state: AppState) -> Router {
         .merge(digest::routes())
         .merge(inbox::routes())
         .merge(owner_notify::routes())
+        .merge(owner_glance::routes())
         .merge(wake::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {

@@ -478,6 +478,25 @@ async fn authority_matrix_follows_the_stamp() -> Result<()> {
         mine["command"]["settlement"]["withdrawnBy"],
         json!({ "origin": "agent", "instanceId": main_id })
     );
+    // Both transcripts say the queued send was withdrawn, without its text.
+    let (_, journal) = ctx
+        .get(&ctx.human, &format!("/v1/instances/{worker}/journal"))
+        .await?;
+    let notes: Vec<String> = journal["events"]
+        .as_array()
+        .context("journal events")?
+        .iter()
+        .map(|row| row["event"].to_string())
+        .filter(|event| event.contains("queued-command-withdrawn"))
+        .collect();
+    assert!(
+        notes.iter().any(|note| note.contains(&agent_cmd2)),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().all(|note| !note.contains("\"second\"")),
+        "{notes:?}"
+    );
     // Audit: who, which command, its revision; never the prompt text.
     let store = ctx.hub.store().context("store")?;
     let rows = store.audit_for(agent_cmd2.clone()).await?;

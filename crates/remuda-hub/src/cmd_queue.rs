@@ -391,6 +391,25 @@ fn actor(device: &Device) -> Value {
     }
 }
 
+/// An Agent's send is journaled to both transcripts when it is queued
+/// (`journal_agent_message`), with the text it had then. After an edit or a
+/// withdrawal both transcripts get a text-free note naming the command, so
+/// the earlier record is never left standing as what was delivered.
+async fn journal_queue_change(state: &AppState, row: &CommandRecord, name: &str, note: &str) {
+    let Some(initiator) = &row.initiator else {
+        return;
+    };
+    let mut targets = vec![initiator.instance_id.clone()];
+    if let Some(target) = &row.instance_id
+        && target != &initiator.instance_id
+    {
+        targets.push(target.clone());
+    }
+    for instance_id in targets {
+        crate::ws::publish_hub_diagnostic(state, &instance_id, name, note).await;
+    }
+}
+
 async fn audit(state: &AppState, device: &Device, action: &str, subject: &str, detail: Value) {
     if let Err(error) = state
         .store
@@ -500,6 +519,16 @@ async fn edit_command(
             edit_on_node(&state, &owned, expected, &text).await?
         }
     };
+    journal_queue_change(
+        &state,
+        &command,
+        "queued-command-edited",
+        &format!(
+            "command {command_id} was edited before delivery (revision {}); only the edited text is sent",
+            command.revision
+        ),
+    )
+    .await;
     audit(
         &state,
         &device,
@@ -738,6 +767,13 @@ async fn withdraw_command(
         }
         _ => withdraw_on_node(&state, &owned, expected, &by).await?,
     };
+    journal_queue_change(
+        &state,
+        &command,
+        "queued-command-withdrawn",
+        &format!("command {command_id} was withdrawn before delivery; it was never sent"),
+    )
+    .await;
     audit(
         &state,
         &device,

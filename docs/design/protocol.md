@@ -2306,7 +2306,7 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 - `pending` 列出本实例尚未生效的 configure，每项 `{commandId, state: queued|deferred, boundary?, model?, effort?, initiator?, createdAt}`：`queued` 是 Hub 尚未转发的行，`deferred` 是带 boundary 的行。
 - Worker digest（main-agent.md §10.2）的 `model` 增加 `generation`；`model.configure` 的 `state` 取 `queued`、`accepted` 或 `deferred`，deferred 时另带 `boundary`。仍在 2048 字节以内。
 
-**审计。** 编辑写 `command.edit`（commandId、实例、新 revision），撤回写 `command.withdraw`（commandId、实例、revision、`held`），generation 冲突写 `instance.configure.conflict`（实例、commandId、`expectedGeneration`、当前 generation）；行上带调用方设备与 Agent 的 initiator。审计与日志只记类别和 id，绝不记 prompt 文本。
+**审计。** 编辑写 `command.edit`（commandId、实例、新 revision），撤回写 `command.withdraw`（commandId、实例、revision、`held`），generation 冲突写 `instance.configure.conflict`（实例、commandId、`expectedGeneration`、当前 generation）；行上带调用方设备与 Agent 的 initiator。审计与日志只记类别和 id，绝不记 prompt 文本。 Agent 的 send 排队时 Hub 已把当时的文本记进发送方与目标的 journal；之后被编辑或撤回时，两边 journal 各追加一条不含文本的 Hub 诊断（`queued-command-edited` / `queued-command-withdrawn`，带 commandId 与 revision），先前那条记录不会被当作已送达的内容。
 
 ~~~text
 GET /v1/commands?mine=1&state=queued

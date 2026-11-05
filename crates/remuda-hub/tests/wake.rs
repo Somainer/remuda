@@ -2826,6 +2826,10 @@ async fn a_failed_check_settle_write_is_retried_never_the_run() -> Result<()> {
     assert_eq!(run["state"], "failed", "{run:#?}");
     assert_eq!(run["failureKind"], "check-exit");
     assert_eq!(run["checkExit"], 1);
+    assert_eq!(
+        run["check"]["containment"], "subreaper",
+        "r4: the last-resort write keeps the containment its Node reported"
+    );
     assert_eq!(queued()?.0, 0, "nothing left queued");
     Ok(())
 }

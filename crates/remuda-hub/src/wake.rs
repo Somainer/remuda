@@ -3297,6 +3297,17 @@ fn in_savepoint_with<T>(
     }
 }
 
+/// The containment a Node reported, as the run stores it.
+fn report_containment(report: &CheckReport) -> Option<String> {
+    match report {
+        CheckReport::Done(result) => result
+            .containment
+            .and_then(|label| serde_json::to_value(label).ok())
+            .and_then(|label| label.as_str().map(str::to_owned)),
+        _ => None,
+    }
+}
+
 /// The last resort of a report whose full apply kept failing: the run and its
 /// check end in the state the report names, with nothing else written (no
 /// delivery, no fact, no notice). A check that passed cannot run any more:
@@ -3344,9 +3355,18 @@ fn apply_report_state_only(
     };
     conn.execute(
         "UPDATE wake_runs SET state = ?2, check_state = ?3, failure_kind = ?4, check_exit = ?5,
-                ended_at = ?6
+                ended_at = ?6, check_containment = ?7, check_containment_incomplete = ?8
           WHERE run_id = ?1 AND state = 'running' AND check_state = 'running'",
-        params![run_id, state, check_state, kind, exit, now_rfc3339()],
+        params![
+            run_id,
+            state,
+            check_state,
+            kind,
+            exit,
+            now_rfc3339(),
+            report_containment(report),
+            matches!(report, CheckReport::Done(result) if result.containment_incomplete),
+        ],
     )?;
     tracing::warn!(
         category = "wake",
@@ -3514,10 +3534,7 @@ fn apply_report(
             ("failed", Some(failure::CHECK_UNAVAILABLE))
         }
     };
-    let containment = result
-        .and_then(|result| result.containment)
-        .and_then(|label| serde_json::to_value(label).ok())
-        .and_then(|label| label.as_str().map(str::to_owned));
+    let containment = report_containment(report);
     let incomplete = result.is_some_and(|result| result.containment_incomplete);
     tx.execute(
         "UPDATE wake_runs SET check_state = ?2, check_exit = ?3, check_summary = ?4,

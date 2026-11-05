@@ -584,7 +584,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 | `ma-main-ui` | D-057 Main 界面（main-agent.md §9、§15） | 见 main-agent.md §15 |
 | `home-main-card` | ③、⑨、桌面右栏、⑥ | `ma-main-ui`、`home-queue` |
 | `home-main-extras` | 快捷提问、交给 Main、★、Main 提问置顶且只计一次 | `home-main-card` |
-| `routed-to` | `GET /v1/interactions` 上的 `routedTo`（`owner`/`main`/`agent`，由推送决定读出，§5.1）；`with_badge` 只计 `routedTo=owner`；`deriveInboxQueue` 按它过滤；/approvals 标「已转给 Main」；Main 卡「正在处理 N 个 worker 提问」 | D-051 委托上线、`home-main-card`；owner glance 落地后其 A 同样收窄 |
+| `routed-to` | `GET /v1/interactions` 上的 `routedTo`（`owner`/`main`/`agent`，由推送决定读出，§5.1）；`with_badge` 只计 `routedTo=owner`；`deriveInboxQueue` 按它过滤；/approvals 标「已转给 Main」；Main 卡「正在处理 N 个 worker 提问」 | D-051 委托上线、`home-main-card`；owner glance（`home-glance-d060`）的 A 同样收窄 |
 | `home-glance-d060` | `GET /v1/owner/glance`；①、⑥ 和行改用 glance；删除逐行 journal 轮询；今日完成 | D-060 `cb-digest` |
 | `home-to-you` | notices 的 list 与 ack 路由；首页复用 D-060 的「告诉你」卡 | D-060 `cb-owner-notify` |
 | `home-wakes` | wakes 的 list 与 delete 路由；⑩ | D-060 `cb-wake-engine`、`cb-owner-notify` |

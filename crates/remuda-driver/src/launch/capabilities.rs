@@ -251,6 +251,7 @@ pub fn snapshot(request: &SnapshotRequest<'_>) -> Option<LaunchSnapshot> {
             resolved: lists.resolved,
             skipped: lists.skipped,
             unavailable: lists.unavailable,
+            removed: Vec::new(),
             refusal,
         },
         skills: if refused { Vec::new() } else { skills },
@@ -707,6 +708,57 @@ pub fn tree_digest(files: &[(String, Vec<u8>)]) -> String {
             .iter()
             .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice())),
     ))
+}
+
+/// Remove the configured skill trees an earlier launch installed in
+/// `native_home` that `keep` (this launch's resolved names) no longer names
+/// (cb-seat-profile r2): a skill dropped from the profile or the spec must
+/// not keep loading from a shared home, whose files outlive their launch.
+///
+/// Only `<native_home>/skills/<name>` directories that are real directories
+/// (never a link, never followed) holding Remuda's `.remuda-managed` marker
+/// as a regular file are removed; a tree without the marker is the user's
+/// and is never touched, and neither are the `remuda` and
+/// `codex-computer-use` trees, which other launch paths own. Returns the
+/// names removed, sorted. A tree that cannot be removed is logged and left.
+#[must_use]
+pub fn remove_stale_skills(native_home: &Path, keep: &[String]) -> Vec<String> {
+    let skills = native_home.join("skills");
+    let Ok(meta) = fs::symlink_metadata(&skills) else {
+        return Vec::new();
+    };
+    if !meta.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(&skills) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if keep.contains(&name) || remuda_protocol::RESERVED_SKILL_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let tree = entry.path();
+        let marked = fs::symlink_metadata(tree.join(remuda_skill::MANAGED_MARKER))
+            .is_ok_and(|marker| marker.file_type().is_file());
+        if !marked {
+            continue;
+        }
+        match fs::remove_dir_all(&tree) {
+            Ok(()) => removed.push(name),
+            Err(error) => {
+                tracing::warn!(skill = %name, %error, "could not remove a revoked skill tree");
+            }
+        }
+    }
+    removed.sort();
+    removed
 }
 
 /// Whether the home a configured tree lands in is shared (its files outlive

@@ -419,7 +419,25 @@ impl DriverFactory for NativeClaudeFactory {
             .as_ref()
             .map(|snapshot| snapshot.skills.clone())
             .unwrap_or_default();
-        let launch_capabilities = snapshot.map(|snapshot| snapshot.payload);
+        let launch_capabilities = snapshot.map(|snapshot| {
+            let mut payload = snapshot.payload;
+            // r2: a skill dropped from the list leaves the shared home before
+            // this launch starts, unless the launch is refused (a refused
+            // launch changes nothing). Only Remuda-managed trees, and only in
+            // a home Remuda manages.
+            if payload.refusal.is_none()
+                && home_managed
+                && launch.request.kind == remuda_protocol::AgentKind::Claude
+            {
+                let keep: Vec<String> = configured_skills
+                    .iter()
+                    .map(|skill| skill.name.clone())
+                    .collect();
+                payload.removed =
+                    remuda_driver::launch::capabilities::remove_stale_skills(&native_home, &keep);
+            }
+            payload
+        });
         let binary = resolve_binary_source(
             self.kind,
             launch.request.kind,

@@ -11708,6 +11708,14 @@
           ],
           "description": "Set when the Node refuses the launch."
         },
+        "removed": {
+          "default": [],
+          "description": "Configured skill trees an earlier launch installed in this shared\nnative home that this launch's list no longer names, removed before\nthe harness starts (cb-seat-profile r2). Only Remuda-managed trees\n(with `.remuda-managed`) are ever removed. Absent on older events.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "resolved": {
           "description": "What is materialized.",
           "items": {
@@ -11739,6 +11747,7 @@
         "resolved",
         "skipped",
         "unavailable",
+        "removed",
         "refusal"
       ],
       "type": "object"

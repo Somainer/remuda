@@ -3158,6 +3158,8 @@ export interface components {
                 };
                 reason?: string;
             } | null;
+            /** @description Configured skill trees removed from the shared native home before this launch (r2); absent on older events. */
+            removed?: string[];
             resolved: {
                 class: string;
                 digest: string | null;

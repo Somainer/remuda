@@ -2634,6 +2634,7 @@ export type LaunchCapabilitiesPayload = ({
   "launch": LaunchCapabilitiesLaunch;
   "profileRevision": (U64 | (null));
   "refusal": (LaunchRefusal | (null));
+  "removed": (((string))[]);
   "resolved": ((LaunchResolvedItem)[]);
   "skipped": ((LaunchSkippedItem)[]);
   "unavailable": ((LaunchUnavailableItem)[]);

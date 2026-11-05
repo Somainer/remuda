@@ -174,6 +174,12 @@ pub struct LaunchCapabilitiesPayload {
     pub skipped: Vec<LaunchSkippedItem>,
     /// What will not reach the harness.
     pub unavailable: Vec<LaunchUnavailableItem>,
+    /// Configured skill trees an earlier launch installed in this shared
+    /// native home that this launch's list no longer names, removed before
+    /// the harness starts (cb-seat-profile r2). Only Remuda-managed trees
+    /// (with `.remuda-managed`) are ever removed. Absent on older events.
+    #[serde(default)]
+    pub removed: Vec<String>,
     /// Set when the Node refuses the launch.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub refusal: Option<LaunchRefusal>,

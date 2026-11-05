@@ -7644,6 +7644,13 @@
                 }
               }
             }
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured skill trees removed from the shared native home before this launch (r2); absent on older events."
           }
         }
       },

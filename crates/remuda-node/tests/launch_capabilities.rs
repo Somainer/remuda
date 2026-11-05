@@ -322,3 +322,55 @@ async fn a_login_shell_journals_no_snapshot() {
     );
     close(&node, &created.instance.meta.id).await;
 }
+
+/// r2 item 2: a skill dropped from the list leaves the shared home before the
+/// next launch starts, and the event names it; a tree without Remuda's
+/// marker is the user's and stays byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_skill_leaves_the_shared_home_and_a_user_tree_stays() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = node(dir.path());
+    let home = dir.path().join("home");
+    let source = skill_source(dir.path(), "kit-a");
+    let first = node
+        .create_instance(request(
+            &home,
+            vec![source.to_string_lossy().into_owned()],
+            Vec::new(),
+        ))
+        .await
+        .expect("create a");
+    let (snapshot, _) = wait_snapshot(&node, &first.instance).await;
+    assert!(snapshot.removed.is_empty());
+    // The materializer writes the tree when the driver starts, just after
+    // the event is journaled.
+    tokio::time::timeout(TIMEOUT, async {
+        while !home.join("skills/kit-a/SKILL.md").is_file() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("installed");
+    close(&node, &first.instance.meta.id).await;
+
+    // The user's own tree beside it, without the marker.
+    std::fs::create_dir_all(home.join("skills/kit-b")).unwrap();
+    std::fs::write(home.join("skills/kit-b/SKILL.md"), b"mine").unwrap();
+
+    let second = node
+        .create_instance(request(&home, Vec::new(), Vec::new()))
+        .await
+        .expect("create without skills");
+    let (snapshot, _) = wait_snapshot(&node, &second.instance).await;
+    assert_eq!(snapshot.removed, vec!["kit-a".to_owned()]);
+    assert!(
+        !home.join("skills/kit-a").exists(),
+        "the revoked tree is gone"
+    );
+    assert_eq!(
+        std::fs::read(home.join("skills/kit-b/SKILL.md")).unwrap(),
+        b"mine",
+        "a marker-less tree is never touched"
+    );
+    close(&node, &second.instance.meta.id).await;
+}

@@ -62,7 +62,13 @@ definitions = [
     ("web-build", ["pnpm", "build"], "web", 1),
     ("web-test", ["pnpm", "test"], "web", 1),
     ("web-hub-e2e", ["pnpm", "run", "test:e2e:hub"], "web", 1),
+    # The specs that seat the Hub's one address-owner Main, on their own Hub
+    # after the main pass (its budget has no room for them). One attempt, like
+    # the main pass; Playwright's CI retry applies inside it.
+    ("web-hub-e2e-main", ["pnpm", "run", "test:e2e:hub:main"], "web", 1),
 ]
+# Steps that drive the shared Hub e2e browser.
+HUB_E2E_STEPS = {"web-hub-e2e", "web-hub-e2e-main"}
 # Test seam: an executable path, not a shell expression. It receives the step
 # name and still exercises ordering, retries, reports, cwd, and environment.
 override = os.environ.get("REMUDA_MERGE_GATE_COMMAND")
@@ -72,7 +78,7 @@ for name, command, cwd, attempts in definitions:
     selected = (args.web or args.web_only or args.web_e2e) if cwd == "web" else not args.web_only
     if name == "cargo-test" and args.affected and not crates:
         selected = False
-    if name == "web-hub-e2e":
+    if name in HUB_E2E_STEPS:
         selected = args.web_e2e
     budget = step_timeout(name, overrides)
     plan.append(dict(name=name, command=[override, name] if override else command,
@@ -115,10 +121,10 @@ try:
                 print(f"gate: {step['name']}" + (" (retried)" if attempt > 1 else ""),
                       file=sys.stderr, flush=True)
                 command = step["command"]
-                # The Hub e2e step shares one browser server across merge
-                # lanes; serialise it on an advisory lock (flock(1)). flock
+                # The Hub e2e steps share one browser server across merge
+                # lanes; serialise them on an advisory lock (flock(1)). flock
                 # execs the command, so it stays inside the step process group.
-                if (step["name"] == "web-hub-e2e"
+                if (step["name"] in HUB_E2E_STEPS
                         and os.environ.get("REMUDA_E2E_LOCK")
                         and shutil.which("flock")):
                     command = ["flock", os.environ["REMUDA_E2E_LOCK"], *command]

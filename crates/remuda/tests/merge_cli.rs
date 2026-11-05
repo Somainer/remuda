@@ -505,11 +505,15 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
         .iter()
         .map(|step| step["name"].as_str().unwrap())
         .collect();
-    assert!(
-        names
-            .windows(3)
-            .any(|steps| { steps == ["web-hub-e2e", "gen-api-current", "verify-tree"] })
-    );
+    assert!(names.windows(4).any(|steps| {
+        steps
+            == [
+                "web-hub-e2e",
+                "web-hub-e2e-main",
+                "gen-api-current",
+                "verify-tree",
+            ]
+    }));
     repo.assert_cleaned();
 }
 
@@ -562,6 +566,7 @@ fn web_changes_automatically_enable_web_checks() {
     assert_eq!(report["web"], true);
     assert_eq!(step(&report, "web-test")["status"], "ok");
     assert_eq!(step(&report, "web-hub-e2e")["status"], "skipped");
+    assert_eq!(step(&report, "web-hub-e2e-main")["status"], "skipped");
     repo.assert_cleaned();
 }
 
@@ -573,10 +578,12 @@ fn web_e2e_flag_runs_live_hub_e2e_without_auth_paths() {
     assert_exit(&output, &report, 0);
     assert_eq!(report["webE2e"], true);
     assert_eq!(step(&report, "web-hub-e2e")["status"], "planned");
+    assert_eq!(step(&report, "web-hub-e2e-main")["status"], "planned");
     let (output, report) = repo.merge(&["--gate", "--web-e2e", "--no-push"], &[]);
     assert_exit(&output, &report, 0);
     assert_eq!(report["webE2e"], true);
     assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
+    assert_eq!(step(&report, "web-hub-e2e-main")["status"], "ok");
     repo.assert_cleaned();
 }
 
@@ -594,10 +601,12 @@ fn auth_changes_select_live_web_e2e_in_both_dry_run_and_execution() {
         assert_exit(&output, &report, 0);
         assert_eq!(report["webE2e"], true);
         assert_eq!(step(&report, "web-hub-e2e")["status"], "planned");
+        assert_eq!(step(&report, "web-hub-e2e-main")["status"], "planned");
         let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
         assert_exit(&output, &report, 0);
         assert_eq!(report["web"], true);
         assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
+        assert_eq!(step(&report, "web-hub-e2e-main")["status"], "ok");
         assert_eq!(repo.trace().last().unwrap()["step"], "gen-api-current");
         repo.assert_cleaned();
     }
@@ -618,6 +627,31 @@ fn live_web_e2e_failure_blocks_main_without_retrying() {
     assert_exit(&output, &report, 1);
     assert_eq!(step(&report, "web-hub-e2e")["status"], "failed");
     assert_eq!(step(&report, "web-hub-e2e")["attempts"], 1);
+    assert_eq!(step(&report, "web-hub-e2e-main")["status"], "skipped");
+    assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
+    assert_eq!(repo.main(), repo.base);
+    assert_eq!(repo.remote_main(), repo.base);
+    repo.assert_cleaned();
+}
+
+#[test]
+fn main_ui_e2e_failure_blocks_main_without_retrying() {
+    // The opt-in Main pass (web-hub-e2e-main) gates the merge like the main
+    // pass: one attempt, and a failure keeps main where it was.
+    let repo = Repo::new();
+    commit_file(
+        &repo.source,
+        "crates/remuda-hub/src/ws.rs",
+        "auth fixture change\n",
+    );
+    let (output, report) = repo.merge(
+        &["--gate", "--web"],
+        &[("REMUDA_TEST_GATE_FAIL", "web-hub-e2e-main")],
+    );
+    assert_exit(&output, &report, 1);
+    assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
+    assert_eq!(step(&report, "web-hub-e2e-main")["status"], "failed");
+    assert_eq!(step(&report, "web-hub-e2e-main")["attempts"], 1);
     assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
     assert_eq!(repo.main(), repo.base);
     assert_eq!(repo.remote_main(), repo.base);

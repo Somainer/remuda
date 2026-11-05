@@ -187,3 +187,7 @@ jobs:
         run: pnpm --dir web exec playwright install --with-deps chromium
       - name: Hub live e2e
         run: pnpm --dir web run test:e2e:hub
+      # The gate's web-hub-e2e-main step: the specs that seat the Hub's one
+      # address-owner Main, on their own Hub after the main pass.
+      - name: Hub live e2e (Main)
+        run: pnpm --dir web run test:e2e:hub:main

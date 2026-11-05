@@ -87,6 +87,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 pnpm install --frozen-lockfile / pnpm build / pnpm test   # selected web checks
 pnpm run test:e2e:hub                                    # when selected
+pnpm run test:e2e:hub:main                               # with test:e2e:hub
 pnpm --dir web run gen:api                              # gen-api-current
 verify-tree                                            # merged HEAD and tree unchanged
 ```
@@ -95,6 +96,20 @@ Web checks, including `gen-api-current`, run when the merge changes `crates/`
 or `web/`, or when `--web` or `--web-e2e` selects them. Otherwise they are
 skipped, except that authentication-sensitive changes can select the web
 and live Hub checks automatically.
+
+The live Hub checks are two steps, selected together:
+- `web-hub-e2e` (`test:e2e:hub`) is the main pass.
+- `web-hub-e2e-main` (`test:e2e:hub:main`, `web/scripts/e2e-hub-main.mjs`)
+  runs the hub specs that seat the Hub's one address-owner Main. They are
+  `main-ui`, `home-extras`, `owner-notify` and `routed-to`, run on their own
+  Hub with `HUB_E2E_MAIN_UI=1 REMUDA_DELEGATED_DECISIONS=1
+  HUB_E2E_LINEAGE_FENCE=1`. The main pass skips them, and its budget has no
+  room for them (it already runs about 48 of its 50 minutes on the shared
+  devbox).
+- A unit test keeps the script's file list equal to the specs that check
+  `HUB_E2E_MAIN_UI`.
+- Both steps make one attempt, with Playwright's CI retry inside it, and
+  both hold the same `REMUDA_E2E_LOCK` flock.
 
 `gen-api-current` runs in the isolated merged worktree after the selected
 web steps. It checks `git status --porcelain` for
@@ -172,9 +187,9 @@ overlap. Reports (single verification and queue lanes alike) live in
 
 ### Hub e2e port precedence
 
-The web-hub-e2e step reads `HUB_E2E_LISTEN` (Hub), `HUB_E2E_WEB_PORT`
-(Vite) and `HUB_E2E_UPSTREAM_LISTEN` (the fake Anthropic upstream) from its
-environment. The merge command exports all three itself, in this order:
+The web-hub-e2e and web-hub-e2e-main steps read `HUB_E2E_LISTEN` (Hub),
+`HUB_E2E_WEB_PORT` (Vite) and `HUB_E2E_UPSTREAM_LISTEN` (the fake Anthropic
+upstream) from their environment. The merge command exports all three itself, in this order:
 
 1. **`--e2e-port-base <port>` (highest):** every value is derived from the
    block — lane 1 gets `<port>` / `<port>+9` / `<port>+1`, lane N shifts the
@@ -196,7 +211,8 @@ upstream default `127.0.0.1:58881`.
 
 Every gate step has a wall-clock deadline enforced by the gate driver:
 `cargo-*` steps 30 minutes, `web-*` steps 20 minutes, the Hub e2e step 30
-minutes (its real worst case), scans and any other step 30 minutes. Each
+minutes (its real worst case), the opt-in Main pass (`web-hub-e2e-main`,
+about 3 minutes) 15 minutes, scans and any other step 30 minutes. Each
 step runs in its own process group; the driver polls the child every
 200 ms. If the deadline passes, or the direct child disappears without
 `waitpid` returning (an external kill leaving the driver stuck in `wait4`,

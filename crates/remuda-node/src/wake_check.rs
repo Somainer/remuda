@@ -1157,8 +1157,61 @@ mod tests {
         let left = survivors(dir.path());
         reap_survivors(dir.path());
         assert!(left.is_empty(), "{checked:?} left {left:?}");
-        // The marker only matches its own check's processes.
-        assert!(live_marked("never-issued").is_empty());
+    }
+
+    /// r4: two checks run at once under different markers; one's marker
+    /// sweep never touches the other's process, which its own sweep then ends.
+    #[tokio::test]
+    async fn a_marker_sweep_never_touches_another_checks_process() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let marker_a = format!("test-a.{}", uuid::Uuid::now_v7().simple());
+        let marker_b = format!("test-b.{}", uuid::Uuid::now_v7().simple());
+        let path_a = dir_a.path().to_path_buf();
+        let task_marker = marker_a.clone();
+        let a = tokio::spawn(async move {
+            run_check(
+                "setsid sleep 600 & echo $! > a; sleep 600",
+                &path_a,
+                &env(),
+                Duration::from_secs(4),
+                &task_marker,
+            )
+            .await
+        });
+        let pid_file = dir_a.path().join("a");
+        for _ in 0..500 {
+            if std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid_a = pid_in(&pid_file);
+        // Collected first and asserted after the cleanup, so a failure
+        // leaves nothing running.
+        let a_marked = live_marked(&marker_a).contains(&pid_a);
+        let a_unmarked_for_b = !live_marked(&marker_b).contains(&pid_a);
+        // B kills its supervisor: only its marker sweep can find what it left.
+        let b = run_check(
+            "setsid sleep 600 & echo $! > b; kill -9 $PPID; sleep 600",
+            dir_b.path(),
+            &env(),
+            Duration::from_secs(30),
+            &marker_b,
+        )
+        .await;
+        let left_b = survivors(dir_b.path());
+        let a_alive = alive(pid_a);
+        let checked_a = a.await.unwrap();
+        let left_a = survivors(dir_a.path());
+        reap_survivors(dir_a.path());
+        reap_survivors(dir_b.path());
+        assert!(a_marked, "A's process carries A's marker");
+        assert!(a_unmarked_for_b, "B's marker does not match A's process");
+        assert!(left_b.is_empty(), "{b:?} left {left_b:?}");
+        assert!(a_alive, "B's sweep killed A's process");
+        assert_eq!(checked_a.outcome, WakeCheckOutcome::TimedOut);
+        assert!(left_a.is_empty(), "A's own sweep ends it: {left_a:?}");
     }
 
     /// r3: a fork in flight when the check exits (the setsid child has not

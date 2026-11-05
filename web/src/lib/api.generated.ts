@@ -3982,7 +3982,10 @@ export interface components {
         };
         SeatProfileUpdate: {
             displayName?: string | null;
-            effort?: Record<string, never> | string | null;
+            effort?: {
+                name: string;
+                ultracode?: boolean;
+            } | string | null;
             /** @description 0 creates the profile */
             expectedRevision: number;
             modelCandidates?: string[];

@@ -7600,10 +7600,27 @@
             "maxItems": 5
           },
           "effort": {
-            "type": [
-              "object",
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "ultracode": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "permissionMode": {

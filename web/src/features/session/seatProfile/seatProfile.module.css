@@ -1,0 +1,168 @@
+/* @tokens strict */
+/*
+ * cb-seat-profile (D-063): Main's seat profile under the 「Main 会话」 status
+ * line. One summary line (it wraps on a phone), details and the unavailable
+ * launch items below it, and the owner's editor inline. Buttons follow
+ * visual-system.md §8.1 (one line, one primary per region).
+ */
+
+.panel {
+  padding: var(--space-1) var(--gutter) var(--space-2);
+  border-top: 1px solid var(--divider);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  min-height: var(--control-h-sm);
+}
+
+.lead {
+  color: var(--fg-strong);
+  font-weight: 600;
+}
+
+.item {
+  white-space: nowrap;
+}
+
+.item[data-tone="attention"] {
+  color: var(--attention-fg);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--attention-border);
+  border-radius: var(--radius-pill);
+  background: var(--attention-bg);
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.controls {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-h-sm);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn:disabled {
+  color: var(--fg-faint);
+}
+
+.btnPrimary {
+  border-color: var(--primary-fill);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+}
+
+.details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0 0;
+}
+
+.details dt {
+  color: var(--fg-muted);
+}
+
+.details dd {
+  margin: 0;
+  color: var(--fg-body);
+  overflow-wrap: anywhere;
+}
+
+.model + .model::before {
+  content: "、";
+}
+
+.unavailable {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-4);
+  color: var(--attention-fg);
+}
+
+.unavailable code {
+  font-family: var(--font-mono);
+}
+
+.refused {
+  color: var(--danger-fg);
+}
+
+.form {
+  display: grid;
+  gap: var(--space-2);
+  max-width: 560px;
+  margin-top: var(--space-2);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+  color: var(--fg-body);
+}
+
+.input,
+.textarea {
+  min-height: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-family: var(--font-ui);
+  font-size: var(--text-input);
+}
+
+.textarea {
+  min-height: 88px;
+  padding: var(--space-2);
+  resize: vertical;
+}
+
+.note {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
+.alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--danger-fg);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}

@@ -1218,6 +1218,169 @@ fn is_node_host_file_stage(path: &str) -> bool {
     )
 }
 
+/// The resource an Agent-only path is pinned to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnedTarget<'a> {
+    /// The instance named in the path; [`owns`] decides.
+    Instance(&'a str),
+    /// The lineage named in the path; it must be the caller's own.
+    Lineage(&'a str),
+    /// The worker named in the path; its instance must be in the caller's
+    /// lineage ([`agent_owns_worker`]).
+    Worker(&'a str),
+}
+
+/// How [`restrict_agent_routes`] treats an Agent-origin request.
+///
+/// This is the middleware's own predicate, split out so the capability ledger
+/// generator (`crates/remuda/examples/gen_parity.rs`) can ask the middleware
+/// about a route instead of re-reading its source. The middleware calls it for
+/// every request, so the ledger cannot drift from the enforcement without
+/// this function changing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRouteAdmission<'a> {
+    /// The middleware does not resolve the caller for this path — a login,
+    /// Node-link or health path, the Node's object pull, or the Node's
+    /// host-file staging endpoint. Whatever gate applies lives in the handler.
+    MiddlewareSkipped,
+    /// Admitted for any Agent caller; the handler applies its own grant and
+    /// scope checks.
+    Admitted,
+    /// Admitted only when the addressed resource is in the caller's ownership
+    /// scope, else refused with the same 403 as [`Self::Refused`].
+    OwnerScoped(OwnedTarget<'a>),
+    /// Refused before the handler with `HubError::agent_route()`.
+    Refused,
+}
+
+/// Classify `(method, path)` for an Agent-origin caller; see
+/// [`restrict_agent_routes`]. The path is the request path as registered
+/// (`/v1/instances/{id}` templates first become concrete paths).
+pub fn agent_route_admission<'a>(
+    method: &axum::http::Method,
+    path: &'a str,
+) -> AgentRouteAdmission<'a> {
+    use axum::http::Method;
+    // D-027: a Node pulls `GET /v1/objects/{id}` with its *host* token, which
+    // is not a device and would fail `caller` with 401 before the handler ever
+    // runs. The handler authorizes that route itself, and its device branch is
+    // strictly stronger than this one (operator only, so Agent origin is
+    // refused there too), so skipping it loses no check.
+    if (*method == Method::GET && path.starts_with("/v1/objects/"))
+        // Host files: a Node stages read file bytes at
+        // `POST /v1/hosts/{id}/files/objects` with the same host token. The
+        // handler verifies the token resolves to the addressed host.
+        || (*method == Method::POST && is_node_host_file_stage(path))
+        || is_auth_establishing(path)
+    {
+        return AgentRouteAdmission::MiddlewareSkipped;
+    }
+    // Reads with no path id: the handler re-checks grants and scope.
+    let scope_wide_read = *method == Method::GET
+        && (path == "/v1/caller"
+            // D-028 §4.5: the in-session MCP server reads its own
+            // session's attachments. The handlers pin every read to
+            // the credential's own instance — strictly narrower than
+            // `owns`, which also admits direct children.
+            || attachment_read(path)
+            // §2.4: coordinators list/read projects and instances
+            // inside their scope; handlers re-check grants + scope.
+            || project_read_target(path)
+            || task_read_target(method, path)
+            || path == "/v1/instances"
+            // D-057 §4.2 item 1: scope-wide worker reads; the
+            // handlers require `dispatch` and project scope.
+            || worker_read_target(path)
+            // D-045: `remuda hostcap` is the coordinator's pre-dispatch
+            // host fact, and a launched coordinator is always agent
+            // origin. `GET /v1/hosts/{id}` is operator-only, so this is
+            // the only host read an agent may make; the handler still
+            // requires the `dispatch` grant and re-checks scope, and it
+            // now carries the capability block for exactly this caller.
+            || hostcap_read_target(path)
+            // D-051: delegated-decision routing. Literal predicate for
+            // `GET /v1/interactions` (list; handler
+            // `crates/remuda-hub/src/interactions.rs:281`). The handler
+            // independently re-checks `owns()`, kind, bypass posture,
+            // and the feature switch; admitting the path loosens
+            // nothing by itself.
+            || path == "/v1/interactions");
+    if scope_wide_read {
+        return AgentRouteAdmission::Admitted;
+    }
+    // `/v1/own/check` is a read-shaped gate primitive even though it is POST
+    // (it carries a diff in the body); the handler still enforces scope.
+    if *method == Method::POST && path == "/v1/own/check" {
+        return AgentRouteAdmission::Admitted;
+    }
+    // Reads pinned to one id: the target must be in the caller's ownership
+    // scope.
+    if *method == Method::GET {
+        if let Some(id) = lineage_read_target(path).or_else(|| glance_read_target(path)) {
+            return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+        }
+        // D-060 §9: a worker digest is admitted under the lineage read
+        // predicate, not as a scope-wide worker read.
+        if let Some(id) = digest_read_target(path) {
+            return AgentRouteAdmission::OwnerScoped(OwnedTarget::Worker(id));
+        }
+        if let Some(id) = read_target(path) {
+            return AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance(id));
+        }
+    }
+    // D-060: the caller's own lineage memory (reads and writes).
+    if let Some(id) = memory_target(method, path) {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+    }
+    // cb-inbox-facts: the caller's own lineage inbox.
+    if let Some(id) = inbox_target(method, path) {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+    }
+    // cb-wake-engine: the caller's own lineage wake-ups.
+    if let Some(id) = wake_target(method, path) {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+    }
+    // cb-seat-profile: the caller's own lineage profile. PUT is admitted here
+    // only so the handler answers with its own refusal (`profile-human-only`).
+    if let Some(id) = profile_target(method, path) {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
+    }
+    let write = *method == Method::POST
+        && (path == "/v1/instances"
+            || path == "/v1/fleet/instances"
+            || path == "/v1/fleet/broadcast"
+            || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
+            // D-051: literal predicate for
+            // `POST /v1/interactions/{id}/answer` (handler
+            // `crates/remuda-hub/src/interactions.rs:420`) — there is
+            // no GET-detail predicate (that endpoint does not exist),
+            // and no read_target/project/task helper may match this
+            // implicitly. The handler owns the authorization decision.
+            || (path.starts_with("/v1/interactions/") && path.ends_with("/answer"))
+            || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
+            // Batch 6 gate-queue enqueue/cancel POSTs.
+            || project_write_target(path)
+            // D-057 §4.2 item 1: dispatch, observe and the
+            // per-worker verbs. Handlers keep `dispatch` + project
+            // scope and add lineage-subtree ownership for mutations.
+            || worker_write_target(path)
+            // D-060 §11.5: `remuda owner notify`; the handler
+            // requires `address-owner` and the initiator check.
+            || path == "/v1/owner/notify"
+            || task_write_target(method, path));
+    let patched =
+        *method == Method::PATCH && (project_write_target(path) || task_write_target(method, path));
+    let deleted = *method == Method::DELETE
+        && ((path
+            .strip_prefix("/v1/projects/")
+            .is_some_and(|rest| rest.ends_with("/members")))
+            || task_write_target(method, path));
+    if write || patched || deleted {
+        return AgentRouteAdmission::Admitted;
+    }
+    AgentRouteAdmission::Refused
+}
+
 /// Scoped credentials cannot mint operator credentials, answer their own
 /// approvals, mutate host/worktree administration, or use the raw tty socket.
 pub async fn restrict_agent_routes(
@@ -1226,121 +1389,28 @@ pub async fn restrict_agent_routes(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, HubError> {
     let path = request.uri().path();
-    // D-027: a Node pulls `GET /v1/objects/{id}` with its *host* token, which
-    // is not a device and would fail `caller` here with 401 before the handler
-    // ever runs. The handler authorizes that route itself, and its device
-    // branch is strictly stronger than this one (operator only, so Agent
-    // origin is refused there too), so skipping it loses no check.
-    let node_object_read =
-        request.method() == axum::http::Method::GET && path.starts_with("/v1/objects/");
-    // Host files: a Node stages read file bytes at
-    // `POST /v1/hosts/{id}/files/objects` with the same host token. The
-    // handler verifies the token resolves to the addressed host.
-    let node_host_file_stage =
-        request.method() == axum::http::Method::POST && is_node_host_file_stage(path);
-    if !node_object_read
-        && !node_host_file_stage
-        && !is_auth_establishing(path)
+    let admission = agent_route_admission(request.method(), path);
+    // A skipped path resolves no caller here (a Node token is not a device,
+    // and a login path must not be 401'd by a stale cookie).
+    if !matches!(admission, AgentRouteAdmission::MiddlewareSkipped)
         && auth::presented_token(request.headers()).is_some()
     {
         let device = caller(&state, request.headers()).await?;
         if origin(&device) == InputOrigin::Agent {
-            // `/v1/own/check` is a read-shaped gate primitive even though it
-            // is POST (it carries a diff in the body); the handler still
-            // enforces scope.
-            let read = (request.method() == axum::http::Method::GET
-                && (path == "/v1/caller"
-                    // D-028 §4.5: the in-session MCP server reads its own
-                    // session's attachments. The handlers pin every read to
-                    // the credential's own instance — strictly narrower than
-                    // `owns`, which also admits direct children.
-                    || attachment_read(path)
-                    // §2.4: coordinators list/read projects and instances
-                    // inside their scope; handlers re-check grants + scope.
-                    || project_read_target(path)
-                    || task_read_target(request.method(), path)
-                    || path == "/v1/instances"
-                    // D-057 §4.2 item 1: scope-wide worker reads; the
-                    // handlers require `dispatch` and project scope.
-                    || worker_read_target(path)
-                    // D-045: `remuda hostcap` is the coordinator's pre-dispatch
-                    // host fact, and a launched coordinator is always agent
-                    // origin. `GET /v1/hosts/{id}` is operator-only, so this is
-                    // the only host read an agent may make; the handler still
-                    // requires the `dispatch` grant and re-checks scope, and it
-                    // now carries the capability block for exactly this caller.
-                    || hostcap_read_target(path)
-                    // D-051: delegated-decision routing. Literal predicate for
-                    // `GET /v1/interactions` (list; handler
-                    // `crates/remuda-hub/src/interactions.rs:281`). The handler
-                    // independently re-checks `owns()`, kind, bypass posture,
-                    // and the feature switch; admitting the path loosens
-                    // nothing by itself.
-                    || path == "/v1/interactions"
-                    || match lineage_read_target(path).or_else(|| glance_read_target(path)) {
-                        Some(id) => agent_owns_lineage(&state, &device, id).await?,
-                        None => false,
-                    }
-                    || match digest_read_target(path) {
-                        Some(id) => agent_owns_worker(&state, &device, id).await?,
-                        None => false,
-                    }
-                    || match read_target(path) {
-                        Some(id) => owns(&state, &device, id).await?,
-                        None => false,
-                    }))
-                || (request.method() == axum::http::Method::POST && path == "/v1/own/check");
-            let write = request.method() == axum::http::Method::POST
-                && (path == "/v1/instances"
-                    || path == "/v1/fleet/instances"
-                    || path == "/v1/fleet/broadcast"
-                    || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
-                    // D-051: literal predicate for
-                    // `POST /v1/interactions/{id}/answer` (handler
-                    // `crates/remuda-hub/src/interactions.rs:420`) — there is
-                    // no GET-detail predicate (that endpoint does not exist),
-                    // and no read_target/project/task helper may match this
-                    // implicitly. The handler owns the authorization decision.
-                    || (path.starts_with("/v1/interactions/") && path.ends_with("/answer"))
-                    || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
-                    // Batch 6 gate-queue enqueue/cancel POSTs.
-                    || project_write_target(path)
-                    // D-057 §4.2 item 1: dispatch, observe and the
-                    // per-worker verbs. Handlers keep `dispatch` + project
-                    // scope and add lineage-subtree ownership for mutations.
-                    || worker_write_target(path)
-                    // D-060 §11.5: `remuda owner notify`; the handler
-                    // requires `address-owner` and the initiator check.
-                    || path == "/v1/owner/notify"
-                    || task_write_target(request.method(), path))
-                || request.method() == axum::http::Method::PATCH
-                    && (project_write_target(path) || task_write_target(request.method(), path))
-                || (request.method() == axum::http::Method::DELETE
-                    && ((path
-                        .strip_prefix("/v1/projects/")
-                        .is_some_and(|rest| rest.ends_with("/members")))
-                        || task_write_target(request.method(), path)));
-            // D-060: the caller's own lineage memory (reads and writes).
-            let memory = match memory_target(request.method(), path) {
-                Some(id) => agent_owns_lineage(&state, &device, id).await?,
-                None => false,
+            let refused = match admission {
+                AgentRouteAdmission::MiddlewareSkipped | AgentRouteAdmission::Admitted => false,
+                AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance(id)) => {
+                    !owns(&state, &device, id).await?
+                }
+                AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id)) => {
+                    !agent_owns_lineage(&state, &device, id).await?
+                }
+                AgentRouteAdmission::OwnerScoped(OwnedTarget::Worker(id)) => {
+                    !agent_owns_worker(&state, &device, id).await?
+                }
+                AgentRouteAdmission::Refused => true,
             };
-            // cb-inbox-facts: the caller's own lineage inbox.
-            let inbox = match inbox_target(request.method(), path) {
-                Some(id) => agent_owns_lineage(&state, &device, id).await?,
-                None => false,
-            };
-            // cb-wake-engine: the caller's own lineage wake-ups.
-            let wake = match wake_target(request.method(), path) {
-                Some(id) => agent_owns_lineage(&state, &device, id).await?,
-                None => false,
-            };
-            // cb-seat-profile: the caller's own lineage profile.
-            let profile = match profile_target(request.method(), path) {
-                Some(id) => agent_owns_lineage(&state, &device, id).await?,
-                None => false,
-            };
-            if !read && !write && !memory && !inbox && !wake && !profile {
+            if refused {
                 // cb-errors: the same 403 for a route an Agent may not use,
                 // carrying its reason and next step.
                 return Err(HubError::agent_route());
@@ -1396,6 +1466,54 @@ mod tests {
         ] {
             assert_eq!(wake_target(&method, path), None, "{method} {path}");
         }
+    }
+
+    /// `agent_route_admission` is what the middleware enforces; the capability
+    /// ledger generator reads it, so its verdicts are pinned here.
+    #[test]
+    fn the_route_admission_verdicts_the_middleware_enforces() {
+        use axum::http::Method;
+        let admission = |method, path| agent_route_admission(&method, path);
+        assert_eq!(
+            admission(Method::GET, "/v1/instances"),
+            AgentRouteAdmission::Admitted
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/journal"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/lineages/ins_1/glance"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage("ins_1"))
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/workers/wkr_1/digest"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Worker("wkr_1"))
+        );
+        assert_eq!(
+            admission(Method::POST, "/v1/lineages/ins_1/memory"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage("ins_1"))
+        );
+        assert_eq!(
+            admission(Method::POST, "/v1/instances/ins_1/commands"),
+            AgentRouteAdmission::Admitted
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/hosts"),
+            AgentRouteAdmission::Refused
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/commands"),
+            AgentRouteAdmission::Refused
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/login"),
+            AgentRouteAdmission::MiddlewareSkipped
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/objects/obj_1"),
+            AgentRouteAdmission::MiddlewareSkipped
+        );
     }
 
     #[test]

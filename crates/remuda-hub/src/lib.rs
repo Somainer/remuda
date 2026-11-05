@@ -44,6 +44,10 @@ pub use store::lineage_test_support;
 pub mod agent_scope_test_support {
     pub use crate::agent_scope::CallerAuthority;
 }
+/// The Agent-origin route predicate `restrict_agent_routes` runs, for the
+/// capability ledger generator (`crates/remuda/examples/gen_parity.rs`,
+/// D-060 decision 12). It is the enforcement path itself, not a copy.
+pub use agent_scope::{AgentRouteAdmission, OwnedTarget, agent_route_admission};
 #[doc(hidden)]
 pub mod usage_store_test_support {
     use rusqlite::Connection;

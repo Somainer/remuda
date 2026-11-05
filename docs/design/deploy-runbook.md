@@ -179,7 +179,7 @@ secret envelope；数据库迁移失败时保持 Hub 停止。旧镜像必须兼
 1. **新机准备**：安装版本兼容的二进制；准备空的、权限 `0700` 的
    `<data_dir>`；确认新机上的 `REMUDA_PUBLIC_ORIGIN` 等配置与旧机逐字一致。
 2. **旧机先 SIGTERM 并确认进程退出**：CLI 同时处理 SIGTERM/SIGINT
-   （`crates/remuda/src/main.rs:56-83`），退出走优雅关闭
+   （`crates/remuda/src/lib.rs:65-100`），退出走优雅关闭
    （`crates/remuda/src/cmd/hub.rs:117-127`），writer 线程在 Stop 时
    `PRAGMA wal_checkpoint(TRUNCATE)`（`crates/remuda-hub/src/store.rs:1496`）。
    规格中的 `<data_dir>/hub.lock` 单例锁（hub-topology.md §3）落地后，

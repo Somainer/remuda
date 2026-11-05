@@ -40,7 +40,7 @@
 | D-059 | 2026-10-07 | **回答栅栏（answer fence）proposed——待所有者拍板：让「回答/按键能否到达一个仍在运行的进程」可验证。** 三个彼此独立的串行域（SQLite writer、出站 registry/link FIFO、每个进程的内存状态）的检查与生效分处不同域上，局部加固给不出统一顺序；本决策把三者收进同一顺序：所有者令牌（host+实例+nodeEpoch+processGeneration，由 Node 盖在 journal 上，客户端提示永不参与授权）、单一 writer 派发口（`Store::dispatch_answer` 无 await、claim 先于入队落盘）、出站写闸（回答帧在交给 socket 前对在飞 attempt 做 CAS，线性化点从入队移到「写出决定」）、Node 每实例 `RunGate`（放行与按键持共享读锁，进程结束分类器的证据取独占锁，按键 `tty.write`/`instance.keys` 同受 AF-K 栅栏）、durable link 身份单一来源 + hello 有序采纳（`hello_seq`，只有当前采纳的 link 能登记）、卡状态机（`invalidated`/`unknown` 是关闭态而非吸收态，可被 Node journal 证据细化为 `answer-committed`/`expired`）、commandId 即身份（无 TTL，对账器重驱）、单 Hub 进程硬前提（`hub.lock` fail-closed）、**无 Node 证据时时钟清扫只投影非终态的「联系丢失/未知」、绝不自主结束实例**（Hub 停机不计失联；结束只来自共享进程结束分类器）。只在**进程结束证据**出现时栅栏才收紧（对齐 D-057 OA6：turn/subagent/workflow/configure/diagnostic 失败都不触发，判定交 c-cardsettle 的共享进程结束分类器）。实现切片已列但未排期，c-cardsettle（终态结清、settlement 总线）与 hub.lock 是前置。 | coordinator（c-answerfence，proposed docs-only） | 本 ADR；D-055、D-057 OA6、[hub-topology §3](./hub-topology.md)、[protocol.md §2.5/§2.6/§5.6/§6.1/§7.2/§9.1](./protocol.md)；依赖 c-cardsettle |
 | D-060 | 2026-10-29 | **主 agent 的伙伴层（部分 adopted）：记忆按条目存于 Hub、来源只记录不设闸、事实与唤醒的送达约束、用量上限后的续跑。** 所有者 2026-10-29 拍板三项：(R1) 记忆改为 Hub 的 `memory_entries` 条目表（每条 revision CAS、FTS5 加 LIKE 兜底、秘密 lint、纳入 hub-backup、只接受当前章节写入），现在就做、不依赖 F，血缘退役时归档不删除，取代 main-agent.md §12 原「第三阶段整份文档」；(R2) `rootTurn {commandId, origin, continuation}` 由 Hub 从回合记录推出，只用于审计和显示、永远不是闸，作为 ma-initiator 之后的独立切片 `cb-rootturn`，由事实触发的回合仍可发起 D-017 审批并在 `/approvals` 标为 "agent-initiated"，正式否决 autonomous 回合白名单与记忆内容的策略 lint；(R3) 用量上限：reset 事实一定发送，`autoContinue` 按实例、默认关、agent 可在 dispatch 时打开，两次实质进展之间最多续跑 3 次，任何 Human 或 Agent 输入都取消等待。仍为 proposed 的部分：结构不变量「Hub 执行的任何东西都不从记忆读取」并有测试证明；章节启动只注入记忆索引；inbox 的九条送达约束（稳定 dedupeKey、持久 occurrence 上限、run generation 入键、无订阅者退回所有者推送、不给自己章节发事实、暂停时 hold、先写可见行再发送、Hub 口吻、工具在途的 stall 阈值）；wake run 状态机（interrupted 不重放、错过只补一次）、超时必填的 `check`、无人值守信封与 `owner notify`；不超过 2 KB 的 worker digest 与血缘 glance；自我关闭守卫；错误体只增不改的 `reason`/`next`；能力台账 [agent-parity.md](./agent-parity.md)。待所有者决定 Q1–Q6（about-me 归属、跨 host 迁移、飞书主路由、记忆整理、跟随自己会话、证据位图）各附推荐默认 | coordinator（c-cbadr，docs-only）；R1–R3 由所有者拍板 | 本 ADR；[main-agent.md §3.6/§10–§15/§17](./main-agent.md)、[agent-parity.md](./agent-parity.md)、[protocol.md §8.4/§9.1](./protocol.md)；D-017、D-050、D-051、D-055、D-057；参考 Cindy（Apache-2.0） |
 | D-061 | 2026-10-30 | **首页分诊优先（部分 adopted）：全页唯一的「需要你」队列、Main 卡加「问 Main」、共享 `rank()`、按 owner 的完成未看。** 所有者 2026-10-30 拍板：主轴 A（`/m` 与 `/sessions` 各有一个「需要你」队列并可一键作答，Main 是顶部一张卡加底部一条输入条，PhoneNav 保持 4 槽，h1 仍是「会话」）；`ma-main-ui` 现在排期；完成未看（◉）按 owner 记，取代 ui-spec §3.1 的按设备 last-read 与投影字段 `unread?`；glance 取 owner 范围；角标与「需要你」= 在等 owner 的交互 + 没有交互的 owner 阻塞任务，Main 的提问只算一次，完成未看、通知、回合失败不计；首页可用 chip 回答单字段、单选、≤4 个选项、非 sensitive 的问题（修订 ui-spec §2.5）；「小界面授权更少」（首页权限卡只给允许一次与拒绝、计划卡只给审阅计划、永不批量批准；人类界面规则，不约束 Main）；桌面列表的裸 enter/esc/ctrl+c 移到终端页、停止要确认；快捷提问只在输入聚焦时出现；不做 Hub 早报模板与外部邮件/IM；队列为空时一行问候。规格展开为 [home.md](./home.md)：`rank()` 七档（blocked > 完成未看 > working > 待唤醒 > starting > idle > exited，档内新的在前）、交互期间不重排、空闲折叠；新鲜度（2 s 轮询，10 s 无成功 refresh 或连接非 live 即过期，回前台到首次 refresh 之间不判过期，横幅只在连续失败满 5 s 后出现）；未知计数隐藏不画 0；**`/sessions` 上的 SpacesPanel 默认折叠到「空间 ▸」开关后面**（修订 D-053）；`/m` 底部「问 Main」输入条与 PhoneNav 合为一条停靠带（ui-spec §4.7 唯一例外）；推送落点改为 `/sessions?focus=`。新路由（seen、owner glance、notices list/ack、lineage wakes list/delete、interactions 的 `routedTo`）见正文路由表；docs-only | 所有者（主轴与默认值，2026-10-30）+ coordinator（c-hdocs，docs-only） | 本 ADR；[home.md](./home.md)；[ui-spec.md §1.2/§1.4/§2.1/§2.5/§3.1/§3.3/§4.5/§4.7/§6](./ui-spec.md)；[visual-system.md §8.1/§8.6](./visual-system.md)；[main-agent.md §9](./main-agent.md)；[ui-screenshots.md](./ui-screenshots.md)；D-017、D-038、D-049、D-050、D-051、D-053、D-055、D-057、D-060 |
-| D-062 | 2026-11-04 | **Claim an external herdr pane as an instance (herdr-claim)**: a Human operator adopts a pane a human started in another herdr session on the same host, named by session + workspace + tab (+ optional pane); new driver `herdr-claimed`, `permissionMode: "external"`; a claim is not ownership — release/close detaches only and never closes the pane, kills its process or stops the server; pane gone / process gone (pid + kernel start time) is process-end evidence, an unreachable server is contact loss, a Node restart re-attaches. Agent/Bot/narrowed callers get 403 on discovery, claim, release and on commands to a claimed instance. Design: [herdr-claim.md](./herdr-claim.md) | owner (request) + coordinator (defaults) | owner request 2026-11-04; security-review-2 G1; coordinator-guide "do not restart a shared herdr" |
+| D-062 | 2026-11-04 | **Claim an external herdr pane as an instance (herdr-claim)**: a Human operator adopts a pane a human started in another herdr session on the same host, named by session + workspace + tab (+ optional pane); new driver `herdr-claimed`, `permissionMode: "external"`; a claim is not ownership — release/close detaches only and never closes the pane, kills its process or stops the server; pane gone / process gone (pid + kernel start time, re-checked before every write) is process-end evidence, unknown process info is never alive, an unreachable server is contact loss, a Node restart re-attaches. Agent/Bot/narrowed callers get 403 on discovery, claim, release and on every path that writes to or ends a claimed pane; Hub-origin input never reaches one. Design: [herdr-claim.md](./herdr-claim.md) | owner (request) + coordinator (defaults) | owner request 2026-11-04; security-review-2 G1; coordinator-guide "do not restart a shared herdr" |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -2379,14 +2379,29 @@ pane, its process or its server.
 
 ### Decision
 
-1. **Who may claim: Human operators only.** Discovery
+1. **Who may claim, drive or end a claim: Human operators only.** Discovery
    (`GET /v1/hosts/{id}/herdr`), claim (`POST /v1/instances/claim`) and release
    (`POST /v1/instances/{id}/release`) refuse an Agent, a Bot and a Human
-   narrowed to an instance with 403 plus `reason` and `next`. Commands to a
-   claimed instance (`/v1/instances/{id}/commands`) refuse non-Human callers
-   with 403 `human-only`. Reason: the pane runs with a permission mode and
-   credentials Remuda never set; an agent claiming or driving it would widen
-   its authority.
+   narrowed to an instance with 403 plus `reason` and `next`. **Every** path
+   that writes to a claimed pane or ends its claim — send, keys, interrupt,
+   respond, configure, `tty.write`/`tty.resize` (commands route and follow
+   socket), close, release, purge, `DELETE`, resume, fleet broadcast/run — goes
+   through one Hub gate (`herdr_claims::authorize_pane_write`) that admits only
+   a Human device and stamps the payload; non-Human callers get 403
+   `human-only`. Two backstops refuse an unstamped pane write before anything
+   is sent (`forward_if_online` for queued commands, `call_admitted_frame` for
+   direct RPCs), the Node refuses a pane write whose frame's `origin` is not
+   `human` (a missing origin included), and a source-scan test fails on any Hub
+   send of a pane-write method that skips the gate. Reason: the pane runs with
+   a permission mode and credentials Remuda never set; an agent claiming or
+   driving it would widen its authority.
+   **Hub-origin input never reaches a claimed pane** either: Remuda did not
+   start the process, so Hub voice typed into it (inbox fact batches,
+   usage-resume continuations, restart notices, wake runs, owner-notify) is
+   unsafe. The gate refuses `origin: hub` for a claimed instance, and a claimed
+   instance is refused as an inbox subscriber, a wake target, a usage-resume
+   row and a restart target when those rows are created (owner-notify is a
+   push to the owner and never writes to an instance).
 2. **Ownership: none.** Release — and close, which on a claimed instance *is*
    release — detaches only: the Node stops watching and bridging the pane and
    the instance ends with reason `released`. It never closes the pane, kills or
@@ -2399,9 +2414,14 @@ pane, its process or its server.
    path), workspace id, tab id and optionally pane id. Without a pane id the
    tab must have exactly one pane; otherwise 400 listing the pane ids. The ids
    must exist and belong together (pane in tab, tab in workspace). The Node
-   records all of them plus the pane's foreground process from
-   `pane.process_info` (pid, executable base name, Linux start time) at claim
-   time. The Node's own session is not claimable.
+   records all of them plus the **claimed process** from `pane.process_info`
+   (pid, executable base name, Linux kernel start time) at claim time. For an
+   agent kind that is the pane's foreground process-group leader, which must
+   not be the shell: while herdr reports only the shell the claim is refused
+   with 409 `herdr-claim-not-ready`, never pinned to the shell. For
+   `--kind shell` it is the shell itself: any foreground job is allowed, and
+   the shell's own replacement ends the claim. The Node's own session is not
+   claimable.
 4. **Kind.** `--kind claude|codex|grok|agy|shell`, defaulting to herdr's agent
    kind for the pane (`generic` for other agents, `terminal` when herdr reports
    none). New `DriverKind` **`herdr-claimed`**; `instance.create` refuses it.
@@ -2410,14 +2430,26 @@ pane, its process or its server.
 5. **Uniqueness.** One live claim per (host, socket, pane): a second claim is
    409 naming the live instance. The Node is the authority (one Node per
    host); the Hub checks its own rows first.
-6. **Liveness and end.** The Node polls each claim. Pane gone or process gone
-   (recorded pid absent from `pane.process_info` **and** dead by the kernel)
-   ends the instance `exited` with reason code `herdr-pane-gone` /
-   `herdr-process-gone` — process-end evidence under D-057 OA6 — and the pane is
-   never touched. An unreachable server is contact loss, never failure: the
-   instance stays live with `herdrClaim.contact = "lost"` until the server
-   answers again. A Node restart re-attaches every live claim whose pane still
-   exists in the recorded workspace and tab with its process alive.
+6. **Liveness and end.** The Node polls each claim every 2 s and, in
+   addition, re-checks the claimed process before every send, keystroke and
+   raw TTY input write, so a write in the window between two probes never
+   reaches a process that replaced it. Pane gone ends the instance `exited`
+   with `herdr-pane-gone`. Process gone — the process now in the claimed role
+   (foreground leader for an agent, the shell for a shell claim) is not the
+   recorded pid **with** the recorded kernel start time, so a changed leader
+   or a reused pid counts — ends it with `herdr-process-gone`, and a write that
+   found it is dropped. Both are process-end evidence under D-057 OA6, and the
+   pane is never touched. A `pane.process_info` failure while the server
+   answered is *unknown*, never alive: writes are refused, and 3 such probes
+   in a row end the claim with `herdr-process-unknown`; a claim that recorded
+   no process ends that way at re-attach. An unreachable server is contact
+   loss, never failure: the instance stays live with
+   `herdrClaim.contact = "lost"` until the server answers again. A Node
+   restart re-attaches every live claim whose pane still exists in the
+   recorded workspace and tab with its recorded process in its role. A release
+   is an idempotent `instance.close` command delivered at once, or on the
+   host's next hello and by the Hub tick while it is away; whether it was
+   delivered is read from that command, never from the release audit.
 7. **No agent-output transcript in this cut.** A claimed instance has screen,
    TTY, activity from herdr's agent status, lifecycle events and a user-message
    row per send; nothing the agent prints is journaled.
@@ -2441,4 +2473,6 @@ socket's same-uid `0600` mode stays the trust boundary (security-review-2 G1);
 a claim routes an operator's existing reach through the Hub, so only an
 authenticated Human may use it; no Remuda path can close, kill or restart the
 claimed pane; pane-id reuse is defeated by re-validating workspace, tab and the
-process start time; discovery is metadata only and full argv is never read.
+process start time; a replaced process is caught before every write, not only
+by the poll; Hub-origin input never reaches a claimed pane; discovery is
+metadata only and full argv is never read.

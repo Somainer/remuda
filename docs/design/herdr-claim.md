@@ -24,22 +24,43 @@ whatever that pane can do. For the same reason the Hub refuses every
 `/v1/instances/{id}/commands` call on a claimed instance from a non-Human
 caller (403, reason `human-only`).
 
-The rule is structural (round 2). Every operation that writes to a claimed
-pane or ends its claim — `instance.send`, `instance.keys`, `tty.write` and
-`tty.resize` (from the commands route **and** the follow socket's TTY input),
-`instance.configure`, `instance.cancel`, `instance.respond`, `instance.close`,
-release, `DELETE /v1/instances/{id}`, resume and fleet broadcast/run — passes
-one Hub gate, `herdr_claims::authorize_pane_write`, with the authenticated,
-narrowed device. Only a Human device passes; the gate stamps the payload
-(`claimWrite`, `origin: human`), and `forward_if_online` refuses (and settles
-rejected) any such command for a claimed instance without that stamp, so a
-route that forgets the gate fails closed. Hub-internal work (inbox delivery,
-restart notices, digests) never writes to a claimed pane. A fleet broadcast
-from a non-Human skips claimed targets with a per-instance `human-only`
-result. The Node refuses the same writes to a claimed pane when the frame's
-Hub-stamped `origin` is not `human`. A source-scan test fails if a Hub path
-sends a pane-write Node RPC without the gate. A claimed pane cannot be
-resumed at all (400).
+The rule is structural (rounds 2–3). Every operation that writes to a
+claimed pane or ends its claim — `instance.send`, `instance.keys`, `tty.write`
+and `tty.resize` (from the commands route **and** the follow socket's TTY
+input), `instance.configure`, `instance.cancel`, `instance.respond`,
+`instance.close`, `instance.purge`, release, `DELETE /v1/instances/{id}`,
+resume and fleet broadcast/run — passes one Hub gate,
+`herdr_claims::authorize_pane_write`, with the authenticated, narrowed device.
+Only a Human device passes; the gate stamps the payload (`claimWrite`,
+`origin: human`). Two backstops refuse an unstamped pane write to a claimed
+instance before anything is sent, so a route that forgets the gate fails
+closed: `forward_if_online` for every queued command (the row settles
+rejected) and `node_ops::call_admitted_frame` (`verify_direct`) for direct
+RPCs. A fleet broadcast from a non-Human skips claimed targets with a
+per-instance `human-only` result. The Node refuses the same writes to a
+claimed pane unless the frame's Hub-stamped `origin` is `human` — a frame with
+**no** origin is refused too, so an omission cannot downgrade the check. A
+source-scan test (`herdr_claims::gate_scan`) fails if a Hub function sends a
+pane-write Node RPC without the gate: it reads every `.call(` on any Node
+transport whatever the receiver is named, every call of a method-forwarding
+helper (`call_node`, `call_node_pinned`, `call_admitted`,
+`call_admitted_frame`, the host-files and SCM proxies, the workspace mutation),
+and treats a non-literal method as possibly a pane write; RED fixtures prove
+each shape is caught. A claimed pane cannot be resumed at all (400).
+
+**Hub-origin input never reaches a claimed pane** (round 3). Remuda did not
+start the process in it, so Hub voice typed into it is unsafe. The gate above
+already refuses an unstamped `origin: hub` write; beyond that every
+Hub-origin source refuses a claimed target when its row would be created, so
+nothing is formed, refused and formed again:
+
+| Source | Refusal |
+| --- | --- |
+| inbox fact batches | a claimed lineage never receives facts, whatever its settings; `PATCH /v1/lineages/{id}/inbox` with `optIn: true` is 409 `claimed-pane`; the delivery gate treats a claimed chapter as gone, so a left-over fact falls back to the owner push |
+| wake-ups (persistent and fresh) | `POST /v1/lineages/{id}/wake-ups` is 409 `claimed-pane`; a fresh run never creates a child on a claimed chapter's behalf |
+| usage-resume continuations | `PATCH /v1/instances/{id}` with `autoContinue: true` is 409 `claimed-pane`; no wait row is recorded; a left-over one ends `claimed-pane` |
+| restart notices | a claimed row never gets continuity (no grants, no restart policy) and the C1 supervisor skips `herdr-claimed` |
+| owner-notify | a push to the owner; it never writes to any instance |
 
 ## 2. Identity
 
@@ -145,6 +166,15 @@ JSONL is out of scope (§10).
 All calls go to the socket recorded in the claim, and every one names the
 claimed pane id: nothing reaches another pane, tab or workspace.
 
+**Every write re-checks the claimed process** (round 3). Probes run every
+2 s, so between two of them a replaced process could otherwise receive input.
+Before `instance send`, `instance keys`, interrupt and **every** raw TTY input
+write, the Node re-reads `pane.process_info` and the kernel start time and
+compares them with the recorded identity (§2). A mismatch ends the claim
+(`herdr-process-gone`, §6) and the write is dropped; an unknown answer (below)
+refuses the write. The TTY bridge carries this check itself (a write guard on
+the bridge), and the claimed driver never hands out an unguarded bridge.
+
 ## 6. Liveness, end and restart
 
 The Node polls each claimed pane every 2 s (`session.snapshot` plus
@@ -161,6 +191,13 @@ The Node polls each claimed pane every 2 s (`session.snapshot` plus
   program now runs there — is process-gone, so send, keys and the TTY never
   drive whatever replaced the claimed agent. The instance ends `exited` with
   reason code `herdr-process-gone` and evidence naming both pids.
+- **Process unknown** — the session snapshot answered but `pane.process_info`
+  failed or reported no process info. Nothing can be said about the claimed
+  process, so it is never read as alive: every write is refused, and after 3
+  such probes in a row the instance ends `exited` with reason code
+  `herdr-process-unknown`. A claim row that recorded no process at all (made
+  before round 2) is ended the same way at re-attach and never re-attached:
+  there is nothing to compare with.
 - **Server unreachable** — the socket refuses, times out or answers
   `server_unavailable`. This is contact loss, never process end: the instance
   stays live, the journal gets a `herdr_claim_contact` = `lost` diagnostic, the
@@ -172,8 +209,10 @@ In every case the pane is never touched.
 **Node restart.** A graceful shutdown leaves claimed rows live; a crash leaves
 them as they were. At start, before any command is served, the Node checks
 each live claim: pane present and process alive → re-attach (watcher, TTY
-bridge, command queue); pane gone or process gone → end with evidence as
-above; server unreachable → re-attach in the contact-lost state. Either way the
+bridge, command queue); pane gone or process gone, or no recorded process →
+end with evidence as above; process unknown → re-attach with every write
+refused, the first of the 3 probes counted; server unreachable → re-attach in
+the contact-lost state. Either way the
 re-attach journals the contact it observes (`ok` or `lost`), so a `lost` that
 survived the restart flips back to `ok` once the server answers. The Hub sees
 the re-attached instances as live in the hello inventory.
@@ -185,12 +224,14 @@ Node RPCs (Hub→Node, additive, same family as `host.dirs.list`):
 | Method | Params | Result |
 | --- | --- | --- |
 | `herdr.discover` | `{session?}` | `{sessions:[{session, socketPath, reachable, error?, workspaces:[{workspaceId, label, tabs:[{tabId, label, panes:[{paneId, agent?, agentStatus, process?, claimedBy?}]}]}]}]}` |
-| `herdr.resolve` | `{session, workspaceId, tabId, paneId?, kind?}` | `{claim: HerdrClaim, kind, agentStatus, cwd?}` — read-only validation |
+| `herdr.resolve` | `{session, workspaceId, tabId, paneId?, kind?}` | `{claim: HerdrClaim, kind, agentStatus, remudaWorkspaceId?, cwd?}` — read-only validation; `remudaWorkspaceId` is the registered workspace holding the pane's cwd |
 | `instance.claim` | `{instanceId, session, workspaceId, tabId, paneId, kind}` | `{instance}` — idempotent per `instanceId` |
 
 Refusals carry a stable prefix in the Node's error text, which the Hub maps:
 `herdr-claim-invalid` and `herdr-claim-ambiguous` → 400, `herdr-claim-own-session`
-→ 400, `herdr-claim-conflict` → 409, `herdr-unreachable` → 400.
+→ 400, `herdr-claim-conflict` → 409 (`already-claimed`),
+`herdr-claim-not-ready` → 409 (`not-ready`: an agent claim whose pane has no
+foreground agent yet), `herdr-unreachable` → 400.
 
 Hub routes (Human only):
 

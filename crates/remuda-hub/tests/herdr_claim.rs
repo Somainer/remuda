@@ -199,6 +199,7 @@ impl NodeTransport for FakeNode {
                     }
                 }
                 "instance.close" => json!({"result": {"accepted": true}}),
+                "instance.purge" => json!({"result": {"purged": true}}),
                 other => node_error(&format!("unexpected {other}")),
             };
             Ok(Some(reply))
@@ -1055,6 +1056,17 @@ async fn delete_of_a_claimed_instance_is_human_only() -> Result<()> {
     assert_eq!(closes.len(), 1);
     assert_eq!(closes[0]["origin"], "human");
     assert!(closes[0]["claimWrite"].as_str().is_some());
+    // D-062 r3 item 4: the Node refuses an unstamped purge of a claimed row,
+    // so the Human delete's purge carries the gate's stamp too.
+    let node = fixture.node.clone();
+    eventually("the purge reaches the Node", || {
+        !node.params_of("instance.purge").is_empty()
+    })
+    .await?;
+    let purges = fixture.node.params_of("instance.purge");
+    assert_eq!(purges[0]["instanceId"], json!(id));
+    assert_eq!(purges[0]["origin"], "human", "{purges:?}");
+    assert!(purges[0]["claimWrite"].as_str().is_some(), "{purges:?}");
     fixture.hub.shutdown().await;
     Ok(())
 }

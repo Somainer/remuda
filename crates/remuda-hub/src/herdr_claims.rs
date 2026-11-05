@@ -123,13 +123,43 @@ pub(crate) async fn verify_forward(
     if !is_claimed(&instance) {
         return Ok(());
     }
-    let stamped = command
-        .payload
+    if stamped(&command.payload) {
+        Ok(())
+    } else {
+        Err(human_only())
+    }
+}
+
+/// The direct-RPC twin of [`verify_forward`] (D-062 r3 item 4), run by
+/// `node_ops::call_admitted_frame` before anything is sent: a pane write to a
+/// claimed instance whose params lack the gate's stamp is refused.
+pub(crate) async fn verify_direct(
+    state: &AppState,
+    method: &str,
+    params: &Value,
+) -> Result<(), HubError> {
+    if !PANE_WRITE_OPS.contains(&method) {
+        return Ok(());
+    }
+    let Some(instance_id) = params.get("instanceId").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(instance) = state.store.get_instance(instance_id.to_owned()).await? else {
+        return Ok(());
+    };
+    if !is_claimed(&instance) || stamped(params) {
+        return Ok(());
+    }
+    Err(human_only())
+}
+
+/// Whether a payload carries [`authorize_pane_write`]'s stamp.
+fn stamped(payload: &Value) -> bool {
+    payload
         .get(CLAIM_WRITE_MARK)
         .and_then(Value::as_str)
         .is_some_and(|id| !id.is_empty())
-        && command.payload.get("origin").and_then(Value::as_str) == Some("human");
-    if stamped { Ok(()) } else { Err(human_only()) }
+        && payload.get("origin").and_then(Value::as_str) == Some("human")
 }
 
 async fn require_human(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
@@ -656,27 +686,126 @@ async fn audit(state: &AppState, device: &Device, action: &str, instance_id: &st
 }
 
 #[cfg(test)]
+mod backstop {
+    //! D-062 r3 item 4: the direct-RPC backstop in `call_admitted_frame`.
+    use super::{DRIVER, verify_direct};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn an_unstamped_direct_pane_write_to_a_claimed_row_is_never_sent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let hub = crate::spawn(crate::HubConfig::for_test(dir.path().join("data")))
+            .await
+            .expect("hub");
+        let state = hub.test_state().clone();
+        let host = remuda_protocol::HostId::new().as_id().as_str().to_owned();
+        hub.test_insert_host(&host).await.expect("host");
+        let claimed = state
+            .store
+            .insert_instance_delegated(
+                host.clone(),
+                None,
+                "claude".into(),
+                DRIVER.into(),
+                None,
+                json!({"kind": "claude", "driver": DRIVER}),
+                crate::store::InstanceDelegation::default(),
+                crate::agent_scope::CallerAuthority::internal(),
+            )
+            .await
+            .expect("claimed row");
+        let id = claimed.instance_id;
+        let unstamped = json!({"instanceId": id});
+        let refused = verify_direct(&state, "instance.send", &unstamped)
+            .await
+            .expect_err("an unstamped pane write is refused");
+        assert_eq!(refused.status_code_and_body().0, 403, "{refused}");
+        // Through the helper itself: refused before the host check, so the
+        // answer is the 403, not host-offline.
+        let through = crate::node_ops::call_admitted_frame(
+            &state,
+            &host,
+            "tty.write",
+            None,
+            "op_test".into(),
+            json!({"instanceId": id, "dataBase64": "eA=="}),
+            std::time::Duration::from_secs(1),
+            &crate::node_ops::NodeOpAuth {
+                initiator: None,
+                device_id: None,
+            },
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(through.status_code_and_body().0, 403, "{through}");
+        // Stamped by the gate, a read, or another instance: untouched.
+        let stamped = json!({"instanceId": id, "claimWrite": "dev_x", "origin": "human"});
+        verify_direct(&state, "instance.send", &stamped)
+            .await
+            .expect("stamped");
+        verify_direct(&state, "tty.screen", &unstamped)
+            .await
+            .expect("a read");
+        verify_direct(&state, "instance.send", &json!({"instanceId": "ins_other"}))
+            .await
+            .expect("not a claimed row");
+        hub.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod gate_scan {
-    //! D-062 r2 item 1, structural: every Hub path that sends a Node RPC able
-    //! to write to a claimed pane (or end its claim) goes through the
-    //! Human-only gate. A new route that forwards one without it fails here.
+    //! D-062 r2 item 1 / r3 item 4, structural: every Hub path that sends a
+    //! Node RPC able to write to a claimed pane (or end its claim) goes through
+    //! the Human-only gate. A new route that forwards one without it fails here.
+    //!
+    //! What counts as a send:
+    //! * any `.call(` in production code, whatever its receiver is named: in
+    //!   the Hub that is a Node transport (`ConnectedNodes::call(host, method,
+    //!   params, timeout)`, or a pinned / raw transport's `call(method, params,
+    //!   timeout)`), so the method is argument 1 of a 4-argument call and
+    //!   argument 0 of a 3-argument one;
+    //! * a call of a generic RPC helper ([`HELPERS`]), at its method argument.
+    //!
+    //! A method that may be a pane write is a pane-write literal, a protocol
+    //! constant naming one, or anything that is not a literal or a constant (a
+    //! variable carries any method). The calling function must run the gate.
     use super::PANE_WRITE_OPS;
     use std::path::{Path, PathBuf};
 
-    /// Bodies of the generic RPC helpers: their method is the caller's
-    /// argument, so the rule applies at their call sites instead.
-    /// `proxy_to_host` (host files), `proxy_scm` (workspace SCM) and
-    /// `call_admitted_frame` (D-057 direct operations) are read/ops proxies
-    /// that take the method from their callers too.
-    const GENERIC_HELPERS: &[&str] = &[
-        "call_node",
-        "call_node_pinned",
-        "proxy_to_host",
-        "proxy_scm",
-        "call_admitted_frame",
+    /// Hub→Node RPC helpers that send the method their caller names: `(file
+    /// defining it, fn, index of the method argument, private)`. A private
+    /// helper's call sites are only looked for in its own file. Their bodies
+    /// are exempt (the method is the caller's argument), so the rule applies
+    /// at their call sites instead; `call_admitted_frame` also runs
+    /// [`super::verify_direct`] itself.
+    const HELPERS: &[(&str, &str, usize, bool)] = &[
+        ("http.rs", "call_node", 2, false),
+        ("http.rs", "call_node_pinned", 2, false),
+        ("host_files.rs", "proxy_to_host", 3, true),
+        ("workspaces.rs", "proxy_scm", 3, true),
+        // `workspace.register` / `workspace.unregister`.
+        ("workspaces.rs", "mutate", 4, true),
+        ("node_ops.rs", "call_admitted", 2, false),
+        ("node_ops.rs", "call_admitted_frame", 2, false),
     ];
-    /// Functions that do not route anything: the transport layer itself.
+    /// In-process test seams (`#[doc(hidden)]`, never routed) that pass a
+    /// caller-chosen method to `call_admitted_frame`, whose
+    /// [`super::verify_direct`] refuses an unstamped pane write. Each must
+    /// still exist and still go through that helper.
+    const SEAMS: &[(&str, &str)] = &[("lib.rs", "test_call_node_op")];
+    /// Gate calls: the Human-only gate and its two backstops.
+    const GATES: &[&str] = &["authorize_pane_write(", "verify_forward(", "verify_direct("];
+    /// The transport layer itself routes nothing.
     const SKIPPED_FILES: &[&str] = &["transport.rs"];
+
+    #[derive(Default, Debug)]
+    struct Scan {
+        /// `file::fn (method)` of every send that may be a pane write.
+        checked: Vec<String>,
+        /// Those whose function runs no gate.
+        offenders: Vec<String>,
+    }
 
     fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("src dir").flatten() {
@@ -689,13 +818,107 @@ mod gate_scan {
         }
     }
 
-    /// Production text of a file: everything before its first test module.
-    fn production(path: &Path) -> String {
-        let text = std::fs::read_to_string(path).expect("source");
-        match text.find("#[cfg(test)]") {
-            Some(at) => text[..at].to_owned(),
-            None => text,
+    /// Production text: the file without its `#[cfg(test)]` items (each
+    /// skipped through its `;` or its balanced `{…}` block), so production
+    /// code AFTER a test item is still scanned.
+    fn production(text: &str) -> String {
+        const ATTR: &str = "#[cfg(test)]";
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(ATTR) {
+            out.push_str(&rest[..at]);
+            let item = &rest[at + ATTR.len()..];
+            rest = &item[item_len(item)..];
         }
+        out.push_str(rest);
+        out
+    }
+
+    /// Byte length of the item at the start of `text`: through the first
+    /// top-level `;`, or through the `}` closing its first block. Strings, raw
+    /// strings, char literals and comments are stepped over.
+    fn item_len(text: &str) -> usize {
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'r' if matches!(bytes.get(i + 1), Some(b'"' | b'#'))
+                    && !bytes[..i]
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+                {
+                    let hashes = bytes[i + 1..].iter().take_while(|c| **c == b'#').count();
+                    if bytes.get(i + 1 + hashes) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        let from = i + 2 + hashes;
+                        i = text[from..]
+                            .find(&close)
+                            .map_or(bytes.len(), |end| from + end + close.len())
+                            - 1;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                // A char literal ('x', '\n', '\''), never a lifetime ('a).
+                b'\'' if bytes.get(i + 1) == Some(&b'\\') => {
+                    i += 3;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                }
+                b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+                b';' if depth == 0 => return i + 1,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
+    }
+
+    /// `(file name, production text)` of every Hub source.
+    fn hub_sources() -> Vec<(String, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        files
+            .into_iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let text = std::fs::read_to_string(&path).expect("source");
+                (name, production(&text))
+            })
+            .collect()
     }
 
     /// `(name, start, end)` of every fn in `text`, by the next fn header.
@@ -725,16 +948,31 @@ mod gate_scan {
         out
     }
 
-    /// The `index`th top-level argument of the call opening at `open` (`(`).
-    fn argument(text: &str, open: usize, index: usize) -> Option<String> {
+    /// Top-level arguments of the call opening at `open` (`(`).
+    fn arguments(text: &str, open: usize) -> Vec<String> {
         let mut depth = 0usize;
         let mut current = String::new();
         let mut args = Vec::new();
         let mut in_str = false;
-        for ch in text[open + 1..].chars() {
+        let mut escaped = false;
+        let mut in_comment = false;
+        let mut chars = text[open + 1..].chars().peekable();
+        while let Some(ch) = chars.next() {
+            if in_comment {
+                in_comment = ch != '\n';
+                continue;
+            }
+            if !in_str && ch == '/' && chars.peek() == Some(&'/') {
+                in_comment = true;
+                continue;
+            }
             if in_str {
                 current.push(ch);
-                if ch == '"' {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
                     in_str = false;
                 }
                 continue;
@@ -749,7 +987,9 @@ mod gate_scan {
                     current.push(ch);
                 }
                 ')' | ']' | '}' if depth == 0 => {
-                    args.push(current.trim().to_owned());
+                    if !current.trim().is_empty() {
+                        args.push(current.trim().to_owned());
+                    }
                     break;
                 }
                 ')' | ']' | '}' => {
@@ -763,159 +1003,261 @@ mod gate_scan {
                 _ => current.push(ch),
             }
         }
-        args.get(index).cloned()
+        args
     }
 
-    /// Whether a method argument can name a pane write: a guarded literal, or
-    /// anything not a literal (a variable carries any method).
+    /// Whether a method argument can name a pane write: a guarded literal, a
+    /// constant naming one, or anything that is not a literal or a constant.
     fn may_write(method: &str) -> bool {
-        match method
+        let method = method.trim().trim_start_matches('&');
+        if let Some(literal) = method
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
         {
-            Some(literal) => PANE_WRITE_OPS.contains(&literal),
-            None => {
-                let upper = method.to_ascii_uppercase();
-                let guarded_const = [
-                    "TTY_WRITE",
-                    "TTY_RESIZE",
-                    "INSTANCE_SEND",
-                    "INSTANCE_KEYS",
-                    "INSTANCE_CLOSE",
-                    "INSTANCE_CONFIGURE",
-                    "INSTANCE_CANCEL",
-                    "INSTANCE_RESPOND",
-                    "INTERACTION_RESPOND",
-                    "INSTANCE_RESUME",
-                ]
-                .iter()
-                .any(|op| upper.contains(op));
-                // A protocol `METHOD_*` constant names its method; any other
-                // non-literal (a variable) may carry any method.
-                !method.contains("METHOD_") || guarded_const
-            }
+            return PANE_WRITE_OPS.contains(&literal);
         }
+        let last = method.rsplit("::").next().unwrap_or(method);
+        let constant = !last.is_empty()
+            && last
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if !constant {
+            // A variable, a field or an expression carries any method.
+            return true;
+        }
+        PANE_WRITE_OPS.iter().any(|op| {
+            let named = op.replace('.', "_").to_ascii_uppercase();
+            last.contains(&named)
+        })
     }
 
-    #[test]
-    fn every_node_write_path_runs_the_human_only_gate() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        sources(&root, &mut files);
-        let mut checked = Vec::new();
-        let mut offenders = Vec::new();
-        for file in files {
-            let name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_owned();
-            if SKIPPED_FILES.contains(&name.as_str()) {
+    /// Whether the match at `at` starts an identifier (not `xcall_node(`).
+    fn starts_identifier(body: &str, at: usize) -> bool {
+        !body[..at]
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    fn scan(files: &[(String, String)]) -> Scan {
+        let mut out = Scan::default();
+        for (file, text) in files {
+            if SKIPPED_FILES.contains(&file.as_str()) {
                 continue;
             }
-            let text = production(&file);
-            for (function, start, end) in functions(&text) {
-                if GENERIC_HELPERS.contains(&function.as_str()) {
+            for (function, start, end) in functions(text) {
+                if HELPERS
+                    .iter()
+                    .any(|(home, name, _, _)| *home == file.as_str() && *name == function)
+                    || SEAMS.contains(&(file.as_str(), function.as_str()))
+                {
                     continue;
                 }
                 let body = &text[start..end];
-                let gated =
-                    body.contains("authorize_pane_write(") || body.contains("verify_forward(");
-                // (pattern, index of the method argument)
-                for (pattern, method_arg) in [
-                    (".call(", 1usize),
-                    ("call_node(", 2),
-                    ("call_node_pinned(", 2),
-                ] {
-                    let mut search = 0;
-                    while let Some(found) = body[search..].find(pattern) {
-                        let at = search + found;
-                        search = at + pattern.len();
-                        if pattern == ".call(" {
-                            // Only Node RPCs: `state.nodes … .call(` / `nodes.call(`.
-                            let before = &body[at.saturating_sub(80)..at];
-                            if !before.contains("nodes") {
-                                continue;
-                            }
-                        } else if body[..at].ends_with("fn ") {
-                            continue;
-                        }
-                        let open = at + pattern.len() - 1;
-                        let Some(method) = argument(body, open, method_arg) else {
-                            continue;
-                        };
-                        if !may_write(&method) {
-                            continue;
-                        }
-                        checked.push(format!("{name}::{function} ({method})"));
-                        if !gated {
-                            offenders.push(format!("{name}::{function} sends {method}"));
-                        }
-                    }
+                let gated = GATES.iter().any(|gate| body.contains(gate));
+                let mut sends: Vec<(String, String)> = Vec::new();
+                // Any `.call(`: a Node transport call by its arity.
+                let mut search = 0;
+                while let Some(found) = body[search..].find(".call(") {
+                    let at = search + found;
+                    search = at + ".call(".len();
+                    let args = arguments(body, at + ".call(".len() - 1);
+                    let method = match args.len() {
+                        0..=2 => continue,
+                        3 => args[0].clone(),
+                        4 => args[1].clone(),
+                        _ => "<unknown arity>".to_owned(),
+                    };
+                    sends.push((".call".to_owned(), method));
                 }
-            }
-        }
-        // A generic helper's call sites never pass a pane-write method, unless
-        // the calling function runs the gate.
-        let mut files = Vec::new();
-        sources(&root, &mut files);
-        for file in files {
-            let name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_owned();
-            let text = production(&file);
-            for (function, start, end) in functions(&text) {
-                let body = &text[start..end];
-                let gated =
-                    body.contains("authorize_pane_write(") || body.contains("verify_forward(");
-                for helper in GENERIC_HELPERS {
+                for (home, helper, method_arg, private) in HELPERS {
+                    if *private && *home != file.as_str() {
+                        continue;
+                    }
                     let call = format!("{helper}(");
                     let mut search = 0;
                     while let Some(found) = body[search..].find(&call) {
                         let at = search + found;
                         search = at + call.len();
-                        if body[..at].ends_with("fn ") || body[..at].ends_with('_') {
+                        if !starts_identifier(body, at) || body[..at].ends_with("fn ") {
                             continue;
                         }
-                        let open = at + call.len() - 1;
-                        let args: Vec<String> = (0..6)
-                            .filter_map(|index| argument(body, open, index))
-                            .collect();
-                        let writes = args
-                            .iter()
-                            .any(|arg| PANE_WRITE_OPS.iter().any(|op| arg == &format!("\"{op}\"")));
-                        if writes && !gated {
-                            offenders.push(format!(
-                                "{name}::{function} sends a pane write via {helper}"
-                            ));
-                        }
+                        let args = arguments(body, at + call.len() - 1);
+                        let method = args
+                            .get(*method_arg)
+                            .cloned()
+                            .unwrap_or_else(|| "<missing method>".to_owned());
+                        sends.push(((*helper).to_owned(), method));
+                    }
+                }
+                for (via, method) in sends {
+                    if !may_write(&method) {
+                        continue;
+                    }
+                    out.checked.push(format!("{file}::{function} ({method})"));
+                    if !gated {
+                        out.offenders
+                            .push(format!("{file}::{function} sends {method} via {via}"));
                     }
                 }
             }
         }
+        out
+    }
+
+    #[test]
+    fn every_node_write_path_runs_the_human_only_gate() {
+        let files = hub_sources();
+        let found = scan(&files);
         assert!(
-            offenders.is_empty(),
-            "Node write paths that skip herdr_claims::authorize_pane_write / verify_forward: {offenders:#?}"
+            found.offenders.is_empty(),
+            "Node write paths that skip herdr_claims::authorize_pane_write / verify_forward / verify_direct: {:#?}",
+            found.offenders
         );
-        // The scan is not vacuous: it saw the three known write paths.
+        // The scan is not vacuous: it saw the known write paths.
         for known in ["forward_if_online", "forward_tty_call", "delete_instance"] {
             assert!(
-                checked
+                found
+                    .checked
                     .iter()
                     .any(|site| site.contains(&format!("::{known} "))),
-                "{known} not found by the scan: {checked:#?}"
+                "{known} not found by the scan: {:#?}",
+                found.checked
             );
         }
-        let http = production(&root.join("http.rs"));
-        let forward = functions(&http)
-            .into_iter()
-            .find(|(name, _, _)| name == "forward_if_online")
-            .expect("forward_if_online");
+        let text = |file: &str| {
+            files
+                .iter()
+                .find(|(name, _)| name == file)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_else(|| panic!("{file}"))
+        };
+        let body = |file: &str, function: &str| {
+            let text = text(file);
+            let (_, start, end) = functions(&text)
+                .into_iter()
+                .find(|(name, _, _)| name == function)
+                .unwrap_or_else(|| panic!("{file}::{function}"));
+            text[start..end].to_owned()
+        };
         assert!(
-            http[forward.1..forward.2].contains("herdr_claims::verify_forward("),
+            body("http.rs", "forward_if_online").contains("herdr_claims::verify_forward("),
             "forward_if_online must keep the forward-time backstop"
         );
+        assert!(
+            body("node_ops.rs", "call_admitted_frame").contains("herdr_claims::verify_direct("),
+            "call_admitted_frame must keep the direct-RPC backstop"
+        );
+        // Production code after a file's first test item is scanned too.
+        for (file, late) in [
+            ("lib.rs", "fn expire_stale_requested"),
+            ("gatequeue.rs", "fn spawn_landing_reconciler"),
+            ("workspaces.rs", "fn mutate"),
+        ] {
+            assert!(text(file).contains(late), "{file}: {late} not scanned");
+        }
+        // Every exemption still names a real function, and every seam still
+        // goes through the backstopped helper.
+        for (file, function, _, _) in HELPERS {
+            body(file, function);
+        }
+        for (file, function) in SEAMS {
+            assert!(
+                body(file, function).contains("call_admitted_frame("),
+                "{file}::{function} must send through call_admitted_frame"
+            );
+        }
+    }
+
+    /// RED fixtures: each ungated send shape is caught; gated or read-only
+    /// sends are not.
+    #[test]
+    fn the_scan_catches_every_ungated_send_shape() {
+        let fixture = |text: &str| scan(&[("fixture.rs".to_owned(), text.to_owned())]);
+        let caught = [
+            // A route using call_admitted for instance.send.
+            r#"async fn sneaky_send(state: AppState) {
+                crate::node_ops::call_admitted(&state, &host, "instance.send", None, op, json!({"instanceId": id}), timeout, &auth).await;
+            }"#,
+            r#"async fn sneaky_frame(state: AppState) {
+                call_admitted_frame(&state, &host, "tty.write", None, op, params, timeout, &auth).await;
+            }"#,
+            // A non-literal method at a helper call site.
+            r#"async fn relay(state: AppState, method: &'static str) {
+                crate::node_ops::call_admitted_frame(&state, &host, method, None, op, params, timeout, &auth).await;
+            }"#,
+            r#"async fn relay_node(state: AppState, method: String) {
+                crate::http::call_node(&state, &host, &method, params).await;
+            }"#,
+            // A Node transport under another name.
+            r#"async fn aliased(state: AppState) {
+                let link = &state.nodes;
+                link.call(&host, "instance.keys", params, timeout).await;
+            }"#,
+            r#"async fn pinned_write(pin: NodePin) {
+                pin.call("instance.close", params, timeout).await;
+            }"#,
+            r#"async fn constant(state: AppState) {
+                state.nodes.call(&host, remuda_protocol::hubnode::METHOD_TTY_WRITE, params, timeout).await;
+            }"#,
+            r#"async fn variable_op(state: AppState, op: &str) {
+                transport.call(op, params, timeout).await;
+            }"#,
+            // A comment inside the arguments does not hide the method.
+            r#"async fn commented(state: AppState) {
+                state.nodes.call(
+                    &host,
+                    "instance.purge",
+                    params,
+                    // wait for the driver, then drop it, so allow more time
+                    timeout,
+                ).await;
+            }"#,
+        ];
+        // Production code after a test item is still scanned.
+        let after_tests = production(
+            r#"#[cfg(test)]
+            mod early_tests {
+                fn helper() { let quote = '"'; let brace = '{'; let s = "}"; }
+            }
+            #[cfg(test)]
+            mod declared;
+            async fn late_route(state: AppState) {
+                state.nodes.call(&host, "tty.write", params, timeout).await;
+            }"#,
+        );
+        assert!(!after_tests.contains("early_tests") && !after_tests.contains("declared"));
+        let found = fixture(&after_tests);
+        assert_eq!(found.offenders.len(), 1, "{after_tests}\n{found:?}");
+        for text in caught {
+            let found = fixture(text);
+            assert_eq!(
+                found.offenders.len(),
+                1,
+                "an ungated send was missed: {text}\n{found:?}"
+            );
+        }
+        let passed = [
+            // The same send behind the gate.
+            r#"async fn gated(state: AppState) {
+                crate::herdr_claims::authorize_pane_write(&instance, Some(&device), "instance.send", &mut params)?;
+                crate::node_ops::call_admitted(&state, &host, "instance.send", None, op, params, timeout, &auth).await;
+            }"#,
+            // Read-only methods and constants.
+            r#"async fn lease(state: AppState) {
+                crate::node_ops::call_admitted(&state, &host, "worktree.lease", None, op, params, timeout, &auth).await;
+                state.nodes.call(&host, METHOD_HERDR_DISCOVER, json!({}), timeout).await;
+                crate::http::call_node(&state, &host, METHOD_HERDR_RESOLVE, params).await;
+            }"#,
+            // Not a Node transport call: too few arguments.
+            r#"fn service(svc: S) { svc.call(request); }"#,
+        ];
+        for text in passed {
+            let found = fixture(text);
+            assert!(
+                found.offenders.is_empty(),
+                "a gated or read-only send was flagged: {text}\n{found:?}"
+            );
+        }
     }
 }

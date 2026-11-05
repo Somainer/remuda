@@ -91,9 +91,11 @@ const PANE_WRITE_METHODS: &[&str] = &[
     "instance.purge",
 ];
 
-/// D-062 r2, Node side of the Human-only rule: refuse a write to a claimed
-/// pane whose frame carries a Hub-stamped origin other than `human`. A frame
-/// with no origin (an older Hub) is left to the Hub's gate.
+/// D-062 r2/r3, Node side of the Human-only rule: refuse a write to a
+/// claimed pane unless its frame carries the Hub-stamped origin `human`. A
+/// frame with NO origin is refused too (r3 item 4): every Hub that can create
+/// a claimed instance stamps the origin of a pane write, so a missing one is
+/// an omission and must never downgrade the check.
 pub(crate) fn refuse_non_human_write(
     node: &DevNode,
     method: &str,
@@ -102,10 +104,7 @@ pub(crate) fn refuse_non_human_write(
     if !PANE_WRITE_METHODS.contains(&method) {
         return Ok(());
     }
-    let Some(origin) = params.get("origin") else {
-        return Ok(());
-    };
-    if origin.as_str() == Some("human") {
+    if params.get("origin").and_then(Value::as_str) == Some("human") {
         return Ok(());
     }
     let Some(id) = params

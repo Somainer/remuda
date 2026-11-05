@@ -527,7 +527,7 @@ async fn send_keys_and_tty_reach_only_the_claimed_pane() {
     crate::transport::hubnode::dispatch_method(
         &harness.node,
         "instance.send",
-        json!({"instanceId": wire_id, "input": {"type": "prompt", "text": "hello pane"}}),
+        json!({"instanceId": wire_id, "input": {"type": "prompt", "text": "hello pane"}, "origin": "human"}),
     )
     .await
     .expect("send");
@@ -536,7 +536,7 @@ async fn send_keys_and_tty_reach_only_the_claimed_pane() {
     crate::transport::hubnode::dispatch_method(
         &harness.node,
         "instance.keys",
-        json!({"instanceId": wire_id, "keys": ["esc"]}),
+        json!({"instanceId": wire_id, "keys": ["esc"], "origin": "human"}),
     )
     .await
     .expect("keys");
@@ -586,7 +586,7 @@ async fn release_detaches_and_leaves_the_pane_and_its_process_alive() {
     crate::transport::hubnode::dispatch_method(
         &harness.node,
         "instance.close",
-        json!({"instanceId": id.as_id().as_str()}),
+        json!({"instanceId": id.as_id().as_str(), "origin": "human"}),
     )
     .await
     .expect("release");
@@ -596,7 +596,7 @@ async fn release_detaches_and_leaves_the_pane_and_its_process_alive() {
     let _ = crate::transport::hubnode::dispatch_method(
         &harness.node,
         "instance.close",
-        json!({"instanceId": id.as_id().as_str()}),
+        json!({"instanceId": id.as_id().as_str(), "origin": "human"}),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1052,6 +1052,14 @@ async fn the_node_refuses_a_non_human_write_to_a_claimed_pane() {
             json!({"instanceId": id, "input": {"type": "prompt", "text": "x"}, "origin": "hub"}),
         ),
         ("instance.close", json!({"instanceId": id, "origin": "bot"})),
+        // D-062 r3 item 4: a frame with no origin is refused too.
+        ("instance.keys", json!({"instanceId": id, "keys": ["esc"]})),
+        ("tty.write", json!({"instanceId": id, "dataBase64": "eA=="})),
+        (
+            "instance.send",
+            json!({"instanceId": id, "input": {"type": "prompt", "text": "x"}}),
+        ),
+        ("instance.close", json!({"instanceId": id})),
     ] {
         let error = crate::transport::hubnode::dispatch_method(&harness.node, method, params)
             .await

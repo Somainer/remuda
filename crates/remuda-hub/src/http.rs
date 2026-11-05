@@ -743,6 +743,16 @@ pub async fn delete_instance(
         purge_outcomes: serde_json::Map<String, Value>,
         chapter_ids: Vec<String>,
     }
+    // D-062 r3 item 4: the Node refuses an unstamped purge of a claimed
+    // pane's row; the Human gate above already admitted this delete, so the
+    // addressed chapter's purge carries its stamp (a no-op for other rows).
+    let mut addressed_purge = json!({ "instanceId": instance.instance_id });
+    crate::herdr_claims::authorize_pane_write(
+        &instance,
+        Some(&device),
+        "instance.purge",
+        &mut addressed_purge,
+    )?;
     let response_instance_id = instance_id.clone();
     let op_state = state.clone();
     let op = tokio::spawn(async move {
@@ -911,12 +921,17 @@ pub async fn delete_instance(
         // outcome is recorded as `node-offline` in the audit — there is no
         // purge-on-reconnect.
         for chapter in &chapters {
+            let purge = if addressed_purge["instanceId"] == json!(chapter.instance_id) {
+                addressed_purge.clone()
+            } else {
+                json!({ "instanceId": chapter.instance_id })
+            };
             let outcome = match state
                 .nodes
                 .call(
                     &chapter.host_id,
                     "instance.purge",
-                    json!({ "instanceId": chapter.instance_id }),
+                    purge,
                     // The Node waits for a just-closed driver to finish exiting
                     // before it can remove the directory, so allow more than an
                     // RPC round trip.

@@ -336,6 +336,9 @@ pub(crate) async fn call_admitted_frame(
     timeout: std::time::Duration,
     auth: &NodeOpAuth,
 ) -> Result<Option<Value>, HubError> {
+    // D-062 r3 item 4: a pane write to a claimed herdr pane needs the Human
+    // gate's stamp on this path too; refused before anything is written.
+    crate::herdr_claims::verify_direct(state, method, &params).await?;
     // D-057 §7.5 item 2 / §7.6: a host with unacknowledged fences is not sent
     // to (host-offline), and a continuity lineage's op is refused for a Node
     // without fence support. Both refuse before anything is written.

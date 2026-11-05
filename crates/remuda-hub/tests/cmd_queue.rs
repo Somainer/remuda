@@ -768,6 +768,11 @@ async fn a_stale_expected_generation_is_a_conflict_not_an_overwrite() -> Result<
         mains["command"]["settlement"]["outcome"], "rejected",
         "{mains}"
     );
+    assert_eq!(
+        mains["generation"],
+        read + 1,
+        "the response names the new generation"
+    );
     let owner_id = remuda_protocol::CommandId::new().as_id().to_string();
     let owners = json!({ "commandId": owner_id, "operation": "instance.configure",
                          "payload": { "effort": { "name": "high" }, "expectedGeneration": read } });

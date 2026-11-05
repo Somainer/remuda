@@ -453,6 +453,10 @@
           },
           "replayed": {
             "type": "boolean"
+          },
+          "generation": {
+            "type": "integer",
+            "description": "cb-command-queue: for instance.configure, the runtime-config generation (configureSeq) its merge produced"
           }
         },
         "required": [

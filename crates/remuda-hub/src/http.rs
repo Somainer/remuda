@@ -3300,8 +3300,11 @@ pub async fn post_command(
     // pre-dispatch rejection is persisted WITH the command — including the
     // exact HTTP status and body it answered — so a replay reproduces the
     // original outcome instead of a do-nothing `replayed:true`.
-    if command.operation == "instance.configure"
-        && let Err(store_error) = state
+    // cb-command-queue: the runtime-config generation this merge produced,
+    // returned with the response so a client's next configure can name it.
+    let mut generation: Option<i64> = None;
+    if command.operation == "instance.configure" {
+        match state
             .store
             .patch_instance_configure_for(
                 instance_id.clone(),
@@ -3309,37 +3312,19 @@ pub async fn post_command(
                 command.payload.clone(),
             )
             .await
-    {
-        // cb-command-queue: a stale `expectedGeneration` is an audit row.
-        if let crate::store::StoreError::GenerationConflict { generation, .. } = &store_error {
-            let _ = state
-                .store
-                .append_audit(
-                    device.id.clone(),
-                    "instance.configure.conflict".into(),
-                    Some(instance_id.clone()),
-                    json!({
-                        "commandId": command.command_id,
-                        "expectedGeneration": command.payload.get("expectedGeneration"),
-                        "generation": generation,
-                    }),
+        {
+            Ok(merged) => generation = Some(merged.configure_seq),
+            Err(store_error) => {
+                return Err(configure_merge_failed(
+                    &state,
+                    &device,
+                    &instance_id,
+                    &command,
+                    store_error,
                 )
-                .await;
+                .await);
+            }
         }
-        let error = map_store(store_error);
-        let (http_status, http_body) = error.status_code_and_body();
-        // Persist the pre-dispatch rejection WITH the command so a replay
-        // reproduces this exact status and body instead of a fresh success.
-        let _ = state
-            .store
-            .reject_command_outcome(
-                command.command_id.clone(),
-                error.to_string(),
-                Some(http_status as i64),
-                Some(http_body.to_string()),
-            )
-            .await;
-        return Err(error);
     }
     // cb-command-queue: effort on a carrier that takes it only at launch is a
     // `next-chapter` change; the merge above already holds it. With nothing
@@ -3348,7 +3333,14 @@ pub async fn post_command(
         && crate::cmd_queue::LAUNCH_EFFORT_DRIVERS.contains(&instance.driver.as_str())
         && crate::cmd_queue::changes_effort(&command.payload)
     {
-        let settle = !crate::cmd_queue::changes_model(&command.payload);
+        // Settled here only when effort is all it changes: a model or a new
+        // permission mode still goes to the Node (without the effort).
+        let settle = !crate::cmd_queue::changes_model(&command.payload)
+            && command
+                .payload
+                .get("permissionMode")
+                .and_then(Value::as_str)
+                .is_none_or(|mode| instance.permission_mode.as_deref() == Some(mode));
         let command_id = command.command_id.clone();
         let deferred = state
             .store
@@ -3358,7 +3350,9 @@ pub async fn post_command(
             .await
             .map_err(map_store)?;
         if settle && let Some(command) = deferred {
-            return Ok(Json(json!({ "command": command, "replayed": false })));
+            return Ok(Json(
+                json!({ "command": command, "replayed": false, "generation": generation }),
+            ));
         }
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
@@ -3395,7 +3389,52 @@ pub async fn post_command(
         )
         .await;
     }
-    Ok(Json(json!({ "command": command, "replayed": false })))
+    let mut body = json!({ "command": command, "replayed": false });
+    if let Some(generation) = generation {
+        body["generation"] = json!(generation);
+    }
+    Ok(Json(body))
+}
+
+/// Persist a configure's failed first merge with its command (D-055: a
+/// replay reproduces this exact status and body) and return the error.
+async fn configure_merge_failed(
+    state: &AppState,
+    device: &crate::store::Device,
+    instance_id: &str,
+    command: &CommandRecord,
+    store_error: crate::store::StoreError,
+) -> HubError {
+    // cb-command-queue: a stale `expectedGeneration` is an audit row.
+    if let crate::store::StoreError::GenerationConflict { generation, .. } = &store_error {
+        let _ = state
+            .store
+            .append_audit(
+                device.id.clone(),
+                "instance.configure.conflict".into(),
+                Some(instance_id.to_owned()),
+                json!({
+                    "commandId": command.command_id,
+                    "expectedGeneration": command.payload.get("expectedGeneration"),
+                    "generation": generation,
+                }),
+            )
+            .await;
+    }
+    let error = map_store(store_error);
+    let (http_status, http_body) = error.status_code_and_body();
+    // Persist the pre-dispatch rejection WITH the command so a replay
+    // reproduces this exact status and body instead of a fresh success.
+    let _ = state
+        .store
+        .reject_command_outcome(
+            command.command_id.clone(),
+            error.to_string(),
+            Some(http_status as i64),
+            Some(http_body.to_string()),
+        )
+        .await;
+    error
 }
 
 /// Answer a client retry (same commandId or idempotency key) of the stored

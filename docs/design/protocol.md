@@ -2294,7 +2294,7 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 | `POST /v1/commands/{id}/withdraw` | `{expectedRevision?: U64}` | `{command}`：`state=settled`，`settlement.outcome=withdrawn`，`settlement.withdrawnBy: {origin, instanceId?}`。对已撤回的命令再撤回一次返回同一行 |
 | `GET /v1/instances/{id}/config` | — | `{instanceId, generation, model, effort, permissionMode, effective: {model, effort}, pending: [...]}`；Agent 对自己拥有的实例可调用 |
 
-`revision`、`generation` 在 Hub HTTP 上是 JSON 整数（与 `configureSeq` 相同）；请求里的 `expectedRevision`、`expectedGeneration` 接受整数或十进制字符串。
+`revision`、`generation` 在 Hub HTTP 上是 JSON 整数（与 `configureSeq` 相同）；请求里的 `expectedRevision`、`expectedGeneration` 接受整数或十进制字符串。 `instance.configure` 的 POST 应答另带顶层 `generation`：这次 merge 之后的 generation，客户端下一次 configure 用它作 `expectedGeneration`。
 
 同 id 的重放（D-055 outbox）若带的是编辑前的原始 payload，仍视为同一条命令（Hub 只为这一比较保留原始 payload），返回当前行；仍在 Hub 排队的行照 G1 恰好转发一次，发出的是**编辑后**的内容。重放命中已撤回的行时返回该结算行，不再转发。
 

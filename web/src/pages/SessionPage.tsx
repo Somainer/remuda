@@ -71,6 +71,7 @@ import annCss from "../features/tasks/annotation.module.css";
 import { profilingEnabled, reportProbe } from "../lib/profileFlags";
 import type { Observation } from "../types/generated";
 import type { UsageRollup } from "../features/session/contextUsage";
+import { QueuedSends } from "../features/session/QueuedSends";
 
 declare global {
   interface Window {
@@ -184,10 +185,16 @@ export function selectSession(state: HubState, instanceId: string) {
           )?.index ?? null)
         : null,
     usageRollup: hubStore.usageRollupOf(instanceId),
+    // cb-command-queue: this device's own undelivered sends to the session.
+    queued: hubStore.queuedCommandsOf(instanceId),
+    configDeferred: hubStore.configDeferredOf(instanceId),
   };
 }
 
 type SessionSlice = ReturnType<typeof selectSession>;
+
+/** cb-command-queue: how often an open session re-reads its 排队中 list. */
+const QUEUED_REFRESH_MS = 5_000;
 
 /**
  * The decoder builds each list row's capability snapshot afresh and stamps
@@ -378,6 +385,23 @@ function SessionPageBody({
   useEffect(() => {
     void hubStore.loadSupplyCatalog();
   }, []);
+
+  // cb-command-queue 「排队中」: re-read this device's own undelivered sends on
+  // entry, on journal progress (a delivery lands there) and every few seconds
+  // while the page is open (a host coming back delivers without a journal
+  // event of ours).
+  const queuedSeq = hub.instance?.durableSeq;
+  useEffect(() => {
+    if (!instanceId || isTtyLabFixtureId(instanceId)) return;
+    void hubStore.loadQueuedCommands(instanceId);
+  }, [instanceId, queuedSeq]);
+  useEffect(() => {
+    if (!instanceId || isTtyLabFixtureId(instanceId)) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void hubStore.loadQueuedCommands(instanceId);
+    }, QUEUED_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [instanceId]);
 
   // c-composerpop e2e seam: inject a Hub-computed usage rollup as if a poll
   // had delivered it (fake-node sessions never report usage). Installed ONLY
@@ -1083,6 +1107,13 @@ function SessionPageBody({
           taskTitle={sessionTask?.title ?? null}
           readonly={annotationReadonly}
         />
+        {endedBar ? null : (
+          <QueuedSends
+            rows={hub.queued}
+            onEdit={(row, text) => hubStore.editQueuedCommand(instance.id, row, text)}
+            onWithdraw={(row) => hubStore.withdrawQueuedCommand(instance.id, row)}
+          />
+        )}
         {/* An ended session mounts no Composer: the EndedBar is its one
             surface (and the one resume entry). */}
         {endedBar ?? <Composer
@@ -1153,6 +1184,7 @@ function SessionPageBody({
           effortEffective={hub.effortEffective}
           effortReadbackWithdrawn={hub.effortReadbackWithdrawn}
           effortPending={hub.effortPending}
+          effortDeferred={hub.configDeferred}
           ultraGate={hub.effortVersionGate}
           ultraBlocked={
             instance.kind === "claude" && hub.effortRefusal

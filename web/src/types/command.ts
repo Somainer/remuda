@@ -1,6 +1,15 @@
 import type { ActorRef, Digest, EntityMeta, Id, Knowledge, U64 } from "./wire";
 
-export type CommandSettlementOutcome = "cancelled" | "completed" | "expired" | "rejected";
+export type CommandSettlementOutcome =
+  | "cancelled"
+  | "completed"
+  | "expired"
+  | "rejected"
+  // cb-command-queue: the queuer took it back before it was delivered.
+  | "withdrawn";
+
+/** cb-command-queue: a configure that takes effect only at a boundary. */
+export type ConfigureBoundary = "next-turn" | "next-chapter";
 
 export type Command = EntityMeta & {
   commandId: Id;
@@ -19,9 +28,16 @@ export type Command = EntityMeta & {
    */
   settlement?: { outcome: CommandSettlementOutcome; reason?: string };
   expected?: { instanceRevision?: U64; processGeneration?: U64 };
+  /** cb-command-queue: a configure deferred to a turn or chapter boundary. */
+  deferred?: { boundary: ConfigureBoundary; resolvedAt?: string };
 };
 
-export type CommandResult = { command: Command; relatedCommandIds: Id[] };
+export type CommandResult = {
+  command: Command;
+  relatedCommandIds: Id[];
+  /** cb-command-queue: for a configure, the runtime-config generation it produced. */
+  generation?: number;
+};
 
 export type Page<T> = { items: T[]; nextCursor: string | null };
 

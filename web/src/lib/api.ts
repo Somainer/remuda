@@ -1,4 +1,4 @@
-import type { Command, CommandResult, Page } from "../types/command";
+import type { Command, CommandResult, CommandSettlementOutcome, Page } from "../types/command";
 import { profileRegion } from "./profileFlags";
 import { reportFollowVisibility } from "./followVisibility";
 import type { HerdrClaim, Host, HostCli, Instance, TuiMode } from "../types/instance";
@@ -526,12 +526,16 @@ function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id)
     ...(row.settlement
       ? {
           settlement: {
-            outcome: row.settlement.outcome as
-              | "cancelled"
-              | "completed"
-              | "expired"
-              | "rejected",
+            outcome: row.settlement.outcome as CommandSettlementOutcome,
             ...(row.settlement.reason ? { reason: row.settlement.reason } : {}),
+          },
+        }
+      : {}),
+    ...(row.deferred
+      ? {
+          deferred: {
+            boundary: row.deferred.boundary,
+            ...(row.deferred.resolvedAt ? { resolvedAt: row.deferred.resolvedAt } : {}),
           },
         }
       : {}),
@@ -539,8 +543,17 @@ function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id)
 }
 
 function mapCommandResult(body: HubJson<"/v1/instances/{id}/commands", "post">, instanceId: Id): CommandResult {
-  return { command: mapCommand(body.command, instanceId), relatedCommandIds: [] };
+  return {
+    command: mapCommand(body.command, instanceId),
+    relatedCommandIds: [],
+    ...(typeof body.generation === "number" ? { generation: body.generation } : {}),
+  };
 }
+
+/** cb-command-queue: one of the caller's own undelivered commands. */
+export type QueuedCommand = components["schemas"]["CommandRecord"];
+/** cb-command-queue: an instance's runtime config and its generation. */
+export type InstanceConfig = components["schemas"]["InstanceConfig"];
 
 export type HelloResult = {
   protocol: { major: number; minor: number };
@@ -615,6 +628,11 @@ export type InstanceConfigurePatch = {
   permissionMode?: string;
   model?: string;
   effort?: EffortRef;
+  /**
+   * cb-command-queue: the runtime-config generation this write is based on;
+   * a stale one answers 409 CONFIG_GENERATION_CONFLICT instead of overwriting.
+   */
+  expectedGeneration?: number;
 };
 
 export type WorktreeRecord = {
@@ -798,6 +816,14 @@ export type HubApi = {
    */
   instanceSeen(instanceId: Id, durableSeq: U64, visible?: boolean): Promise<SeenView>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
+  /** cb-command-queue: `GET /v1/commands?mine=1&state=queued&instanceId=`. */
+  queuedCommands(instanceId: Id): Promise<QueuedCommand[]>;
+  /** cb-command-queue: `PATCH /v1/commands/{id}` (text, under a revision CAS). */
+  editQueuedCommand(commandId: Id, expectedRevision: number, text: string): Promise<QueuedCommand>;
+  /** cb-command-queue: `POST /v1/commands/{id}/withdraw`. */
+  withdrawQueuedCommand(commandId: Id): Promise<QueuedCommand>;
+  /** cb-command-queue: `GET /v1/instances/{id}/config`. */
+  instanceConfig(instanceId: Id): Promise<InstanceConfig>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
   interactionRespond(interactionId: Id, answer: InteractionAnswer): Promise<CommandResult>;
@@ -1366,6 +1392,27 @@ function createMockApi(): HubApi {
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
+    },
+    async queuedCommands() {
+      // The demo has no Hub queue: nothing is ever held undelivered.
+      return [];
+    },
+    async editQueuedCommand(commandId) {
+      throw new HubHttpError(404, "NOT_FOUND", `command ${commandId} not found`);
+    },
+    async withdrawQueuedCommand(commandId) {
+      throw new HubHttpError(404, "NOT_FOUND", `command ${commandId} not found`);
+    },
+    async instanceConfig(instanceId) {
+      return {
+        instanceId: instanceId as string,
+        generation: 0,
+        model: null,
+        effort: null,
+        permissionMode: null,
+        effective: {},
+        pending: [],
+      };
     },
     async interactionList(q) {
       return mockDb.interactions.filter((i) => {
@@ -1997,7 +2044,32 @@ function createLiveApi(): HubApi {
         permissionMode: extras?.permissionMode ?? permissionMode,
         ...(extras?.model ? { model: extras.model } : {}),
         ...(extras?.effort ? { effort: extras.effort } : {}),
+        ...(typeof extras?.expectedGeneration === "number"
+          ? { expectedGeneration: extras.expectedGeneration }
+          : {}),
       });
+    },
+    async queuedCommands(instanceId) {
+      const qs = new URLSearchParams({ mine: "1", state: "queued", instanceId });
+      const body = await rest<HubJson<"/v1/commands", "get">>(`/v1/commands?${qs}`);
+      return body.commands ?? [];
+    },
+    async editQueuedCommand(commandId, expectedRevision, text) {
+      const body = await rest<HubJson<"/v1/commands/{id}", "patch">>(
+        `/v1/commands/${encodeURIComponent(commandId)}`,
+        { method: "PATCH", body: JSON.stringify({ expectedRevision, text }) },
+      );
+      return body.command;
+    },
+    async withdrawQueuedCommand(commandId) {
+      const body = await rest<HubJson<"/v1/commands/{id}/withdraw", "post">>(
+        `/v1/commands/${encodeURIComponent(commandId)}/withdraw`,
+        { method: "POST", body: "{}" },
+      );
+      return body.command;
+    },
+    async instanceConfig(instanceId) {
+      return rest<InstanceConfig>(`/v1/instances/${encodeURIComponent(instanceId)}/config`);
     },
     async interactionList(q) {
       const qs = new URLSearchParams();

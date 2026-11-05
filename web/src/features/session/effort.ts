@@ -730,3 +730,12 @@ export const ULTRACODE_SWITCH_LABEL = "Ultracode";
 export const ULTRACODE_SWITCH_DESC = "每个任务编排 dynamic workflow · 仅本会话";
 export const ULTRACODE_SWITCH_SPACE = "Ultracode 开关在档位下方独立存在，不移动滑杆";
 export const ULTRACODE_COUPLED_DESC = "开启后以 xhigh 运行（Claude Code 2.1.203–2.1.283）";
+
+/**
+ * cb-command-queue: the label for a configure the Hub deferred to a boundary
+ * (`deferred.boundary` on its answer): the next idle moment of this session,
+ * or its next launch.
+ */
+export function deferredLabel(boundary: "next-turn" | "next-chapter"): string {
+  return boundary === "next-turn" ? "下一回合生效" : "下一章节生效";
+}

@@ -1155,7 +1155,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
   - `resume_on_reset` and its per-instance `resume_trackers` [`cb-usage-resume`].
   - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
 - Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
-- Hub columns: commands `revision`, `original_payload_json`, `queued_by_device_id` (Hub-only), `withdrawn_by_json`, `config_prior_json`, `config_deferred` [`cb-command-queue`].
+- Hub columns: commands `revision`, `original_payload_json`, `queued_by_device_id` (Hub-only), `withdrawn_by_json`, `config_prior_json`, `config_deferred`, `config_deferred_resolved_at` [`cb-command-queue`].
 - Task and dispatch documents gain `requestedBy` inside the existing `doc_json`, with a serde default and no migration: a reference only, `{commandId}` for an owner-origin root turn and `{origin}` for any other [`cb-requested-by`]. The same record rides the approval card the request opened. The owner's words are never stored outside the Hub's command row: a Human read of the approval card source, the board and a task detail is hydrated with a read-time `excerpt` (one line, at most 280 chars, secret-scrubbed) from that row, and every Agent or Bot read, on any route, gets the reference alone. It is never a gate.
 - Project policy gains an optional `stallToolThresholdMins` (unset by default: no stall fact while a tool call is in flight) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
 - On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].

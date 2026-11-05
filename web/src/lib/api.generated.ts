@@ -2530,6 +2530,8 @@ export interface components {
         };
         CommandResult: {
             command: components["schemas"]["CommandRecord"];
+            /** @description cb-command-queue: for instance.configure, the runtime-config generation (configureSeq) its merge produced */
+            generation?: number;
             replayed?: boolean;
         };
         CommandWithdraw: {

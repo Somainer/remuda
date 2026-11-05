@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { MAIN_ENV, MAIN_SPECS } from "./e2e-hub-main.mjs";
+import { FAKE_NODE_SPECS, MAIN_ENV, MAIN_SPECS, MAIN_UI_SPECS } from "./e2e-hub-main.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -15,7 +15,17 @@ describe("test:e2e:hub:main (the gate's web-hub-e2e-main pass)", () => {
       .filter((name) => /process\.env\.HUB_E2E_MAIN_UI !== "1"/.test(readFileSync(join(dir, name), "utf8")))
       .map((name) => `tests/e2e/${name}`)
       .sort();
-    expect([...MAIN_SPECS].sort()).toEqual(gated);
+    expect([...MAIN_UI_SPECS].sort()).toEqual(gated);
+  });
+
+  it("also runs the listed fake-Node opt-ins, each gated on HUB_E2E_FAKE_NODE", () => {
+    expect(FAKE_NODE_SPECS).toContain("tests/e2e/cmd-queue.hub.spec.ts");
+    for (const spec of FAKE_NODE_SPECS) {
+      expect(readFileSync(join(root, spec), "utf8"), spec).toMatch(
+        /process\.env\.HUB_E2E_FAKE_NODE !== "1"/,
+      );
+    }
+    expect(MAIN_SPECS).toEqual([...MAIN_UI_SPECS, ...FAKE_NODE_SPECS]);
   });
 
   it("sets every flag those specs skip without", () => {

@@ -18,8 +18,10 @@ import { login } from "./hub-auth";
  * 3. a configure based on a stale runtime-config generation is a 409: the
  *    page reloads the current values and says so.
  *
- * The sentinels exist only in the fake Node, so the file self-skips unless
- * the gate runs it with HUB_E2E_FAKE_NODE=1 (as effort-sync does).
+ * The sentinels exist only in the fake Node, so the file self-skips without
+ * HUB_E2E_FAKE_NODE=1. The gate's `web-hub-e2e-main` step sets it: this spec
+ * is in FAKE_NODE_SPECS of web/scripts/e2e-hub-main.mjs
+ * (`pnpm run test:e2e:hub:main`); the main `test:e2e:hub` pass skips it.
  */
 
 test.describe.configure({ mode: "serial" });

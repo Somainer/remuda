@@ -8,7 +8,10 @@
  *  - HUB_E2E_MAIN_UI=1 lets them seat Main;
  *  - REMUDA_DELEGATED_DECISIONS=1 and HUB_E2E_LINEAGE_FENCE=1 are for
  *    routed-to: the D-051 switch, and the fake Node that dispatches for an
- *    Agent.
+ *    Agent;
+ *  - HUB_E2E_FAKE_NODE=1 is for the fake-Node opt-ins listed in
+ *    FAKE_NODE_SPECS (their sentinels exist only in the in-process fake
+ *    Node). Other specs gated on it are not in this pass yet.
  * The env is set here rather than in package.json so the command is the same
  * on every platform. Extra arguments go to Playwright.
  */
@@ -18,7 +21,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Every hub spec gated on HUB_E2E_MAIN_UI (a unit test keeps this list complete). */
-export const MAIN_SPECS = [
+export const MAIN_UI_SPECS = [
   "tests/e2e/home-extras.hub.spec.ts",
   "tests/e2e/main-ui.hub.spec.ts",
   "tests/e2e/owner-notify.hub.spec.ts",
@@ -26,10 +29,16 @@ export const MAIN_SPECS = [
   "tests/e2e/seat-profile.hub.spec.ts",
 ];
 
+/** Hub specs gated on HUB_E2E_FAKE_NODE that this pass runs. */
+export const FAKE_NODE_SPECS = ["tests/e2e/cmd-queue.hub.spec.ts"];
+
+export const MAIN_SPECS = [...MAIN_UI_SPECS, ...FAKE_NODE_SPECS];
+
 export const MAIN_ENV = {
   HUB_E2E_MAIN_UI: "1",
   REMUDA_DELEGATED_DECISIONS: "1",
   HUB_E2E_LINEAGE_FENCE: "1",
+  HUB_E2E_FAKE_NODE: "1",
 };
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

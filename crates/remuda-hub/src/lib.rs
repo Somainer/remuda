@@ -334,6 +334,12 @@ pub mod push_test_support {
     pub fn arm_end_evidence_read_failure(instance_id: &str) {
         crate::alerts::test_seams::arm_end_evidence_read_failure(instance_id);
     }
+
+    /// While `fail` holds, every `routedTo` read (the interaction page, the
+    /// push badge) that asks about `interaction_id` fails.
+    pub fn set_routed_read_failure(interaction_id: &str, fail: bool) {
+        crate::push_route::test_seams::set_routed_read_failure(interaction_id, fail);
+    }
 }
 
 /// Test-only seams of the inbox (`cb-inbox-facts` r2): inject a failing

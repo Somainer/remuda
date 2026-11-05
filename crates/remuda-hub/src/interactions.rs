@@ -600,6 +600,9 @@ pub async fn list_interactions(
     if agent_origin {
         items = delegated_visible_items(&state, &device, items).await?;
     }
+    // D-061 `routedTo`: who each item waits on, read from the push decision
+    // (D-057 §8.1), never a second routing predicate.
+    crate::push_route::stamp_routed_to(&state, &mut items).await;
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 

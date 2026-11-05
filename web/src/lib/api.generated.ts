@@ -2957,10 +2957,14 @@ export interface components {
             };
             commandId?: string;
         };
+        /** @description One merged interaction: the protocol Interaction entity flattened beside its list wrapper, plus Hub-stamped fields. */
+        InteractionListItem: {
+            routedTo?: components["schemas"]["RoutedTo"];
+        } & {
+            [key: string]: unknown;
+        };
         InteractionPage: {
-            items: {
-                [key: string]: unknown;
-            }[];
+            items: components["schemas"]["InteractionListItem"][];
             nextCursor?: string | null;
         };
         JournalPage: {
@@ -3869,6 +3873,11 @@ export interface components {
              */
             origin: "human" | "bot" | "agent" | "hub";
         };
+        /**
+         * @description D-061: who a pending interaction waits on, read from the push decision (D-057 §8.1). `main`: routed to the running address-owner lineage; `agent`: routed to another running Agent parent; `owner` in every other case (approval kind, no suppression, a lifted suppression, a Human parent, a store error). A client reads a missing or unknown value as `owner`.
+         * @enum {string}
+         */
+        RoutedTo: "owner" | "main" | "agent";
         SeenRequest: {
             /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */
             durableSeq: string | number;

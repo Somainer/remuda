@@ -1842,3 +1842,132 @@ async fn a_fallback_page_honours_the_routing_and_the_lift_pages_once() -> Result
     );
     Ok(())
 }
+
+// ─── D-061 `routedTo` and the owner badge ──────────────────────────────────
+
+impl Ctx {
+    /// `routedTo` of `interaction` on the owner's `GET /v1/interactions`.
+    async fn routed_to(&self, interaction: &str) -> Result<String> {
+        let page = self.get("/v1/interactions").await?;
+        let item = page["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["interactionId"] == interaction || item["id"] == interaction)
+            .with_context(|| format!("{interaction} on the page: {page}"))?;
+        Ok(item["routedTo"]
+            .as_str()
+            .with_context(|| format!("routedTo on {item}"))?
+            .to_owned())
+    }
+
+    /// The badge of the newest push tagged `interaction:<id>`.
+    async fn badge_of(&self, interaction: &str, count: usize) -> Result<Value> {
+        let pushes = self
+            .wait_pushes(&self.phone, &format!("interaction:{interaction}"), count)
+            .await?;
+        Ok(pushes[count - 1]["badge"].clone())
+    }
+}
+
+/// `routedTo` is the push decision, read back: approval → owner; a question
+/// or plan review routed to a running Main → main; the D-051 switch off →
+/// owner; a Human parent → owner; a non-Main Agent parent → agent; Main not
+/// effectively running at fire time → owner; Main paused after the
+/// suppression → owner from the lift on, and still owner once Main runs
+/// again (no re-suppression), while a new question is routed again; a store
+/// error → owner. Every push's badge is the owner-routed pending count (B is
+/// empty here: no tasks), and the lift push's badge already counts the items
+/// it lifts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let main = seat(&ctx).await?;
+    // A native session to continue, so Main can be resumed below.
+    ctx.node_p().append(&main, session("idle"))?;
+    ctx.wait_activity(&main, "idle").await?;
+    let worker = ctx.child(Some(&main)).await?;
+    let human_child = ctx.child(None).await?;
+    let coordinator = ctx.parent(true).await?;
+    let coordinated = ctx.child(Some(&coordinator)).await?;
+
+    ctx.raise(&worker, "int_rt_approval", "approval")?;
+    assert_eq!(ctx.decision("int_rt_approval").await?, "paged");
+    // Only the approval waits on the owner.
+    assert_eq!(ctx.badge_of("int_rt_approval", 1).await?, 1);
+    assert_eq!(ctx.routed_to("int_rt_approval").await?, "owner");
+
+    suppressed_question(&ctx, &worker, "int_rt_question").await?;
+    ctx.raise(&worker, "int_rt_plan", "plan-review")?;
+    assert_eq!(ctx.decision("int_rt_plan").await?, "suppressed");
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+    assert_eq!(ctx.routed_to("int_rt_plan").await?, "main");
+
+    suppressed_question(&ctx, &coordinated, "int_rt_agent").await?;
+    assert_eq!(ctx.routed_to("int_rt_agent").await?, "agent");
+
+    ctx.raise(&human_child, "int_rt_human", "question")?;
+    assert_eq!(ctx.decision("int_rt_human").await?, "paged");
+    assert_eq!(ctx.routed_to("int_rt_human").await?, "owner");
+    // approval + human: the three routed items do not count.
+    assert_eq!(ctx.badge_of("int_rt_human", 1).await?, 2);
+
+    set_d051(false);
+    ctx.raise(&worker, "int_rt_off", "question")?;
+    assert_eq!(ctx.decision("int_rt_off").await?, "paged");
+    set_d051(true);
+    assert_eq!(ctx.routed_to("int_rt_off").await?, "owner");
+    assert_eq!(ctx.badge_of("int_rt_off", 1).await?, 3);
+
+    // A store error reads owner, for the page and for the badge.
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", true);
+    let page = ctx.get("/v1/interactions").await?;
+    for item in page["items"].as_array().context("items")? {
+        assert_eq!(item["routedTo"], "owner", "{item}");
+    }
+    ctx.raise(&human_child, "int_rt_fault", "question")?;
+    assert_eq!(ctx.decision("int_rt_fault").await?, "paged");
+    // approval, human, off, fault + the three routed items it could not read.
+    assert_eq!(ctx.badge_of("int_rt_fault", 1).await?, 7);
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", false);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+
+    // Pause Main: the lift pages both of Main's items, and that push's badge
+    // already counts them (approval, human, off, fault + question, plan).
+    ctx.close(&main).await?;
+    ctx.wait_lineage(&main, "paused").await?;
+    assert_eq!(ctx.wait_lifted("int_rt_question").await?, "fence");
+    assert_eq!(ctx.badge_of("int_rt_question", 1).await?, 6);
+    assert_eq!(ctx.badge_of("int_rt_plan", 1).await?, 6);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "owner");
+    assert_eq!(ctx.routed_to("int_rt_plan").await?, "owner");
+    // Another parent's routing is untouched.
+    assert_eq!(ctx.routed_to("int_rt_agent").await?, "agent");
+
+    // Main not effectively running at fire time: the question pages.
+    ctx.raise(&worker, "int_rt_paused", "question")?;
+    assert_eq!(ctx.decision("int_rt_paused").await?, "paged");
+    assert_eq!(ctx.routed_to("int_rt_paused").await?, "owner");
+
+    // Main runs again: the lifted items stay the owner's; a new question is
+    // evaluated normally and routed.
+    let resumed = ctx
+        .post(&format!("/v1/instances/{main}/resume"), json!({}))
+        .await?;
+    let successor = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    ctx.report_running(ctx.node_p(), &successor).await?;
+    ctx.wait_lineage(&main, "running").await?;
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "owner");
+    assert_eq!(ctx.routed_to("int_rt_paused").await?, "owner");
+    suppressed_question(&ctx, &worker, "int_rt_again").await?;
+    assert_eq!(ctx.routed_to("int_rt_again").await?, "main");
+    ctx.raise(&human_child, "int_rt_last", "question")?;
+    assert_eq!(ctx.decision("int_rt_last").await?, "paged");
+    // approval, human, off, fault, question, plan, paused, last.
+    assert_eq!(ctx.badge_of("int_rt_last", 1).await?, 8);
+    Ok(())
+}

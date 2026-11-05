@@ -348,6 +348,121 @@ pub(crate) fn route_interaction(
     Ok(Route::Suppressed)
 }
 
+// ─── who an interaction waits on (`routedTo`) ───────────────────────────────
+
+/// Who a pending interaction waits on (D-061 `routedTo`). One source of
+/// truth, the push decision: an item is routed exactly while its owner push
+/// is withheld.
+pub(crate) use remuda_protocol::RoutedTo;
+
+/// The interactions among `ids` that are routed away from the owner: each
+/// still pending with an unlifted §8.1 suppression row, mapped to whether
+/// that row's lineage is Main's (its current chapter holds `address-owner`).
+/// Every id it does not name is [`RoutedTo::Owner`].
+///
+/// A lift marks the row in the same writer job that makes the parent stop
+/// running, so the answer turns `owner` at the moment the lift's push is
+/// queued, and stays `owner` (§8.3: no re-suppression).
+pub(crate) fn routed_away(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, RoutedTo>, StoreError> {
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::routed_read_fails(ids) {
+        return Err(StoreError::FaultInjected("routed-to read".to_owned()));
+    }
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() || !any_active(conn) {
+        return Ok(out);
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.interaction_id, s.lineage_id FROM push_suppressions s
+               JOIN interactions i ON i.id = s.interaction_id AND i.state = 'pending'
+              WHERE s.lifted_at IS NULL AND s.rule = ?1",
+        )?;
+        stmt.query_map(params![RULE_ROUTED_TO_RUNNING_PARENT], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut main_lineage = std::collections::HashMap::<String, bool>::new();
+    for (interaction_id, lineage_id) in rows {
+        if !wanted.contains(interaction_id.as_str()) {
+            continue;
+        }
+        let main = match main_lineage.get(&lineage_id) {
+            Some(main) => *main,
+            None => {
+                let chapter: Option<String> = conn
+                    .query_row(
+                        "SELECT current_instance_id FROM lineages WHERE lineage_id = ?1",
+                        params![lineage_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let main = match chapter {
+                    Some(chapter) => holds_address_owner(conn, &chapter)?,
+                    None => false,
+                };
+                main_lineage.insert(lineage_id, main);
+                main
+            }
+        };
+        out.insert(
+            interaction_id,
+            if main {
+                RoutedTo::Main
+            } else {
+                RoutedTo::Agent
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The interaction id of one `GET /v1/interactions` item.
+fn item_interaction_id(item: &Value) -> Option<&str> {
+    item.get("interactionId")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Stamp `routedTo` on every item of an interaction page (D-061). A store
+/// error stamps `owner` everywhere: a hidden item could cost the owner the
+/// question, an extra card costs one look. Logged by category only.
+pub(crate) async fn stamp_routed_to(state: &AppState, items: &mut [Value]) {
+    let ids: Vec<String> = items
+        .iter()
+        .filter_map(item_interaction_id)
+        .map(str::to_owned)
+        .collect();
+    let routed = match state
+        .store
+        .read("interaction_routed_to", move |conn| routed_away(conn, &ids))
+        .await
+    {
+        Ok(routed) => routed,
+        Err(_) => {
+            tracing::warn!(
+                category = "routed-to",
+                "could not read the push routing; every item reads owner"
+            );
+            Default::default()
+        }
+    };
+    for item in items.iter_mut() {
+        let to = item_interaction_id(item)
+            .and_then(|id| routed.get(id).copied())
+            .unwrap_or(RoutedTo::Owner);
+        if let Some(object) = item.as_object_mut() {
+            object.insert("routedTo".into(), Value::from(to.as_str()));
+        }
+    }
+}
+
 // ─── the one transition function ────────────────────────────────────────────
 
 /// Every cause of "effectively running" turning false (§8.3). Each names its
@@ -1057,6 +1172,35 @@ pub(crate) async fn log_push(state: &AppState, entry: LogEntry) {
         .is_err()
     {
         tracing::warn!(category, "could not record a push log row");
+    }
+}
+
+/// Test seam: fail every `routedTo` read that asks about an armed
+/// interaction, until it is disarmed (keyed by id, so parallel tests cannot
+/// cross).
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_seams {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static ROUTED_READ_FAILURES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+    pub(crate) fn set_routed_read_failure(interaction_id: &str, fail: bool) {
+        let mut armed = ROUTED_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if fail {
+            armed.insert(interaction_id.to_owned());
+        } else {
+            armed.remove(interaction_id);
+        }
+    }
+
+    pub(super) fn routed_read_fails(ids: &[String]) -> bool {
+        let armed = ROUTED_READ_FAILURES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ids.iter().any(|id| armed.contains(id))
     }
 }
 

@@ -274,6 +274,46 @@ wire_enum!(DeliveryState, "2.6", {
     Unknown => "unknown",
 });
 
+/// Who a pending interaction waits on, as the Hub stamps it on every
+/// `GET /v1/interactions` item (D-061 `routedTo`, home.md §5.1). `main` and
+/// `agent` mean the owner push was withheld because the item was routed to a
+/// running Agent parent (D-057 §8.1): Main's lineage, or another one. A
+/// client reads a missing or unknown value as `owner`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+pub enum RoutedTo {
+    /// Wire value `owner`: waiting on the owner (the default).
+    #[serde(rename = "owner")]
+    Owner,
+    /// Wire value `main`: routed to the running `address-owner` lineage.
+    #[serde(rename = "main")]
+    Main,
+    /// Wire value `agent`: routed to another running Agent parent.
+    #[serde(rename = "agent")]
+    Agent,
+}
+
+impl RoutedTo {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Main => "main",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 wire_enum!(InteractionResolutionReason, "2.6", {
     Answered => "answered",
     NativeCleared => "native-cleared",

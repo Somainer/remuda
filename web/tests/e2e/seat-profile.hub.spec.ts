@@ -169,9 +169,10 @@ test.describe("desktop seat profile", () => {
     const body = (await view.json()) as { pending: boolean; liveChapter: { appliedRevision: number | null } };
     expect(body.pending).toBe(false);
     expect(body.liveChapter.appliedRevision).toBe(2);
-    // The successor launched with the profile's first candidate.
+    // The successor launched with revision 2's first candidate (the refused
+    // save never changed the list).
     const row = await page.request.get(`/v1/instances/${secondId}`);
-    expect(((await row.json()) as { model?: string }).model).toBe("e2e/model-b");
+    expect(((await row.json()) as { model?: string }).model).toBe("e2e/model-a");
   });
 });
 

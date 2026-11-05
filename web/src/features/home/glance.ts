@@ -2,7 +2,12 @@ import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Task } from "../../types/generated";
 import { resolveMain } from "../../lib/store";
-import { deriveInboxQueue, type InboxQueueItem } from "../mobile/inboxRows";
+import {
+  deriveActiveInteractions,
+  deriveInboxQueue,
+  routedAway,
+  type InboxQueueItem,
+} from "../mobile/inboxRows";
 import { liveChildParents, rank } from "../mobile/homeRows";
 
 /**
@@ -77,6 +82,33 @@ export function glanceCounts(source: GlanceSource): GlanceCounts {
     else if (homeRank === "done-unseen" && showsDoneUnseen(instance, source.instances)) doneUnseen += 1;
   }
   return { needYou: queue.length + blockedTasks, doneUnseen, working };
+}
+
+/**
+ * home.md §10 / D-061: the worker questions Main is handling — live items the
+ * Hub routed to Main (`routedTo = main`), the ones that left 「需要你」. `null`
+ * until the first interaction page arrived: an unknown count is never shown,
+ * and neither is a known zero.
+ */
+export function routedToMainCount(
+  source: Pick<GlanceSource, "interactions" | "instances" | "hosts" | "answering" | "deviceId" | "nowMs"> & {
+    hydrated: boolean;
+  },
+): number | null {
+  if (!source.hydrated) return null;
+  return deriveActiveInteractions({
+    interactions: [...source.interactions],
+    instances: [...source.instances],
+    hosts: [...source.hosts],
+    answering: source.answering,
+    deviceId: source.deviceId,
+    nowMs: source.nowMs,
+  }).filter((member) => routedAway(member.item) === "main").length;
+}
+
+/** The Main card line for {@link routedToMainCount}. */
+export function routedToMainLine(count: number): string {
+  return `正在处理 ${formatGlanceCount(count)} 个 worker 提问`;
 }
 
 /**

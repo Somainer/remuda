@@ -6,7 +6,7 @@
 
 **v0.2.5 changelog（2026-10-30，首页分诊优先，见 D-061 与 [home.md](./home.md)）**：首页（`/m` 与 `/sessions`）以全页唯一的「需要你」队列为主体，Main 改为一张卡加一条「问 Main」输入条，PhoneNav 仍为 4 槽，h1 仍为「会话」；机械细节以 home.md 为准。本次修订的位置：§1.2（`/sessions?focus=` 推送落点）；§1.4（`/sessions` 上的 SpacesPanel 默认折叠在「空间 ▸」开关后面）；§2.1（首页带；Main 卡取代 Main 置顶行；新增完成未看点 ◉；投影字段 `unread?` 改为按 owner 的 `unseen?`；裸按键移到终端页）；§2.5（首页上的简单单选题例外）；§3.1（seen 按 owner 存于 Hub）；§3.3（没有真实来源的计数隐藏）；§4.5（更正角标现状；角标数等于首页「需要你」数）；§4.7（`/m` 结构、底部停靠带与桌面断点）；§6（◉ 不用绿色）。
 
-**v0.2.4 changelog（2026-09-25，c-ghostbadge 角标一致性）**：收件箱角标（compact 底栏、桌面侧栏、OS Badging API）与 `/m/inbox`、`/approvals` 的「待你处理」队列是同一个派生结果（`deriveInboxQueue`），不再有第二处 `state==="pending"` 计数——一张 durable 仍是 `pending` 但已知 deadline 已过（投影为 expired）的卡在角标与列表里同时消失。deadline 跨越由共享的客户端时钟在到期瞬间驱动重算：store 无变化（如主机离线）时，角标、列表与 OS 角标也在同一刻翻牌，无需刷新或下一次轮询。桌面 `/approvals` 的队列档与 compact 同源；「已离队」档仍只在桌面。状态机本身不变（下表 pending=「`status=pending` 且未过期」）。
+**v0.2.4 changelog（2026-09-25，c-ghostbadge 角标一致性）**：收件箱角标（compact 底栏、桌面侧栏、OS Badging API）与 `/m/inbox`、`/approvals` 的「待你处理」队列是同一个派生结果（`deriveInboxQueue`），不再有第二处 `state==="pending"` 计数——一张 durable 仍是 `pending` 但已知 deadline 已过（投影为 expired）的卡在角标与列表里同时消失。deadline 跨越由共享的客户端时钟在到期瞬间驱动重算：store 无变化（如主机离线）时，角标、列表与 OS 角标也在同一刻翻牌，无需刷新或下一次轮询。桌面 `/approvals` 的队列档与 compact 同源；「已离队」档仍只在桌面。（`routed-to` 修订，D-061：桌面 `/approvals` 的队列档还保留转给 Main 或其他 agent 的项，卡上标「已转给 Main」；头部「待处理 N」只数在等 owner 的项，与侧栏收件箱计数同一个派生，转走的项另写「· 已转给 Main N」。compact 的「待你处理」档不列转走的项。）状态机本身不变（下表 pending=「`status=pending` 且未过期」）。
 
 **v0.2.3 changelog（2026-09-20，task 优先模型，见 D-050）**：新增 §1.5「Task 层」（Task 是 instance 之上的聚合而非第二状态机；看板列只读投影；目录绑定 reuse\|pool 与 attach-lock；任务空间=文件视图过滤投影；批注=composer 草稿；工作台多 session 用 tab 不分屏；/m 任务分组）与 §2.9「任务列表与看板 `/board`」（三列+已归档过滤、failed 角标按 placement 归位、拖卡多跳、`SE-nn` 派生 key、父子嵌套、「需要你」首组、只读预览、任务/项目空间面板、批注徽标、项目切换器）；§1.1 projects 行与「项目」段改为采纳 Hub `Project` 实体（Space 键不放松，D-024）；§1.2 路由表新增 `/board`；§1.3 映射表补看板 compact 落点；§4.7 `/m` 子树补任务分组与看板单列过滤。机械细节（表结构、RPC/路由形状、迁移预算、grant 门控）以 [task-model.md](./task-model.md) 为准。
 
@@ -1084,7 +1084,7 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 **角标数 = 首页「需要你」数（D-061）。** 它等于两部分之和：真正在等 owner 的交互，加上没有对应交互的 owner 阻塞任务。Main 的提问只算一次；完成未看、通知和回合失败都不计入（[home.md](./home.md) §5.1）。因此：
 - v0.2.4「OS 角标与收件箱队列同源」改为「OS 角标 = 首页 N」；
 - 导航上「收件箱」的数字仍是收件箱队列本身，两者的差恰好是「任务待你」卡的张数；
-- Hub 的 `with_badge` 计数由 `home-queue`（加入任务）和 `routed-to`（只计 `routedTo=owner`）对齐到同一口径。
+- Hub 的 `with_badge` 计数由 `home-queue`（加入任务）和 `routed-to`（只计 `routedTo=owner`）对齐到同一口径；转给 Main 的提问不计入角标，lift 推送的角标已经把被 lift 的项算进去（[home.md](./home.md) §5.1）。
 
 **权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
 

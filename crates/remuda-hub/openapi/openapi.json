@@ -2347,12 +2347,30 @@
         ],
         "type": "object"
       },
+      "RoutedTo": {
+        "description": "D-061: who a pending interaction waits on, read from the push decision (D-057 §8.1). `main`: routed to the running address-owner lineage; `agent`: routed to another running Agent parent; `owner` in every other case (approval kind, no suppression, a lifted suppression, a Human parent, a store error). A client reads a missing or unknown value as `owner`.",
+        "enum": [
+          "owner",
+          "main",
+          "agent"
+        ],
+        "type": "string"
+      },
+      "InteractionListItem": {
+        "additionalProperties": true,
+        "description": "One merged interaction: the protocol Interaction entity flattened beside its list wrapper, plus Hub-stamped fields.",
+        "properties": {
+          "routedTo": {
+            "$ref": "#/components/schemas/RoutedTo"
+          }
+        },
+        "type": "object"
+      },
       "InteractionPage": {
         "properties": {
           "items": {
             "items": {
-              "additionalProperties": true,
-              "type": "object"
+              "$ref": "#/components/schemas/InteractionListItem"
             },
             "type": "array"
           },

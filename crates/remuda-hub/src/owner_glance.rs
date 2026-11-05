@@ -242,6 +242,15 @@ fn merged_item_pending(item: &Value, now_unix: i64) -> Option<PendingInteraction
     if item.get("state").and_then(Value::as_str) != Some("pending") {
         return None;
     }
+    // D-061 routed-to: an item routed to Main or another Agent parent is not
+    // waiting on the owner (its owner push was withheld), so it is neither
+    // counted in 需要你 nor a waiting row. Missing or unknown reads owner.
+    if matches!(
+        item.get("routedTo").and_then(Value::as_str),
+        Some("main" | "agent")
+    ) {
+        return None;
+    }
     let interaction_id = item
         .get("interactionId")
         .or_else(|| item.get("id"))
@@ -309,7 +318,10 @@ pub(crate) async fn collect_owner_glance(
     // says the ① count, the ④ header and the OS badge are one definition, and
     // those two are derived over every interaction the owner can see. Only the
     // glance's ROWS are narrowed to the owner scope below.
-    let merged = crate::interactions::merged_interactions(state, device, None, None, None).await?;
+    let mut merged =
+        crate::interactions::merged_interactions(state, device, None, None, None).await?;
+    // The same routedTo the page serves (one source: the push decision).
+    crate::push_route::stamp_routed_to(state, &mut merged).await;
     let pending: Vec<PendingInteraction> = merged
         .iter()
         .filter_map(|item| merged_item_pending(item, now.unix_timestamp()))
@@ -1398,6 +1410,34 @@ mod tests {
         let (kind, question) = crate::digest::interaction_question(&pending.record);
         assert_eq!(kind, "approval");
         assert_eq!(question, "echo e2e");
+    }
+
+    /// D-061: an item routed to Main or another agent is not the owner's, so
+    /// it is neither counted nor a waiting row; a missing or unknown routedTo
+    /// is the owner's.
+    #[test]
+    fn a_routed_item_is_not_the_owners() {
+        let card = |routed: Option<&str>| {
+            let mut card = json!({
+                "id": "int_q", "interactionId": "int_q",
+                "instanceId": "ins_a", "hostId": "hst_1", "kind": "question",
+                "state": "pending", "blocking": true,
+                "request": { "kind": "question", "title": "Which?" },
+                "deadline": { "state": "unknown" },
+            });
+            if let Some(routed) = routed {
+                card["routedTo"] = json!(routed);
+            }
+            card
+        };
+        assert!(merged_item_pending(&card(Some("main")), NOW).is_none());
+        assert!(merged_item_pending(&card(Some("agent")), NOW).is_none());
+        for owner in [None, Some("owner"), Some("elsewhere")] {
+            assert!(
+                merged_item_pending(&card(owner), NOW).is_some(),
+                "{owner:?}"
+            );
+        }
     }
 
     /// §5.3: hand-opened is defined from the Hub-stamped creator — the row (or

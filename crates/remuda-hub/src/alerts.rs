@@ -554,8 +554,32 @@ async fn owner_badge(state: &AppState) -> u64 {
         .unwrap_or_default();
     let tasks = state.store.list_tasks(None).await.unwrap_or_default();
     let task_of_instance = state.store.instance_task_ids().await.unwrap_or_default();
+    // A is narrowed to `routedTo = owner` (D-061): an item whose owner push
+    // was withheld is not counted. A failed read counts it, as the page shows
+    // it then (`push_route::stamp_routed_to`).
+    let ids: Vec<String> = pending
+        .iter()
+        .map(|row| row.interaction_id.clone())
+        .collect();
+    let routed: HashSet<String> = match state
+        .store
+        .read("badge_routed_to", move |conn| {
+            crate::push_route::routed_away(conn, &ids)
+        })
+        .await
+    {
+        Ok(routed) => routed.into_keys().collect(),
+        Err(_) => {
+            tracing::warn!(
+                category = "routed-to",
+                "could not read the push routing; the badge counts every item"
+            );
+            HashSet::new()
+        }
+    };
     owner_queue_count(
         &pending,
+        &routed,
         &tasks,
         &task_of_instance,
         OffsetDateTime::now_utc(),
@@ -567,7 +591,9 @@ async fn owner_badge(state: &AppState) -> u64 {
 /// `web/src/features/home/glance.ts`).
 ///
 /// * A: pending interactions whose known deadline has not passed (a ghost card
-///   past its deadline is not shown, so it is not counted either).
+///   past its deadline is not shown, so it is not counted either) and that
+///   are not in `routed_away` — the items routed to Main or another Agent
+///   parent (`routedTo` is not `owner`, D-061), whose owner push was withheld.
 /// * B: unarchived tasks with a non-blank `blocked_reason` none of whose
 ///   sessions (`instances.task_id`) has an interaction counted in A — the
 ///   interaction card and the task card are never both shown (§4.6).
@@ -575,6 +601,7 @@ async fn owner_badge(state: &AppState) -> u64 {
 /// Done-unseen, notices and failed turns are not part of N.
 pub(crate) fn owner_queue_count(
     pending: &[InteractionRecord],
+    routed_away: &HashSet<String>,
     tasks: &[Task],
     task_of_instance: &HashMap<String, String>,
     now: OffsetDateTime,
@@ -582,6 +609,7 @@ pub(crate) fn owner_queue_count(
     let waiting: Vec<&InteractionRecord> = pending
         .iter()
         .filter(|row| row.state == "pending" && !deadline_passed(&row.payload, now))
+        .filter(|row| !routed_away.contains(&row.interaction_id))
         .collect();
     let covered: HashSet<&str> = waiting
         .iter()
@@ -774,7 +802,7 @@ mod tests {
         let tasks = vec![lone, covered, archived, blank, fine];
         // A = int_a + int_b; B = the lone blocked task only.
         assert_eq!(
-            owner_queue_count(&rows, &tasks, &task_of_instance, now()),
+            owner_queue_count(&rows, &HashSet::new(), &tasks, &task_of_instance, now()),
             3
         );
     }
@@ -790,13 +818,57 @@ mod tests {
             Some("2026-01-01T00:00:00.000Z"),
         )];
         assert_eq!(
-            owner_queue_count(&rows, &[blocked], &task_of_instance, now()),
+            owner_queue_count(&rows, &HashSet::new(), &[blocked], &task_of_instance, now()),
             1
         );
     }
 
     #[test]
+    fn the_badge_counts_only_what_is_routed_to_the_owner_plus_b() {
+        // D-061: A is narrowed to `routedTo = owner`. A routed item does not
+        // count, and it does not cover its task either: the task card shows
+        // (the queue drops the routed card), so the task is B.
+        let routed_task = task(Some("等 Main 回 worker"), false);
+        let mut task_of_instance = HashMap::new();
+        task_of_instance.insert(
+            "ins_routed".to_string(),
+            routed_task.meta.id.as_id().to_string(),
+        );
+        let rows = vec![
+            pending("int_owner", "ins_a", None),
+            pending("int_main", "ins_routed", None),
+            pending("int_agent", "ins_b", None),
+        ];
+        let routed: HashSet<String> = ["int_main", "int_agent"].map(String::from).into();
+        // A = int_owner; B = the task whose only interaction went to Main.
+        assert_eq!(
+            owner_queue_count(
+                &rows,
+                &routed,
+                std::slice::from_ref(&routed_task),
+                &task_of_instance,
+                now()
+            ),
+            2
+        );
+        // Lifted (nothing routed away any more): A = 3, the task is covered.
+        assert_eq!(
+            owner_queue_count(
+                &rows,
+                &HashSet::new(),
+                &[routed_task],
+                &task_of_instance,
+                now()
+            ),
+            3
+        );
+    }
+
+    #[test]
     fn nothing_waiting_clears_the_badge() {
-        assert_eq!(owner_queue_count(&[], &[], &HashMap::new(), now()), 0);
+        assert_eq!(
+            owner_queue_count(&[], &HashSet::new(), &[], &HashMap::new(), now()),
+            0
+        );
     }
 }

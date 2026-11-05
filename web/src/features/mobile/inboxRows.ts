@@ -274,16 +274,20 @@ function isActiveUiState(
 }
 
 /**
- * Project every interaction exactly once and return those the 待你处理 queue
- * shows (pending / answering / paused — the same projection ApprovalsPage
- * uses). Pure and join-based; no kind filter (the queue count is the
- * unfiltered 待你处理 total; callers rendering a filtered tier apply the kind
- * filter themselves).
- *
- * This is the ONE source of truth shared by the compact inbox rows and the
- * phone-nav badge count (c-ghostbadge).
+ * D-061 routed-to: who an interaction was routed to instead of the owner, or
+ * null when it waits on the owner. Only the Hub's `main` and `agent` route an
+ * item away; a missing or unknown value is the owner's.
  */
-export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
+export function routedAway(item: Pick<Interaction, "routedTo">): "main" | "agent" | null {
+  return item.routedTo === "main" || item.routedTo === "agent" ? item.routedTo : null;
+}
+
+/**
+ * Every live interaction (pending / answering / paused), whoever it waits
+ * on: the projection /approvals lists (routed items stay there, labelled) and
+ * the Main card counts. The 「需要你」 queue is {@link deriveInboxQueue}.
+ */
+export function deriveActiveInteractions(source: InboxQueueSource): InboxQueueItem[] {
   const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
   const hostById = new Map(source.hosts.map((host) => [host.id, host]));
   const nowMs = source.nowMs ?? Date.now();
@@ -302,6 +306,22 @@ export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
     queue.push({ item, instance, host, uiState });
   }
   return queue;
+}
+
+/**
+ * Project every interaction exactly once and return those the 待你处理 queue
+ * shows (pending / answering / paused — the same projection ApprovalsPage
+ * uses) that really wait on the owner: an item the Hub routed to Main or
+ * another Agent parent (`routedTo`, D-061) is not the owner's to answer, so
+ * it leaves the queue, N, the badge and the nav counts. Pure and join-based;
+ * no kind filter (the queue count is the unfiltered 待你处理 total; callers
+ * rendering a filtered tier apply the kind filter themselves).
+ *
+ * This is the ONE source of truth shared by the compact inbox rows and the
+ * phone-nav badge count (c-ghostbadge).
+ */
+export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
+  return deriveActiveInteractions(source).filter((member) => routedAway(member.item) === null);
 }
 
 function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: string; rowId: string }): number {

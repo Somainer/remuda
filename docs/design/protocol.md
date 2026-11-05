@@ -332,7 +332,7 @@ stateDiagram-v2
 | `dispatch` | `not-dispatched\|intent-durable\|transport-written\|native-acknowledged` | 不把写 pipe 成功称为原生接纳 |
 | `resolution` | `clear\|unknown\|reconciling` | 正交于 state；例如 queued + transport-written + unknown |
 | `acceptance` | `Knowledge<{scope: native-input\|native-control\|runtime-resource\|tty-bytes, eventIds: Id[]}>` | tty-bytes 只说明 PTY 接收字节，不代表 agent 理解或开始任务 |
-| `settlement` | `Knowledge<{outcome: completed\|rejected\|cancelled\|expired\|withheld, resultRef: Id\|null, error: RuntimeError\|null}>` | send 的 completed 与相应 Run 范围绑定；approve 的 completed 与 broker native resolution 绑定 |
+| `settlement` | `Knowledge<{outcome: completed\|rejected\|cancelled\|expired\|withheld\|withdrawn, resultRef: Id\|null, error: RuntimeError\|null}>` | send 的 completed 与相应 Run 范围绑定；approve 的 completed 与 broker native resolution 绑定。`withdrawn`（2026-11-05，cb-command-queue）：排队者在送达前撤回，另带 `withdrawnBy:{origin, instanceId?}`（§8.5） |
 | `queuedAt` / `acceptedAt` / `settledAt` / `expiresAt` | `Timestamp` / `Knowledge<Timestamp>` / `Knowledge<Timestamp>` / `Timestamp\|null` | expiresAt 只约束尚未派发的命令，不是自动杀任务的 deadline |
 | `nodeReceipt` | `Knowledge<{nodeEpoch: Id, ledgerRevision: U64}>` | Hub 持久排队与 Node 接收分开 |
 
@@ -350,6 +350,8 @@ stateDiagram-v2
 > **2026-09-25 注（D-055）：重放按操作分叉——send 可重放，configure 不可重放。** 同 commandId 重放 `instance.send` 用于恢复丢失响应：返回存储的原始结局，仍排队的行恰好转发一次。`instance.configure` 的 spec merge 只在首次 POST 发生一次：重放命中终态行时原样返回存储记录（包括首次 merge 失败时持久化的原始 500/body，绝不把它重放成 200）；原始结局尚未持久化（转发在飞，`queued`+`forwarded=1`）时 Hub 返回 409 指明 “still in flight”，客户端应轮询 `GET /v1/instances/{id}/commands/{commandId}`；离线排队（`queued`+`forwarded=0`）的 configure 重放同样被 409 拒绝，客户端必须换用新 commandId 发新命令，重放不代为转发。并发同 id 首次 POST 在 Hub 串行 writer 上分出唯一创建行，merge 严格一次。GET 单行命令在转发尝试进行中返回该尝试的终态行（尝试未开始时如实返回 pending），任何读都不先报 `forwardIntent` 再报其回滚。（2026-10-05 补，D-057）commandId 身份（同一 id 必须对应同一载荷）、同 id 重放时转发仍排队的行、Node 按 commandId+digest 去重，这三点适用于除 `instance.configure` 以外的每一种操作，不只 `instance.send`；被隔离（fenced）发起者的行结算为 `rejected(fenced)`。
 
 > **2026-10-05 注（D-057）：发起者隔离（fencing）的两条边界与结果类别。** 续接血缘换代或暂停时，Hub 在单一 SQLite writer 中执行带 generation CAS 的隔离事务 F。**F 是 Hub 受理边界**：F 提交后，旧 generation 发起的变更在 writer 中受理时一律被拒（`queue_command`、`mark_forward_intent`、gate 入队与认领、直连操作受理），包括 F 之前已通过认证的请求。写出帧之前还有一道**发送闸**：内存 fence 表显示发起者已被隔离时不写出，并结算为 withheld；发送闸只缩小窗口，不构成任何保证。**Node 执行边界是最终一致的**：fence 在某台 Node 收到并持久化它（`lineage.fence`，§7.2）时才在该 Node 生效；此前，F 前已受理的操作仍可能在该 Node 上执行（断网 Node 的本地队列、fence 在途的窗口、F 前已通过发送闸的帧）。生效时 Node 取消尚未交付的旧 generation 操作、拒绝之后到达的操作，并在确认中报告结果；无法确定某操作是否已到达执行者时（通常是 Node 或进程在持久意图与任何证据之间崩溃）报告 `unknown`。F 时尚未完成的每个旧 generation 操作都得到如实的结果类别：在 Hub 取消（cancelled at the Hub）、被发送闸拦下（withheld）、被 Node 取消（cancelled by the Node）、被 Node 拒绝（refused by the Node）、已执行（ran）、未知（unknown）。未知包括 host 尚未确认，也包括 host 确认了却无法确定：Node 报告 `unknown`、确认没有提到该操作、或 host 再也不回来时都保持未知，绝不推断为未执行。host 确认并不总能结算每个操作。机制、竞争与测试矩阵见 [main-agent.md §7](./main-agent.md#7-fencing)。
+
+> **2026-11-05 注（D-055 修订，cb-command-queue）：自己排队的命令可列出、编辑、撤回；configure 带 generation 与 `deferred`。** 命令行增加 `revision`（初值 0，每次编辑加一，编辑以 `expectedRevision` 做 CAS）与 `held: hub\|node`（只在列表里出现）。编辑与撤回只在命令可证明尚未到达 harness 时允许：Hub 行 `queued`+`forwarded=0`，或 Node 投递队列里的 PTY prompt（经 Node 做先到先得的 CAS）；其余 409 `already-delivered`。编辑保留 commandId，只改 `instance.send` 的文本与附件；已转发的命令在任何 id 下都不会因编辑而再次发出；排队的 configure 不可编辑，只能撤回后以新 commandId 重发。撤回的命令结算为 `settled`+`withdrawn` 并记录撤回者，永不转发。`instance.configure` 可带 `expectedGeneration`，与实例的运行时配置 generation（`configureSeq`）不等时 409，只能在回合边界生效时结果带 `deferred:{boundary}`。路由、判定与错误见 [§8.5](#85-自己排队的命令与运行时配置的-generationcb-command-queue2026-11-05)。
 
 派发顺序固定为：Hub durable inbox → Node durable command receipt → Node 写 `intent-durable` 并 fsync → 唯一 driver owner 发一次原生操作 → 记录 transport-written → 原生证据推进 accepted → 业务证据推进 settled。进程恰好在发出与落账之间崩溃时，intent 已存在即视为“可能发送”；恢复先查原生历史/请求状态，没有原生幂等保证则保持 unknown，**绝不因为找不到 ACK 而重发**。无法证明没执行时也不能标 rejected；超时查询返回 unknown 的现状。
 
@@ -1642,6 +1644,23 @@ Node 拒绝时错误文本带稳定前缀，Hub 据此映射：`herdr-claim-inva
 ← {"jsonrpc":"2.0","id":"h-31","result":{"instance":{"id":"ins_…","driver":"herdr-claimed","kind":"claude","herdrClaim":{"session":"work","socketPath":"…/sessions/work/herdr.sock","workspaceId":"w2","tabId":"w2:t19","paneId":"w2:p5K","agent":"claude","process":{"pid":4242,"command":"claude"}}}}}
 ~~~
 
+**2026-11-05 补（cb-command-queue）：Node 投递队列里的 prompt 的编辑与撤回。** 与 `lineage.fence` 同族的加性 Hub→Node 方法与字段，不属于上面 46 个目标方法。PTY 承载（`claude-pty`、`generic-pty`、`shell-pty`、`herdr-claimed`）在实例忙时把已接纳的 `instance.send` 留在 Node 的投递队列里；队列里的 prompt 还没有到达 harness，所以仍可编辑或撤回。Node 在每条 prompt 写向 driver 之前做一次投递声明（与 fence 的 dispatch claim 同一处，§7.4 发送闸之后），编辑与撤回和这次声明在同一把锁下先到先得：声明在先则答 `already-delivered`，撤回在先则这条 prompt 永不写出，Node 把它的命令结算为 `cancelled`（原因 `withdrawn`），队列里的用户消息改为 `interrupted`。规则见 [§8.5](#85-自己排队的命令与运行时配置的-generationcb-command-queue2026-11-05)。
+
+| 方法 / 字段 | 方向 | payload / result |
+| --- | --- | --- |
+| `command.withdraw` | Hub→Node | `{commandId,instanceId}` → `{commandId,outcome:withdrawn\|already-delivered}`；对不在投递队列里的命令（已声明、已写出、已结算或从未见过）一律答 `already-delivered`，不做任何事 |
+| `command.edit` | Hub→Node | `{commandId,instanceId,expectedRevision:U64,prompt:string}` → `{commandId,outcome:edited\|already-delivered\|revision-conflict,revision:U64}`；只替换文本（附件已在接纳时登记，不可改）；成功时 `revision = expectedRevision + 1`，队列里的用户消息以新文本追加一次 replace |
+| 转发 `instance.send` 的 `commandRevision` | Hub→Node | Hub 行的 `revision`，大于 0 时才带；Node 以它作为投递队列里这条 prompt 的起始 revision，缺省为 0 |
+| hello `capabilities.heldInput` | Node→Hub | `true` 表示支持上面两个方法；缺失即不支持，Hub 对该 host 上 Node 持有的 prompt 一律答 409 `already-delivered` |
+
+~~~text
+→ {"jsonrpc":"2.0","id":"h-41","method":"command.withdraw","params":{"commandId":"cmd_…","instanceId":"ins_…"}}
+← {"jsonrpc":"2.0","id":"h-41","result":{"commandId":"cmd_…","outcome":"withdrawn"}}
+→ {"jsonrpc":"2.0","id":"h-42","method":"command.edit","params":{"commandId":"cmd_…","instanceId":"ins_…","expectedRevision":"0","prompt":"…"}}
+← {"jsonrpc":"2.0","id":"h-42","result":{"commandId":"cmd_…","outcome":"already-delivered","revision":"0"}}
+hello params: "capabilities": {"driverInventory": […], "lineageFence": true, "heldInput": true}
+~~~
+
 ### 7.3 Snapshot + seq follow 与重连补页
 
 订阅输入：`{journalId,afterSeq:U64|null,snapshot:"required"|"if-needed"|"none",projectionVersion:string,batchLimit:number}`。result：`{subscriptionId,journalId,floorSeq,durableSeq,snapshot:Snapshot|null,replayFromSeq,nextCursor,connectionId}`。`Snapshot` 包含 `{projectionVersion,projectionEpoch:Id,asOfSeq,instance,runs,commands,pendingInteractions,nodes,history:{earliestRetainedSeq,complete:boolean}}`；registry snapshot 使用其对应实体集合，不能给它虚构 Instance。
@@ -2252,6 +2271,68 @@ GET /healthz
 - 投递：`persistent` 的 run 是血缘的一条 `wake-due` 事实，dedupe key 与 occurrence 上限的主体都是 run id；一个批次至多带一个 wake run，文本模板 v2，以该 run 的信封开头（main-agent.md §11.3）。`fresh` 的 run 不发事实，而由 Hub 以章节自己的 Agent 凭证发起一次普通的实例创建（`claude-print`，同 host），子实例 spec 带 `wakeRunId`，其事实经父边回到血缘。
 - `/healthz` 的 503 只表示 wake tick 已停（12 个周期、60 秒没有完成的 tick）；其余路由照常服务。容器探针把它当作不健康；PWA 的连通探针把这一种 503 当作可达。
 
+### 8.5 自己排队的命令与运行时配置的 generation（cb-command-queue，2026-11-05）
+
+D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留 commandId；已转发的命令在任何 id 下都不会因编辑而再次发出；排队的 `instance.configure` 不可编辑，只能撤回后以新 commandId 重发。
+
+**「自己的」按 Hub 盖章的发起者判定，**绝不取自请求体，也不改变任何授权：
+- Agent 调用方只看见、只能操作 `initiator.instanceId` 是自己实例、或 `initiator.lineageId` 是自己血缘的命令（同一血缘的后继章节接手前一章节排的队）；
+- Human 或 Bot 设备的「自己的」是由该设备认证排队的命令；排队设备 id 记在 Hub 的命令行上，只存 Hub，不出现在任何响应里；
+- 未收窄的 owner（Human 设备，不带 `x-remuda-instance-id`）不带 `mine=1` 时列出并可撤回、编辑范围内任何调用方排队的命令；带 `mine=1` 时只看自己设备的；Agent 与 Bot 不论带不带 `mine=1` 都只看自己的；
+- Hub 自己写入的输入（`origin: hub`：inbox 事实批、重启通知、wake 投递）不属于任何调用方，不列出，不能编辑或撤回——它们未送达时由 Hub 自己在新 id 下重新组批；
+- 编辑与撤回时，目标实例仍必须是调用方今天可以命令的：Agent 适用 send 规则（`owns()`，或在其显式收窄的范围内）；
+- 不是自己的命令一律 404，与命令不存在相同；所以 Agent 永远编辑不了 Human 的命令，也编辑不了另一个 Agent 的命令。
+
+**「排队中」即「尚未送达」。** 只有能证明命令还没到达 harness 时才允许编辑与撤回，两种情形：
+- `held: "hub"`：Hub 行 `state=queued` 且 `forwarded=0`（host 离线、fence 未确认、排在 owner 输入之后等）。编辑与撤回在 Hub 的串行 writer 里对 `forwarded=0` 做 CAS；转发的 intent 标记（`mark_forward_intent*`）在同一个 writer 里只对仍为 `queued` 的行生效，所以撤回与转发恰好一方获胜：撤回在先，行结算为 `withdrawn`，转发看到它已结算就什么也不写；转发在先，撤回得 409。转发在 intent 标记之后重读行内容，所以编辑后的文本是唯一可能发出的版本。
+- `held: "node"`：PTY 承载在实例忙时把已接纳的 prompt 留在 Node 的投递队列里，此时 Hub 行为 `accepted`、未结算。编辑与撤回经 Node 的 `command.edit` / `command.withdraw`（§7.2 2026-11-05 补），Node 对投递声明做先到先得的 CAS。Node 未声明 `capabilities.heldInput`、host 离线、或 Node 答 `already-delivered` 时，Hub 回 409 `already-delivered`。附件已在 Node 接纳时登记，所以 Node 持有的 prompt 只能改文本。
+- 其余（已转发且没有 Node 的证据、已结算）一律 409 `already-delivered`，带 `next`；Hub 从不猜测。
+
+| 路由 | 请求 | 结果 |
+| --- | --- | --- |
+| `GET /v1/commands?mine=1&state=queued` | 另可带 `instanceId`、`limit`（默认 50，上限 200）；`state` 只接受 `queued`，缺省即 `queued` | `{commands: Command[]}`，新的在前；只列 `instance.send` 与 `instance.configure`；每行带 `revision` 与 `held: hub\|node`。Agent 可调用 |
+| `PATCH /v1/commands/{id}` | `{expectedRevision: U64, text?: string, attachments?: AttachmentRef[]}`，至少带一项 | `{command}`。只适用于 `instance.send`：文本按发送时的形状原位替换（`text`、`prompt`、`input.text`、字符串 `input` 或 `input.blocks` 里的文本块）；`attachments` 给出时按首次 POST 的同一校验替换顶层附件，省略则保留。成功后 `revision` 加一 |
+| `POST /v1/commands/{id}/withdraw` | `{expectedRevision?: U64}` | `{command}`：`state=settled`，`settlement.outcome=withdrawn`，`settlement.withdrawnBy: {origin, instanceId?}`。对已撤回的命令再撤回一次返回同一行 |
+| `GET /v1/instances/{id}/config` | — | `{instanceId, generation, model, effort, permissionMode, effective: {model, effort}, pending: [...]}`；Agent 对自己拥有的实例可调用 |
+
+同 id 的重放（D-055 outbox）若带的是编辑前的原始 payload，仍视为同一条命令（Hub 只为这一比较保留原始 payload），返回当前行；仍在 Hub 排队的行照 G1 恰好转发一次，发出的是**编辑后**的内容。重放命中已撤回的行时返回该结算行，不再转发。
+
+**运行时配置的 generation。** 每个实例有一个运行时配置 generation，就是实例投影上已有的 `configureSeq`：Hub 每提交一次 configure 的 spec merge 加一；撤回一条已 merge 的排队 configure 时，凡仍保持该 configure 所设值的字段恢复为它之前的值，有字段恢复则也加一。
+- `instance.configure` 的 payload 可带 `expectedGeneration: U64`。它在 merge 的同一个 writer 作业里比较：不等则不 merge，回 409 `CONFIG_GENERATION_CONFLICT`，体内带当前 `generation` 与当前值 `config`（与 `GET …/config` 同形）；这一结局照 D-055 与命令行一起持久化，同 id 重放原样复现这个 409。不带 `expectedGeneration` 的 configure 行为与以前相同。Main 与 owner 都以读到的 generation 去写，谁也不会悄悄覆盖对方。
+- 只能在回合边界生效的配置，POST 结果与命令行都带 `deferred: {boundary: "next-turn" | "next-chapter"}`：
+  - `next-turn`：PTY 承载在实例忙（`activity` 为 `working` 或 `waiting-interaction`）时，driver 把切换留到下一个空闲时刻（D-028 §9.1 的 ready ladder，journal `effort-queued:<word>`）。Hub 在 POST 时按实例活动给出，之后按 journal 维持：带本请求 `effortRequestId` 的 `effort-queued` 标记它为 deferred；`effort-applied`、`effort-degraded`、`effort-unsupported-in-session`、`effort-control-unavailable` 解除它（生效或失败都不再是待生效）。
+  - `next-chapter`：`claude-print` 与 `claude-sdk` 没有会话内的 effort 通道，effort 只在启动时以 `--effort` 生效。Hub 不再把 effort 转发给它们去换一条拒绝：只改 effort 的 configure 由 Hub 结算为 `completed` 并标 `next-chapter`（spec 已 merge，下一章节按它启动）；同时改 model 的，model 照常转发，effort 从转发帧里去掉。它在本章节内一直是待生效。
+- `pending` 列出本实例尚未生效的 configure，每项 `{commandId, state: queued|deferred, boundary?, model?, effort?, initiator?, createdAt}`：`queued` 是 Hub 尚未转发的行，`deferred` 是带 boundary 的行。
+- Worker digest（main-agent.md §10.2）的 `model` 增加 `generation`；`model.configure` 的 `state` 取 `queued`、`accepted` 或 `deferred`，deferred 时另带 `boundary`。仍在 2048 字节以内。
+
+**审计。** 编辑写 `command.edit`（commandId、实例、新 revision），撤回写 `command.withdraw`（commandId、实例、revision、`held`），generation 冲突写 `instance.configure.conflict`（实例、commandId、`expectedGeneration`、当前 generation）；行上带调用方设备与 Agent 的 initiator。审计与日志只记类别和 id，绝不记 prompt 文本。
+
+~~~text
+GET /v1/commands?mine=1&state=queued
+← {"commands": [{"commandId": "cmd_…", "instanceId": "ins_…", "operation": "instance.send",
+   "state": "queued", "resolution": "clear", "forwarded": false, "revision": "1", "held": "hub",
+   "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "1"}, "payload": {…}}]}
+
+PATCH /v1/commands/cmd_…  {"expectedRevision": "0", "text": "…"}
+HTTP 409
+{"error": "command cmd_… is at revision 1", "code": "COMMAND_REVISION_CONFLICT", "revision": "1",
+ "reason": "revision-conflict", "next": {"action": "read-then-decide", "commandId": "cmd_…", "hint": "…"}}
+
+POST /v1/commands/cmd_…/withdraw
+HTTP 409
+{"error": "command cmd_… was already delivered", "code": "COMMAND_NOT_QUEUED",
+ "reason": "already-delivered", "next": {"action": "read-then-decide", "commandId": "cmd_…", "hint": "…"}}
+
+POST /v1/instances/ins_…/commands  {"operation": "instance.configure", "payload": {"effort": {…}, "expectedGeneration": "3"}}
+HTTP 409
+{"error": "runtime config is at generation 4", "code": "CONFIG_GENERATION_CONFLICT", "generation": "4",
+ "config": {…}, "reason": "generation-conflict", "next": {"action": "read-then-decide", "hint": "…"}}
+
+HTTP 200 (busy PTY worker)
+{"command": {"commandId": "cmd_…", "operation": "instance.configure", "state": "settled",
+ "deferred": {"boundary": "next-turn"}, …}, "replayed": false}
+~~~
+
 ## 9. 错误码、未知值与兼容性
 
 ### 9.1 错误对象
@@ -2353,6 +2434,13 @@ HTTP 409
 **实现现状（`cb-errors`）。** 除首批取值外，当前实现还发出同一词汇的三个原因：`stale-caller`（凭证背后的实例行已不存在，`ask-owner`）、`approval-invalid`（approvalId 未知、过期、已用或不属于本次动作，`fix-request`）、`delivery-unknown`（`instance.configure` 重放的投递结果未知，`read-then-decide`，并带 `commandId`）。
 
 **`ma-admission`（D-057 OA1，2026-11-01）新增四个原因。** Agent 来源 create、dispatch、worker 重生的权限档位按「子不超父」被拒时为 403 `FORBIDDEN`，`next.action` 为 `fix-request`，`hint` 列出子实例 harness 可选的档位：`permission-mode-unknown`（请求的档位不在子实例 harness 的词表里）、`permission-mode-not-inheritable`（省略档位，而创建者自己的档位不在子实例 harness 的词表里）、`beyond-creator`（关闭控制的档位，而创建者自身保留控制）。提交点复读到创建者档位已变时为 409 `CONFLICT`，原因 `creator-mode-changed`，`next.action` 为 `retry-same-command`（什么都没有启动，原请求可直接重发，按创建者当前档位重新受理）。
+
+**2026-11-05 补（cb-command-queue，§8.5）：排队命令与 configure generation 的拒绝。** Hub HTTP 错误体新增三个 `code`，均为 409，都带 `reason` 与 `next`：
+- `COMMAND_NOT_QUEUED`，`reason: "already-delivered"`：命令不能再证明尚未送达；`next.action` 为 `read-then-decide`，带 `commandId`。
+- `COMMAND_REVISION_CONFLICT`，`reason: "revision-conflict"`：`expectedRevision` 不是当前 revision；体内带当前 `revision`，`next.action` 为 `read-then-decide`。
+- `CONFIG_GENERATION_CONFLICT`，`reason: "generation-conflict"`：`expectedGeneration` 不是实例当前的运行时配置 generation；体内带当前 `generation` 与 `config`，`next.action` 为 `read-then-decide`。
+
+另有一个 400 `BAD_REQUEST` 的原因 `not-editable`（编辑 `instance.send` 以外的命令，或改 Node 持有的 prompt 的附件），`next.action` 为 `fix-request`，提示撤回后以新 commandId 重发。别人的命令为 404 `NOT_FOUND`。
 
 ### 9.2 Unknown 与 reconciliation 的实现要求
 

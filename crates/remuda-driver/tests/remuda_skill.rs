@@ -206,6 +206,7 @@ impl<'a> Run<'a> {
             secret_policy: None,
             memory_context: self.memory,
             skill_context: self.skill,
+            configured_skills: &[],
         })
         .unwrap_or_else(|error| panic!("{:?}/{:?}: {error}", self.driver, self.kind))
     }
@@ -217,6 +218,7 @@ fn facts(grants: &[&str]) -> SkillContext {
         herdr: true,
         delegated_decisions: true,
         inbox: false,
+        profile: None,
     }
 }
 
@@ -569,6 +571,7 @@ fn section(grants: &[&str], herdr: bool, delegated: bool) -> String {
         herdr,
         delegated_decisions: delegated,
         inbox: false,
+        profile: None,
     })
 }
 
@@ -589,6 +592,7 @@ fn every_context() -> Vec<SkillContext> {
                         herdr,
                         delegated_decisions,
                         inbox,
+                        profile: None,
                     });
                 }
             }
@@ -698,6 +702,7 @@ fn an_inbox_seat_is_told_what_a_batch_is() {
         herdr: true,
         delegated_decisions: false,
         inbox: true,
+        profile: None,
     });
     assert!(!text.contains("No inbox"), "{text}");
     for needle in [
@@ -714,6 +719,7 @@ fn an_inbox_seat_is_told_what_a_batch_is() {
         herdr: false,
         delegated_decisions: false,
         inbox: true,
+        profile: None,
     });
     assert!(!without.contains("worker digest"), "{without}");
 }
@@ -872,6 +878,7 @@ fn a_failed_write_leaves_no_temporary_file_behind() {
         secret_policy: None,
         memory_context: None,
         skill_context: Some(&context),
+        configured_skills: &[],
     });
     assert!(
         result.is_err(),

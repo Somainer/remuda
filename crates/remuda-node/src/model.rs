@@ -159,6 +159,12 @@ pub struct CreateInstanceRequest {
     /// unknown values. Never inherited or implied by installed host software.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// cb-seat-profile (D-063): host-absolute skill directories to install
+    /// into the native home, from the Hub-stored `spec.skills` (a Human or Bot
+    /// create, or the lineage profile at the next chapter). Read once by the
+    /// launch snapshot; empty means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
     /// Resolved model-API route the Hub placed on the spec (D-047). `None` (or
     /// `mode: direct`) means the listener is never started and the launch is a
     /// plain direct delivery. A `via` request missing its host is invalid: the
@@ -361,6 +367,17 @@ impl CreateInstanceRequest {
             if !copied.is_empty() {
                 self.capabilities = copied;
             }
+        }
+        // cb-seat-profile: configured skill directories, verbatim from the
+        // Hub-stored spec. An older Hub omits the field: no configured skill.
+        if self.skills.is_empty()
+            && let Some(skills) = spec.get("skills").and_then(Value::as_array)
+        {
+            self.skills = skills
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
         }
         if self.api_route.is_none() {
             self.api_route = spec

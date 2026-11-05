@@ -36,6 +36,7 @@ fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
         creator_permission_mode: None,
         memory_context: None,
         skill_context: None,
+        skills: Vec::new(),
         initiator: None,
         origin: remuda_protocol::InputOrigin::Human,
         agent_credential: None,

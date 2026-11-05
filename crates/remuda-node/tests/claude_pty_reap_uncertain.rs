@@ -156,6 +156,7 @@ async fn run_reap_barrier(session_name: &str, model: StopModel) {
         creator: remuda_driver::CreatorControl::default(),
         memory_context: None,
         skill_context: None,
+        configured_skills: Vec::new(),
         instance_id: None,
         media_stager: None,
         profile: profile(),

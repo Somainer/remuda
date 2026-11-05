@@ -76,6 +76,7 @@ fn options_for(dir: &Path, instance_id: &InstanceId, spec: &InstanceSpec) -> She
             binary: Some(fake_codex_script(dir)),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
+            configured_skills: Vec::new(),
             settings_overlay: None,
         },
     );

@@ -106,6 +106,12 @@ pub struct MaterializeRequest<'a> {
     /// embedded `remuda` skill where the harness reads it and carry the
     /// seat's capability section ([`crate::launch::remuda_skill`]).
     pub skill_context: Option<&'a SkillContext>,
+    /// cb-seat-profile: the configured skill trees (`spec.skills`) the
+    /// Node's launch snapshot read and resolved for this launch, written at
+    /// `<native_home>/skills/<name>` exactly as read
+    /// ([`crate::launch::capabilities`]). Empty for every launch without
+    /// configured skills.
+    pub configured_skills: &'a [crate::launch::capabilities::ConfiguredSkill],
 }
 
 /// Node token-broker bind baked into a Claude `apiKeyHelper` script.
@@ -540,6 +546,7 @@ fn materialize_inner(
     if let Some(plan) = &skill {
         files.extend(plan.write()?);
     }
+    files.extend(write_configured_skills(request)?);
 
     let settings_digest = files
         .iter()
@@ -842,6 +849,7 @@ fn materialize_shell_pty_agent(
     if let Some(plan) = &skill {
         files.extend(plan.write()?);
     }
+    files.extend(write_configured_skills(request)?);
 
     let settings_digest = files
         .iter()
@@ -930,19 +938,56 @@ fn is_claude_argv_driver(driver: DriverKind) -> bool {
 /// plus a `generic-pty` Claude pane, which the driver pins to the home only
 /// when the home holds login material (`generic_pty::pane_home_env`).
 fn skill_plan(request: &MaterializeRequest<'_>, claude_argv: bool) -> Option<SkillPlan> {
+    let (_, reads_skills) = crate::launch::capabilities::skill_reader(
+        request.spec.driver,
+        request.spec.kind,
+        &request.native_home,
+    );
     crate::launch::remuda_skill::plan(&SkillRequest {
         context: request.skill_context,
         kind: request.spec.kind,
         claude_argv,
-        reads_skills: claude_argv
-            || (request.spec.driver == DriverKind::GenericPty
-                && request.spec.kind == AgentKind::Claude
-                && crate::claude_onboarding::has_login_material(&request.native_home)),
+        reads_skills: claude_argv || reads_skills,
         resume: matches!(request.session, SessionAction::Resume { .. }),
         launch_dir: &request.launch_dir,
         native_home: &request.native_home,
         native_home_managed: request.native_home_managed.unwrap_or(true),
     })
+}
+
+/// cb-seat-profile: write the configured skill trees the launch snapshot
+/// resolved, each at `<native_home>/skills/<name>` under the same rules as the
+/// embedded `remuda` tree (marker first, owner-only, lifetime by whether the
+/// home is shared). The snapshot only resolves a tree for kind `claude` where
+/// the harness reads the directory; a tree the user put there since is
+/// refused by [`crate::launch::remuda_skill::write_managed_tree`].
+fn write_configured_skills(
+    request: &MaterializeRequest<'_>,
+) -> DriverResult<Vec<MaterializedFile>> {
+    let mut files = Vec::new();
+    if request.configured_skills.is_empty() || request.spec.kind != AgentKind::Claude {
+        return Ok(files);
+    }
+    let shared = crate::launch::capabilities::configured_tree_shared(
+        &request.launch_dir,
+        &request.native_home,
+    );
+    for skill in request.configured_skills {
+        let root = request.native_home.join("skills").join(&skill.name);
+        let entries: Vec<(&str, &[u8])> = skill
+            .files
+            .iter()
+            .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice()))
+            .collect();
+        crate::launch::remuda_skill::write_managed_tree(
+            &root,
+            shared,
+            &entries,
+            FileRole::ConfiguredSkill,
+            &mut files,
+        )?;
+    }
+    Ok(files)
 }
 
 /// The materializer's own system-prompt pair on a Claude argv path: the

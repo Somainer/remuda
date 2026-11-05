@@ -157,6 +157,7 @@ fn materialize(
         secret_policy: None,
         memory_context: Some(&context),
         skill_context: None,
+        configured_skills: &[],
     };
     remuda_driver::materialize(&request)
         .unwrap_or_else(|error| panic!("{driver:?}/{kind:?}: {error}"))

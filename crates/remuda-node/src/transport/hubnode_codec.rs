@@ -448,6 +448,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             api_relay_endpoint: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is

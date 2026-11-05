@@ -2122,6 +2122,33 @@ async fn materialize_instance(
     // C2: per-instance registry joining command-delivered prompts onto the
     // hook/transcript observations that confirm them.
     let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
+    // cb-seat-profile (D-063, main-agent.md §3.4.2): ONE `launch.capabilities`
+    // event per agent launch, before the harness starts. A configured item
+    // that exists but cannot be read refuses the launch here: the event is
+    // still journaled, and the create settles rejected like a start failure.
+    if let Some(snapshot) = driver.launch_capabilities() {
+        let refusal = snapshot
+            .refusal
+            .as_ref()
+            .map(|refusal| format!("launch refused ({}): {}", refusal.reason, refusal.next.hint));
+        store.append_observation(
+            &instance_id,
+            None,
+            Completeness::Structured,
+            ObservationPayload::LaunchCapabilities(Box::new(snapshot)),
+        )?;
+        if let Some(reason) = refusal {
+            reject_materialization(
+                store.as_ref(),
+                &instance_id,
+                &mut create_command,
+                &mut receiver,
+                &reason,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     // Protocol §2.3: build is done; the dispatch intent is durable and the
     // native process is about to be spawned. Journal `preparing → starting`
     // before touching the driver so a Hub that never got the RPC reply still

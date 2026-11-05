@@ -389,6 +389,37 @@ impl DriverFactory for NativeClaudeFactory {
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
+        // cb-seat-profile (D-063): the launch snapshot, from the same facts
+        // the materializer reads. The configured trees it read are handed to
+        // the driver, which writes exactly those bytes.
+        let home_managed =
+            native_home_managed(self.kind, launch.request.kind, inherit_default_config);
+        let snapshot = remuda_driver::launch::capabilities::snapshot(
+            &remuda_driver::launch::capabilities::SnapshotRequest {
+                launch: if launch.request.resume_session_id.is_some() {
+                    remuda_protocol::LaunchCapabilitiesLaunch::Resume
+                } else {
+                    remuda_protocol::LaunchCapabilitiesLaunch::Create
+                },
+                kind: launch.request.kind,
+                driver: self.kind,
+                origin: launch.request.origin.into(),
+                permission: &spec.permission_mode,
+                capabilities: &spec.capabilities,
+                args: &spec.args,
+                skills: &launch.request.skills,
+                skill_context: launch.request.skill_context.as_ref(),
+                cwd: &launch.workspace_root,
+                launch_dir: &launch_dir,
+                native_home: &native_home,
+                native_home_managed: home_managed,
+            },
+        );
+        let configured_skills = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.skills.clone())
+            .unwrap_or_default();
+        let launch_capabilities = snapshot.map(|snapshot| snapshot.payload);
         let binary = resolve_binary_source(
             self.kind,
             launch.request.kind,
@@ -411,6 +442,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
                 options.skill_context = launch.request.skill_context.clone();
+                options.configured_skills = configured_skills.clone();
                 Arc::new(ClaudePrintDriver::new(options))
             }
             // Same options as print: the carriers differ by one launch flag, so
@@ -433,6 +465,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
                 options.skill_context = launch.request.skill_context.clone();
+                options.configured_skills = configured_skills.clone();
                 Arc::new(ClaudeSdkDriver::new(options))
             }
             DriverKind::ClaudePty => {
@@ -464,6 +497,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.media_stager = self.tool_media_stager();
                 options.memory_context = launch.request.memory_context.clone();
                 options.skill_context = launch.request.skill_context.clone();
+                options.configured_skills = configured_skills.clone();
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {
@@ -483,6 +517,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.instance_id = Some(launch.instance.meta.id.clone());
                 options.memory_context = launch.request.memory_context.clone();
                 options.skill_context = launch.request.skill_context.clone();
+                options.configured_skills = configured_skills.clone();
                 Arc::new(ClaudeBgDriver::new(options))
             }
             DriverKind::GenericPty => {
@@ -503,6 +538,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.node_epoch = Some(self.epoch.clone());
                 options.memory_context = launch.request.memory_context.clone();
                 options.skill_context = launch.request.skill_context.clone();
+                options.configured_skills = configured_skills.clone();
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {
@@ -578,9 +614,9 @@ impl DriverFactory for NativeClaudeFactory {
                             // claude's is managed unless the operator home is
                             // inherited (the `inherit_default_config` flag is a
                             // claude-specific answer and reads wrong for codex).
-                            native_home_managed: kind != remuda_protocol::AgentKind::Claude
-                                || !inherit_default_config,
+                            native_home_managed: home_managed,
                             settings_overlay: overlay.clone(),
+                            configured_skills: configured_skills.clone(),
                         };
                         ShellPtyOptions::agent(launch.workspace_root.clone(), kind, agent)
                     }
@@ -686,7 +722,29 @@ impl DriverFactory for NativeClaudeFactory {
                 .map(str::to_owned),
             recipe: std::sync::Mutex::new(None),
             startup_error: std::sync::Mutex::new(None),
+            launch_capabilities,
         }))
+    }
+}
+
+/// D-045: whether this launch's native home is Remuda-managed, as each
+/// driver passes it to the materializer. The Claude carriers inherit the
+/// operator home under `inherit_default_config`; `generic-pty` never does;
+/// on `shell-pty` the shadow homes codex/grok get are always managed, and
+/// claude's is managed unless the operator home is inherited (the
+/// `inherit_default_config` flag is a claude-specific answer and reads wrong
+/// for codex).
+fn native_home_managed(
+    driver: DriverKind,
+    kind: remuda_protocol::AgentKind,
+    inherit_default_config: bool,
+) -> bool {
+    match driver {
+        DriverKind::GenericPty => true,
+        DriverKind::ShellPty => {
+            kind != remuda_protocol::AgentKind::Claude || !inherit_default_config
+        }
+        _ => !inherit_default_config,
     }
 }
 
@@ -883,6 +941,8 @@ struct NativeAdapter {
     resume_session_id: Option<String>,
     recipe: std::sync::Mutex<Option<remuda_driver::LaunchRecipe>>,
     startup_error: std::sync::Mutex<Option<String>>,
+    /// cb-seat-profile: the snapshot computed at build, journaled before start.
+    launch_capabilities: Option<remuda_protocol::LaunchCapabilitiesPayload>,
 }
 
 impl Driver for NativeAdapter {
@@ -926,6 +986,10 @@ impl Driver for NativeAdapter {
 
     fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
         self.recipe.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn launch_capabilities(&self) -> Option<remuda_protocol::LaunchCapabilitiesPayload> {
+        self.launch_capabilities.clone()
     }
 
     fn startup_error(&self) -> Option<String> {
@@ -1914,6 +1978,7 @@ mod tests {
                 creator_permission_mode: None,
                 memory_context: None,
                 skill_context: None,
+                skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2131,6 +2196,7 @@ mod tests {
                 creator_permission_mode: None,
                 memory_context: None,
                 skill_context: None,
+                skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2345,6 +2411,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2500,6 +2567,7 @@ mod tests {
                 creator_permission_mode: None,
                 memory_context: None,
                 skill_context: None,
+                skills: Vec::new(),
                 initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
@@ -2564,6 +2632,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2619,6 +2688,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
@@ -2678,6 +2748,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -2741,6 +2812,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3227,6 +3299,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -3654,6 +3727,7 @@ mod tests {
                 creator_permission_mode: None,
                 memory_context: None,
                 skill_context: None,
+                skills: Vec::new(),
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3663,6 +3737,7 @@ mod tests {
                 creator_permission_mode: None,
                 memory_context: None,
                 skill_context: None,
+                skills: Vec::new(),
                 permission_mode: spelling.into(),
                 ..test_create_request()
             }));
@@ -3674,6 +3749,7 @@ mod tests {
             creator_permission_mode: None,
             memory_context: None,
             skill_context: None,
+            skills: Vec::new(),
             initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,

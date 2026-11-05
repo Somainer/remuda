@@ -51,5 +51,6 @@ pub(crate) fn facts(
         herdr: advertises_herdr(host),
         delegated_decisions,
         inbox,
+        profile: None,
     })
 }

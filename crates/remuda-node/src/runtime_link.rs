@@ -366,6 +366,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         api_relay_endpoint: None,
         memory_context: None,
         skill_context: None,
+        skills: Vec::new(),
     };
     request.apply_spec_launch_fields(spec);
     // D-060: the Hub-stamped memory rides the top level of the params, for

@@ -189,6 +189,12 @@ pub struct SkillContext {
     /// host takes hub-origin input.
     #[serde(default)]
     pub inbox: bool,
+    /// cb-seat-profile (D-063): the lineage profile this chapter launched
+    /// with, read from the chapter's own record (never the profile's newest
+    /// revision, so a mid-chapter edit changes nothing live). Absent without
+    /// a profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::SeatProfileFacts>,
 }
 
 impl SkillContext {

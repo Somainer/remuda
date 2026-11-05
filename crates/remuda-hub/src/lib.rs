@@ -2509,9 +2509,6 @@ async fn spawn_inner(
     let bootstrap_resolution = resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
-    // cb-search: index the journal rows older than the search index in the
-    // background; boot never waits for it.
-    crate::search::spawn_backfill(store.clone());
     store
         .mark_all_hosts_offline()
         .await
@@ -2637,6 +2634,10 @@ async fn spawn_inner(
     if bootstrap_resolution == BootstrapResolution::AdoptAfterBind {
         adopt_bootstrap_after_bind(&config.data_dir, &config.bootstrap_token)?;
     }
+    // cb-search: index the journal rows older than the search index in the
+    // background, once boot reconciliation is done and the listener is bound,
+    // so its writer jobs never queue ahead of boot's.
+    crate::search::spawn_backfill(state.store.clone());
     let (tx, rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let shutdown = async {

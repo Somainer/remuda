@@ -9,6 +9,7 @@ import type { Instance } from "../../types/instance";
 import { known, type Id } from "../../types/wire";
 import { MainAskDock, MainCard } from "./MainCard";
 import { resetMainRepliesForTest, TAIL_RETRY_MS } from "./mainTail";
+import { interaction } from "./queueTestData";
 
 const hub = {
   instances: [] as Instance[],
@@ -636,6 +637,80 @@ describe("⑨ quick-ask chips on the 问 Main input", () => {
     fireEvent.click(chips[0]);
     expect((input as HTMLTextAreaElement).value).toBe("谁在等我");
     expect(send).not.toHaveBeenCalled();
+  });
+
+  // main-ui :123: the chips row sits above the input, so if the press on
+  // 发送 blurred the input the row would unmount and 发送 would move out
+  // from under the pointer before the release, and the click would never
+  // land. While Main asks, the input still sends a new message (its question
+  // is answered on ④'s pinned card, home.md §4.1 item 1, §6.3).
+  it.each([
+    ["在问你", true],
+    ["空闲", false],
+  ])("while Main reads %s, a press on 发送 keeps the chips and the click sends", async (phrase, asking) => {
+    hub.interactions = asking ? [interaction({ id: "int_main" as Id, instanceId: "ins_main" as Id })] : [];
+    renderCard("desktop");
+    expect(screen.getByTestId("main-card-status").textContent).toMatch(new RegExp(`^${phrase}`));
+    const input = screen.getByTestId("composer-input");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "看一下 gate" } });
+    expect(screen.getByTestId("composer-suggestions")).toBeTruthy();
+    const sendButton = screen.getByTestId("composer-send");
+    // The press keeps the textarea focused (default prevented), so no blur
+    // collapses the chips row under the pointer.
+    expect(fireEvent.mouseDown(sendButton)).toBe(false);
+    // Keyboard focus moving to 发送 (Tab) keeps the chips as well.
+    fireEvent.blur(input, { relatedTarget: sendButton });
+    expect(screen.getByTestId("composer-suggestions")).toBeTruthy();
+    fireEvent.click(sendButton);
+    await waitFor(() => expect(send).toHaveBeenCalledWith("ins_main", "看一下 gate", [], []));
+    // Leaving the composer hides them.
+    fireEvent.blur(input, { relatedTarget: document.body });
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
+  });
+
+  // main-ui :123 (r2): a press on a control laid out BELOW the card (④'s
+  // 允许一次 at 1280) blurs the input; hiding the chips row on that press
+  // would move the control up under the pointer and lose its click. The row
+  // stays until the press has finished, then goes.
+  it("a press outside keeps the chips until its click has landed, then hides them", async () => {
+    const seen: boolean[] = [];
+    render(
+      <MemoryRouter>
+        <MainCard placement="desktop" />
+        <button
+          type="button"
+          data-testid="below"
+          onClick={() => seen.push(screen.queryByTestId("composer-suggestions") !== null)}
+        >
+          允许一次
+        </button>
+      </MemoryRouter>,
+    );
+    const input = screen.getByTestId("composer-input");
+    fireEvent.focus(input);
+    expect(screen.getByTestId("composer-suggestions")).toBeTruthy();
+    const below = screen.getByTestId("below");
+    fireEvent.pointerDown(below);
+    fireEvent.mouseDown(below);
+    fireEvent.blur(input, { relatedTarget: below });
+    // Still up through the press…
+    expect(screen.getByTestId("composer-suggestions")).toBeTruthy();
+    fireEvent.pointerUp(below);
+    fireEvent.mouseUp(below);
+    fireEvent.click(below);
+    expect(seen).toEqual([true]);
+    // …and gone once it has finished.
+    await waitFor(() => expect(screen.queryByTestId("composer-suggestions")).toBeNull());
+  });
+
+  it("a keyboard blur (no press) hides the chips at once", () => {
+    renderCard("desktop");
+    const input = screen.getByTestId("composer-input");
+    fireEvent.focus(input);
+    expect(screen.getByTestId("composer-suggestions")).toBeTruthy();
+    fireEvent.blur(input, { relatedTarget: document.body });
+    expect(screen.queryByTestId("composer-suggestions")).toBeNull();
   });
 
   it("lists 今天落地了什么 only for a seat holding land", () => {

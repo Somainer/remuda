@@ -54,6 +54,8 @@ class TimeoutConfigTests(unittest.TestCase):
         self.assertEqual(supervisor.default_timeout("web-install"), 20 * 60)
         # The Hub e2e step keeps the 30 minute budget despite the web- prefix.
         self.assertEqual(supervisor.default_timeout("web-hub-e2e"), 30 * 60)
+        # The opt-in Main pass extends that name but has its own 15 minutes.
+        self.assertEqual(supervisor.default_timeout("web-hub-e2e-main"), 15 * 60)
         self.assertEqual(supervisor.default_timeout("secret-scan"), 30 * 60)
 
     def test_env_overrides_and_zero_means_disabled(self):
@@ -261,7 +263,7 @@ class GateDriverEndToEndTests(unittest.TestCase):
             all(
                 step["status"] == "skipped"
                 for step in steps
-                if step["name"] in {"web-build", "web-test", "web-hub-e2e"}
+                if step["name"] in {"web-build", "web-test", "web-hub-e2e", "web-hub-e2e-main"}
             )
         )
 

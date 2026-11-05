@@ -378,6 +378,58 @@ impl Ctx {
         Ok(value)
     }
 
+    /// A `claude-pty` worker the `token` seat owns, on the roster and mid-turn;
+    /// returns (instance id, roster id).
+    async fn busy_worker(&self, token: &str, project: &str) -> Result<(String, String)> {
+        let worker = self.worker(token, project, "claude-pty").await?;
+        let roster_id = remuda_protocol::WorkerRosterId::new().as_id().to_string();
+        let roster: remuda_protocol::WorkerRoster = serde_json::from_value(json!({
+            "id": roster_id, "revision": "1",
+            "createdAt": "2026-11-05T01:00:00.000Z", "updatedAt": "2026-11-05T01:00:00.000Z",
+            "projectId": project, "name": format!("w-{}", &roster_id[roster_id.len() - 6..]),
+            "instanceId": worker,
+            "hostId": self.host, "workspaceId": self.workspace, "harness": "claude",
+            "driver": "claude-pty", "model": "claude-sonnet-5-5",
+            "branch": "wt/w-defer/b-defer-md", "worktreePath": "/w/w-defer",
+            "state": { "state": "working" },
+        }))?;
+        self.hub
+            .store()
+            .context("store")?
+            .insert_worker(
+                roster,
+                "cmdqueue-test".into(),
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+            )
+            .await?;
+        self.journal(
+            &worker,
+            json!({"kind":"lifecycle","payload":{"type":"native","topic":"session",
+                "nativeName":"session","nativeId":{"state":"known","value":"session-1"},
+                "status":{"state":"known","value":"working"},"relatedIds":{},"dataRef":null,
+                "severity":"info","affectsCompletion":false}}),
+        )
+        .await?;
+        let (_, instance) = self.get(token, &format!("/v1/instances/{worker}")).await?;
+        anyhow::ensure!(instance["activity"] == "working", "{instance}");
+        Ok((worker, roster_id))
+    }
+
+    /// Journal a driver's `instance.configure` lifecycle edge as the driver
+    /// writes it (`status` is a `Knowledge`).
+    async fn configure_edge(&self, instance_id: &str, status: &str) -> Result<()> {
+        self.journal(
+            instance_id,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "native", "topic": "configuration", "nativeName": "instance.configure",
+                "nativeId": { "state": "not-applicable" },
+                "status": { "state": "known", "value": status },
+                "relatedIds": {}, "dataRef": null, "severity": "info",
+                "affectsCompletion": false } }),
+        )
+        .await
+    }
+
     async fn journal(&self, instance_id: &str, event: Value) -> Result<()> {
         self.hub
             .store()
@@ -925,37 +977,7 @@ async fn a_mid_turn_configure_is_deferred_until_its_turn_boundary() -> Result<()
     let ctx = Ctx::spawn().await?;
     let project = ctx.project().await?;
     let (_main, main) = ctx.coordinator(&project).await?;
-    let worker = ctx.worker(&main, &project, "claude-pty").await?;
-    let roster_id = remuda_protocol::WorkerRosterId::new().as_id().to_string();
-    let roster: remuda_protocol::WorkerRoster = serde_json::from_value(json!({
-        "id": roster_id, "revision": "1",
-        "createdAt": "2026-11-05T01:00:00.000Z", "updatedAt": "2026-11-05T01:00:00.000Z",
-        "projectId": project, "name": "w-defer", "instanceId": worker,
-        "hostId": ctx.host, "workspaceId": ctx.workspace, "harness": "claude",
-        "driver": "claude-pty", "model": "claude-sonnet-5-5",
-        "branch": "wt/w-defer/b-defer-md", "worktreePath": "/w/w-defer",
-        "state": { "state": "working" },
-    }))?;
-    ctx.hub
-        .store()
-        .context("store")?
-        .insert_worker(
-            roster,
-            "cmdqueue-test".into(),
-            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
-        )
-        .await?;
-    ctx.journal(
-        &worker,
-        json!({"kind":"lifecycle","payload":{"type":"native","topic":"session",
-            "nativeName":"session","nativeId":{"state":"known","value":"session-1"},
-            "status":{"state":"known","value":"working"},"relatedIds":{},"dataRef":null,
-            "severity":"info","affectsCompletion":false}}),
-    )
-    .await?;
-    let (_, instance) = ctx.get(&main, &format!("/v1/instances/{worker}")).await?;
-    assert_eq!(instance["activity"], "working", "{instance}");
-
+    let (worker, roster_id) = ctx.busy_worker(&main, &project).await?;
     let path = format!("/v1/instances/{worker}/commands");
     let configured = ctx
         .ok(
@@ -993,7 +1015,7 @@ async fn a_mid_turn_configure_is_deferred_until_its_turn_boundary() -> Result<()
         &worker,
         json!({ "kind": "lifecycle", "payload": {
             "type": "native", "nativeName": "instance.configure",
-            "status": "effort-applied:high", "severity": "info",
+            "status": { "state": "known", "value": "effort-applied:high" }, "severity": "info",
             "relatedIds": { "effortRequestId": "effreq_defer" } } }),
     )
     .await?;
@@ -1003,6 +1025,121 @@ async fn a_mid_turn_configure_is_deferred_until_its_turn_boundary() -> Result<()
         .get(&main, &format!("/v1/workers/{roster_id}/digest"))
         .await?;
     assert!(digest["model"].get("configure").is_none(), "{digest}");
+    Ok(())
+}
+
+/// A model-only or permission-only configure to a busy PTY worker is deferred
+/// too; the driver's model and permission edges carry no request id, so the
+/// Hub settles the deferral on the terminal edge naming the requested value,
+/// together with the older one on that axis it superseded.
+#[tokio::test]
+async fn a_deferred_model_or_permission_switch_resolves_on_its_own_edges() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.project().await?;
+    let (_main, main) = ctx.coordinator(&project).await?;
+    let (worker, roster_id) = ctx.busy_worker(&main, &project).await?;
+    let path = format!("/v1/instances/{worker}/commands");
+    let pending = |config: &Value| -> Vec<String> {
+        config["pending"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["commandId"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut models = Vec::new();
+    for model in ["claude-sonnet-5-5", "claude-opus-5-5"] {
+        let configured = ctx
+            .ok(
+                &main,
+                &path,
+                json!({ "operation": "instance.configure", "payload": { "model": model } }),
+            )
+            .await?;
+        assert_eq!(
+            configured["command"]["deferred"],
+            json!({ "boundary": "next-turn" }),
+            "{configured}"
+        );
+        models.push(
+            configured["command"]["commandId"]
+                .as_str()
+                .context("id")?
+                .to_owned(),
+        );
+    }
+    // The owner's permission switch waits for the same idle moment.
+    let permission = ctx
+        .ok(
+            &ctx.human,
+            &path,
+            json!({ "operation": "instance.configure",
+                    "payload": { "permissionMode": "default" } }),
+        )
+        .await?;
+    assert_eq!(
+        permission["command"]["deferred"],
+        json!({ "boundary": "next-turn" }),
+        "{permission}"
+    );
+    let permission = permission["command"]["commandId"]
+        .as_str()
+        .context("id")?
+        .to_owned();
+    let config = ctx.config(&main, &worker).await?;
+    assert_eq!(
+        sorted(pending(&config)),
+        sorted(vec![
+            models[0].clone(),
+            models[1].clone(),
+            permission.clone()
+        ]),
+        "{config}"
+    );
+    let (_, digest) = ctx
+        .get(&main, &format!("/v1/workers/{roster_id}/digest"))
+        .await?;
+    assert_eq!(
+        digest["model"]["configure"]["state"], "deferred",
+        "{digest}"
+    );
+
+    // `queued` keeps it deferred; the newer request replaced the older one in
+    // the driver, so the applied edge settles both.
+    ctx.configure_edge(&worker, "model-queued:claude-opus-5-5")
+        .await?;
+    assert_eq!(pending(&ctx.config(&main, &worker).await?).len(), 3);
+    ctx.configure_edge(&worker, "model-applied:claude-opus-5-5")
+        .await?;
+    let config = ctx.config(&main, &worker).await?;
+    assert_eq!(pending(&config), vec![permission.clone()], "{config}");
+    // The wheel spells the mode `manual`; the request said `default`.
+    ctx.configure_edge(&worker, "permission-applied:manual")
+        .await?;
+    let config = ctx.config(&main, &worker).await?;
+    assert_eq!(config["pending"], json!([]), "{config}");
+    let (_, digest) = ctx
+        .get(&main, &format!("/v1/workers/{roster_id}/digest"))
+        .await?;
+    assert!(digest["model"].get("configure").is_none(), "{digest}");
+
+    // A failed switch names no value and settles what is still deferred.
+    let failed = ctx
+        .ok(
+            &main,
+            &path,
+            json!({ "operation": "instance.configure",
+                    "payload": { "model": "claude-haiku-4-5-20251001" } }),
+        )
+        .await?;
+    assert_eq!(failed["command"]["deferred"]["boundary"], "next-turn");
+    ctx.configure_edge(&worker, "model-control-unavailable:pane-gone")
+        .await?;
+    assert_eq!(ctx.config(&main, &worker).await?["pending"], json!([]));
     Ok(())
 }
 

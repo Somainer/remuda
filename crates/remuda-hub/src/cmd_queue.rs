@@ -1226,22 +1226,50 @@ pub(crate) fn defer_to_next_turn(
 }
 
 /// Whether a configure to `instance` that changes these axes waits for a turn
-/// boundary on its carrier: a PTY carrier switches effort and model only at
-/// an idle moment.
+/// boundary on its carrier: a PTY carrier switches effort, model and
+/// permission mode only at an idle moment.
 pub(crate) fn waits_for_turn(instance: &InstanceRecord, payload: &Value) -> bool {
     HELD_INPUT_DRIVERS.contains(&instance.driver.as_str())
-        && (changes_effort(payload) || changes_model(payload))
+        && (changes_effort(payload) || changes_model(payload) || changes_permission(payload))
         && matches!(
             instance.activity.as_str(),
             "working" | "blocked" | "draining"
         )
 }
 
+/// Whether a configure payload sets a permission mode.
+pub(crate) fn changes_permission(payload: &Value) -> bool {
+    payload
+        .get("permissionMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| !mode.trim().is_empty())
+}
+
+/// The terminal edges of a switch: applied, or failed for good. Either way
+/// the change is no longer waiting for its boundary.
+const TERMINAL_EDGES: &[&str] = &[
+    "applied",
+    "degraded",
+    "unsupported-in-session",
+    "control-unavailable",
+];
+
 /// Fold one journaled `instance.configure` lifecycle into the configure
-/// rows' deferral: `effort-queued` (re)marks the request deferred until the
-/// next turn; a terminal effort edge (`applied`, `degraded`,
-/// `unsupported-in-session`, `control-unavailable`) resolves it. Matched by
-/// the request's own `effortRequestId`; an edge without one changes nothing.
+/// rows' deferral. `<axis>-queued` (re)marks the change deferred until the
+/// next turn; a terminal edge (`applied`, `degraded`,
+/// `unsupported-in-session`, `control-unavailable`) resolves it.
+///
+/// * Effort edges carry the request's own `effortRequestId` and are matched
+///   by it; an effort edge without one changes nothing.
+/// * Model and permission edges carry no request id, only the requested
+///   value (`model-applied:<id>`, `permission-queued:<mode>`; a
+///   `control-unavailable` edge carries neither). The driver holds one
+///   pending switch per axis and a newer request replaces an older one, so a
+///   terminal edge settles the newest still-deferred configure of that
+///   instance that asked for its value, and every older one on that axis it
+///   superseded; an edge naming no value (or no deferred configure's value)
+///   settles all of them. A configure that changes both effort and another
+///   axis is settled by whichever terminal edge comes first.
 pub(crate) fn fold_configure_lifecycle(
     conn: &Connection,
     instance_id: &str,
@@ -1252,9 +1280,46 @@ pub(crate) fn fold_configure_lifecycle(
     {
         return Ok(());
     }
-    let Some(status) = payload.get("status").and_then(Value::as_str) else {
+    // `status` is a `Knowledge` on the wire (`{state: known, value}`); a bare
+    // string is accepted too.
+    let Some(status) = payload
+        .get("status")
+        .and_then(|status| status.as_str().or_else(|| status.get("value")?.as_str()))
+    else {
         return Ok(());
     };
+    let Some((axis, rest)) = status.split_once('-') else {
+        return Ok(());
+    };
+    let (edge, value) = match rest.split_once(':') {
+        Some((edge, value)) => (edge, value),
+        None => (rest, ""),
+    };
+    let queued = edge == "queued";
+    if !queued && !TERMINAL_EDGES.contains(&edge) {
+        return Ok(());
+    }
+    match axis {
+        "effort" => fold_effort_edge(conn, instance_id, payload, queued),
+        "model" | "permission" => {
+            // `model-degraded:<id>:<detail>` and `-control-unavailable:<detail>`:
+            // only the first segment of a value-carrying edge is the value.
+            let value = match edge {
+                "control-unavailable" => "",
+                _ => value.split(':').next().unwrap_or_default(),
+            };
+            fold_axis_edge(conn, instance_id, axis, value, queued)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn fold_effort_edge(
+    conn: &Connection,
+    instance_id: &str,
+    payload: &Value,
+    queued: bool,
+) -> Result<(), StoreError> {
     let Some(request_id) = payload
         .pointer(&format!(
             "/relatedIds/{}",
@@ -1266,8 +1331,7 @@ pub(crate) fn fold_configure_lifecycle(
     else {
         return Ok(());
     };
-    let now = crate::config::now_rfc3339();
-    if status.starts_with("effort-queued:") {
+    if queued {
         conn.execute(
             "UPDATE commands SET config_deferred = ?1
               WHERE instance_id = ?2 AND operation = 'instance.configure'
@@ -1276,22 +1340,113 @@ pub(crate) fn fold_configure_lifecycle(
                 AND COALESCE(config_deferred, ?1) = ?1",
             params![NEXT_TURN, instance_id, request_id],
         )?;
-    } else if [
-        "effort-applied:",
-        "effort-degraded:",
-        "effort-unsupported-in-session:",
-        "effort-control-unavailable:",
-    ]
-    .iter()
-    .any(|prefix| status.starts_with(prefix))
-    {
+    } else {
         conn.execute(
             "UPDATE commands SET config_deferred_resolved_at = ?1
               WHERE instance_id = ?2 AND operation = 'instance.configure'
                 AND json_extract(payload_json, '$.effort.requestId') = ?3
                 AND config_deferred_resolved_at IS NULL
                 AND COALESCE(config_deferred, ?4) = ?4",
-            params![now, instance_id, request_id, NEXT_TURN],
+            params![
+                crate::config::now_rfc3339(),
+                instance_id,
+                request_id,
+                NEXT_TURN
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The value a configure payload asks of `axis`, normalised as the driver
+/// spells it in its edges.
+fn axis_value(payload: &Value, axis: &str) -> Option<String> {
+    match axis {
+        "model" => payload
+            .get("model")
+            .or_else(|| payload.get("modelId"))
+            .and_then(Value::as_str)
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty()),
+        _ => payload
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .map(normalized_permission),
+    }
+}
+
+fn normalized_permission(word: &str) -> String {
+    remuda_protocol::normalize_permission_word(word)
+        .map(|mode| remuda_protocol::permission_mode_wire(mode).to_owned())
+        .unwrap_or_else(|| word.trim().to_owned())
+}
+
+/// A model or permission edge (see [`fold_configure_lifecycle`]).
+fn fold_axis_edge(
+    conn: &Connection,
+    instance_id: &str,
+    axis: &str,
+    value: &str,
+    queued: bool,
+) -> Result<(), StoreError> {
+    let value = match axis {
+        "permission" if !value.is_empty() => normalized_permission(value),
+        _ => value.trim().to_owned(),
+    };
+    // Newest first: this chapter's configures that change the axis and are
+    // not yet resolved.
+    let mut stmt = conn.prepare(
+        "SELECT id, payload_json, config_deferred FROM commands
+          WHERE instance_id = ?1 AND operation = 'instance.configure'
+            AND config_deferred_resolved_at IS NULL
+            AND COALESCE(settlement_outcome, 'completed') = 'completed'
+          ORDER BY created_at DESC, id DESC
+          LIMIT 50",
+    )?;
+    let rows = stmt
+        .query_map(params![instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(id, payload, deferred)| {
+            let payload: Value = serde_json::from_str(&payload).ok()?;
+            Some((id, axis_value(&payload, axis)?, deferred))
+        })
+        .collect::<Vec<_>>();
+    if queued {
+        // The driver found the carrier busy after all: the newest configure
+        // asking for this value waits for the next turn.
+        if let Some((id, _, deferred)) = rows.first()
+            && rows[0].1 == value
+            && deferred.as_deref().is_none_or(|d| d == NEXT_TURN)
+        {
+            conn.execute(
+                "UPDATE commands SET config_deferred = ?1
+                  WHERE id = ?2 AND config_deferred_resolved_at IS NULL",
+                params![NEXT_TURN, id],
+            )?;
+        }
+        return Ok(());
+    }
+    let deferred = rows
+        .into_iter()
+        .filter(|(_, _, deferred)| deferred.as_deref() == Some(NEXT_TURN))
+        .collect::<Vec<_>>();
+    let from = (!value.is_empty())
+        .then(|| deferred.iter().position(|(_, asked, _)| *asked == value))
+        .flatten()
+        .unwrap_or(0);
+    let now = crate::config::now_rfc3339();
+    for (id, _, _) in &deferred[from..] {
+        conn.execute(
+            "UPDATE commands SET config_deferred_resolved_at = ?1
+              WHERE id = ?2 AND config_deferred_resolved_at IS NULL",
+            params![now, id],
         )?;
     }
     Ok(())

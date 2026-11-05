@@ -255,7 +255,7 @@
 
 1. **Main 在问你**：Main 现行章节上的待处理交互，置顶，只计一次（`home-main-extras`）。
 2. **其他待处理交互**：`GET /v1/interactions` 中 `status=pending` 且没有过期的项，派生规则和收件箱一样（`deriveInboxQueue`），顺序也和收件箱「待你处理」档一样。`routedTo` 为 `main` 或 `agent` 的项不进入队列（§5.1）。
-3. **任务待你**：`GET /v1/tasks` 中未归档、`blockedReason` 非空、并且它的会话都没有待处理交互的任务（§4.6）。
+3. **任务待你**：`GET /v1/tasks` 中未归档、`blockedReason` 非空、并且它的会话都没有在等 owner 的待处理交互（`routedTo=owner`）的任务（§4.6）。
 4. **告诉你**：Main 用 `remuda owner notify` 发出、还没确认的通知（D-060 决策 7）。notices 的 list 与 ack 路由和卡片已随 `cb-owner-notify` 落地（[main-agent.md §11.7](./main-agent.md#117-implementation-notes-cb-owner-notify-2026-11-03)），按创建时间新的在前。
 5. **回合失败**：`GET /v1/instances` 中带 `lastTurnError` 的实例（D-057 OA6），离开规则见 §4.5。
 
@@ -322,8 +322,8 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 
 - 首页只能有一个「需要你」，就是这个队列。台账（⑦）不再单独渲染任务层的「需要你」组（`buildHomeTaskLayer` 的 attention 组）。`/board` 和任务列表里的「需要你」组不受影响（ui-spec §2.9）。
 - 一个未归档、由 owner 阻塞的任务（`blockedReason` 非空）：
-  - 它的某个会话已经有待处理交互时，只显示那张交互卡，不显示任务卡；
-  - 它的会话都没有待处理交互时，显示一张「任务待你」卡，操作是「打开任务」。
+  - 它的某个会话已经有在等 owner 的待处理交互（`routedTo=owner`）时，只显示那张交互卡，不显示任务卡；
+  - 它的会话都没有在等 owner 的待处理交互（`routedTo=owner`）时，显示一张「任务待你」卡，操作是「打开任务」。转给 Main 或其他 agent 的交互不算（§5.1）。
 - 计数行和角标用同一套口径（§5）。
 
 ## 5 计数口径

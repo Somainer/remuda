@@ -573,6 +573,13 @@ pub(crate) fn transition(conn: &Connection, cause: Transition<'_>) -> Result<usi
         };
         if !running {
             lifted += lift_lineage(conn, &lineage, cause.cause())?;
+        } else if matches!(cause, Transition::Boot | Transition::Hello { .. }) {
+            // The D-051 admission is Hub configuration: a restart can turn the
+            // switch off (globally or for one project) under a row suppressed
+            // with it on. Main could then neither list nor answer the item,
+            // so a parent still running does not keep it: it is lifted, and
+            // its push pages the owner.
+            lifted += lift_revoked(conn, &lineage)?;
         }
     }
     if lifted > 0 {
@@ -661,50 +668,90 @@ impl crate::store::Store {
     }
 }
 
+/// The lift cause of a suppression whose D-051 admission no longer holds.
+const LIFT_ADMISSION_REVOKED: &str = "admission-revoked";
+
+/// Active suppressions of `lineage_id`: (interaction, child instance, kind).
+fn active_rows(
+    conn: &Connection,
+    lineage_id: &str,
+) -> Result<Vec<(String, String, String)>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.interaction_id, s.instance_id, s.interaction_kind FROM push_suppressions s
+           JOIN interactions i ON i.id = s.interaction_id AND i.state = 'pending'
+          WHERE s.lifted_at IS NULL AND s.lineage_id = ?1
+          ORDER BY s.suppressed_at, s.interaction_id",
+    )?;
+    Ok(stmt
+        .query_map(params![lineage_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn lift_lineage(conn: &Connection, lineage_id: &str, cause: &str) -> Result<usize, StoreError> {
-    let rows: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT s.interaction_id, s.instance_id FROM push_suppressions s
-               JOIN interactions i ON i.id = s.interaction_id AND i.state = 'pending'
-              WHERE s.lifted_at IS NULL AND s.lineage_id = ?1
-              ORDER BY s.suppressed_at, s.interaction_id",
-        )?;
-        stmt.query_map(params![lineage_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let now = crate::config::now_rfc3339();
     let mut lifted = 0;
-    for (interaction_id, instance_id) in rows {
-        let changed = conn.execute(
-            "UPDATE push_suppressions SET lifted_at = ?2, lift_cause = ?3
-              WHERE interaction_id = ?1 AND lifted_at IS NULL",
-            params![interaction_id, now, cause],
-        )?;
-        if changed == 0 {
-            continue;
-        }
-        let (title, body) = crate::alerts::INTERACTION_PUSH;
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO push_outbox
-                (outbox_key, kind, instance_id, interaction_id, tag_kind, tag_id, title, body,
-                 url, created_at)
-             VALUES (?1, 'lift', ?2, ?3, 'interaction', ?3, ?4, ?5, ?6, ?7)",
-            params![
-                format!("lift:{interaction_id}"),
-                instance_id,
-                interaction_id,
-                title,
-                body,
-                crate::alerts::interaction_landing_url(&interaction_id),
-                now
-            ],
-        )?;
-        if inserted > 0 {
-            note_outbox();
-        }
-        lifted += 1;
+    for (interaction_id, instance_id, _) in active_rows(conn, lineage_id)? {
+        lifted += usize::from(lift_one(conn, &interaction_id, &instance_id, cause)?);
     }
     Ok(lifted)
+}
+
+/// Lift each active suppression of `lineage_id` that §8.1 condition 2 (the
+/// D-051 predicate, `interactions::routed_to_parent_conn`) no longer admits.
+fn lift_revoked(conn: &Connection, lineage_id: &str) -> Result<usize, StoreError> {
+    let mut lifted = 0;
+    for (interaction_id, instance_id, kind) in active_rows(conn, lineage_id)? {
+        if crate::interactions::routed_to_parent_conn(conn, &instance_id, &kind)? {
+            continue;
+        }
+        lifted += usize::from(lift_one(
+            conn,
+            &interaction_id,
+            &instance_id,
+            LIFT_ADMISSION_REVOKED,
+        )?);
+    }
+    Ok(lifted)
+}
+
+/// Mark one suppression lifted and insert its one outbox row. False when the
+/// row was lifted already.
+fn lift_one(
+    conn: &Connection,
+    interaction_id: &str,
+    instance_id: &str,
+    cause: &str,
+) -> Result<bool, StoreError> {
+    let now = crate::config::now_rfc3339();
+    let changed = conn.execute(
+        "UPDATE push_suppressions SET lifted_at = ?2, lift_cause = ?3
+          WHERE interaction_id = ?1 AND lifted_at IS NULL",
+        params![interaction_id, now, cause],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    let (title, body) = crate::alerts::INTERACTION_PUSH;
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO push_outbox
+            (outbox_key, kind, instance_id, interaction_id, tag_kind, tag_id, title, body,
+             url, created_at)
+         VALUES (?1, 'lift', ?2, ?3, 'interaction', ?3, ?4, ?5, ?6, ?7)",
+        params![
+            format!("lift:{interaction_id}"),
+            instance_id,
+            interaction_id,
+            title,
+            body,
+            crate::alerts::interaction_landing_url(interaction_id),
+            now
+        ],
+    )?;
+    if inserted > 0 {
+        note_outbox();
+    }
+    Ok(true)
 }
 
 // ─── reply-ready (§8.5) ─────────────────────────────────────────────────────

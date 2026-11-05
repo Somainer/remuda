@@ -1981,3 +1981,95 @@ async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -
     assert_eq!(ctx.badge_of("int_rt_last", 1).await?, 8);
     Ok(())
 }
+
+/// Clears the D-051 force-off project override on drop.
+struct ForceOff;
+
+impl ForceOff {
+    fn set(projects: &[&str]) -> Self {
+        remuda_hub::delegated_decisions_test_support::set_force_off_override(Some(
+            projects.iter().map(|id| (*id).to_owned()).collect(),
+        ));
+        Self
+    }
+}
+
+impl Drop for ForceOff {
+    fn drop(&mut self) {
+        remuda_hub::delegated_decisions_test_support::set_force_off_override(None);
+    }
+}
+
+/// r2 item 1: a suppression does not outlive its D-051 admission. Suppressed
+/// with the switch on, the Hub restarts with it off (globally, or with the
+/// child's project forced off): boot lifts the row although Main still runs
+/// by state, with its own cause; the owner is paged once with a badge that
+/// counts the item, and it reads `routedTo: owner` from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_revokes_the_admission_lifts_at_boot() -> Result<()> {
+    let _flag = d051(true).await;
+    for how in ["global-off", "project-force-off"] {
+        let mut ctx = Ctx::boot().await?;
+        let main = seat(&ctx).await?;
+        let worker = ctx.child(Some(&main)).await?;
+        let project = remuda_protocol::ProjectId::new()
+            .as_id()
+            .as_str()
+            .to_owned();
+        ctx.db()?.execute(
+            "UPDATE instances SET scope_json = ?2 WHERE id = ?1",
+            rusqlite::params![worker, json!({ "projectIds": [project] }).to_string()],
+        )?;
+        let id = format!("int_revoked_{}", how.replace('-', "_"));
+        suppressed_question(&ctx, &worker, &id).await?;
+        assert_eq!(ctx.routed_to(&id).await?, "main", "{how}");
+        let _off = match how {
+            "global-off" => {
+                set_d051(false);
+                None
+            }
+            _ => Some(ForceOff::set(&[&project])),
+        };
+        ctx.crash_restart(|_| {}, as_if_crashed).await?;
+        assert_eq!(ctx.wait_lifted(&id).await?, "admission-revoked", "{how}");
+        ctx.hub.test_handle().test_drive_outbox().await;
+        // The one item now waits on the owner, and the page says so.
+        assert_eq!(ctx.badge_of(&id, 1).await?, 1, "{how}");
+        assert_eq!(ctx.routed_to(&id).await?, "owner", "{how}");
+        assert_eq!(ctx.outbox_rows(&id)?, 1, "{how}");
+        set_d051(true);
+        ctx.hub.shutdown().await;
+    }
+    Ok(())
+}
+
+/// r2 item 1, the hello cause: a row boot kept (the switch still on, Main
+/// running by state) is lifted by the parent host's same-epoch hello once the
+/// admission no longer holds, although that hello keeps Main running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hello_lifts_a_suppression_whose_admission_is_gone() -> Result<()> {
+    let _flag = d051(true).await;
+    let mut ctx = Ctx::boot().await?;
+    let main = seat(&ctx).await?;
+    let worker = ctx.child(Some(&main)).await?;
+    suppressed_question(&ctx, &worker, "int_revoked_hello").await?;
+    ctx.crash_restart(|_| {}, as_if_crashed).await?;
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(ctx.suppression("int_revoked_hello")?, (None, None));
+    set_d051(false);
+    let _node = FakeNode::connect_with(
+        &ctx.hub,
+        &ctx.host_p,
+        &ctx.p_node_token,
+        hello_extra(EPOCH, &[&main]),
+    )
+    .await?;
+    assert_eq!(
+        ctx.wait_lifted("int_revoked_hello").await?,
+        "admission-revoked"
+    );
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(ctx.badge_of("int_revoked_hello", 1).await?, 1);
+    assert_eq!(ctx.routed_to("int_revoked_hello").await?, "owner");
+    Ok(())
+}

@@ -340,7 +340,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
   - **唯一来源是推送决定。** 一项算作「转走了」，当且仅当它的 owner 推送被扣下了。`routedTo="main"` 当且仅当这一项仍是 pending，并且有一行**未 lift** 的 `push_suppressions`（规则 `routed-to-running-parent`），这一行的血缘是 Main 的，也就是当前章节持有 `address-owner` 的血缘。
   - **非 Main 的 Agent 上级是 `"agent"`。** 未 lift 的抑制行、血缘不是 Main 的：owner 没被推送，所以这一项也不计入 owner 的数。D-061 原文只列了 `"owner" | "main"`，这是对它的增补。
   - **其余一律是 `"owner"`：** approval、没有抑制行、抑制行已 lift、Human 上级、已经不是 pending。读 Hub store 出错时也是 `"owner"`，日志只记类别。
-  - **lift 即刻生效，并且不回退。** Main 暂停、重启或主机失联时，lift 在把推送放进 outbox 的同一个写事务里标记这一行（main-agent.md §8.3）。所以这一项在它的推送发出的那一刻进入队列，那条推送的角标已经把它算进去了。角标从不藏起一个已经推送过的项。不再抑制（§8.3），所以 Main 恢复运行之后，被 lift 的项仍是 `"owner"`；新的提问照常判定。
+  - **lift 即刻生效，并且不回退。** Main 暂停、重启或主机失联时，lift 在把推送放进 outbox 的同一个写事务里标记这一行（main-agent.md §8.3）。所以这一项在它的推送发出的那一刻进入队列，那条推送的角标已经把它算进去了。角标从不藏起一个已经推送过的项。不再抑制（§8.3），所以 Main 恢复运行之后，被 lift 的项仍是 `"owner"`；新的提问照常判定。Hub 重启时如果 D-051 开关关了（全局，或子会话的项目进了 `_FORCE_OFF`），已有的抑制行也会被 lift（`admission-revoked`，main-agent.md §8.8），因为那时 Main 既看不到也答不了它。
   - **客户端把缺失或不认识的值当作 `"owner"`**（`web/src/features/mobile/inboxRows.ts` 的 `routedAway`），所以老 Hub 退化为今天的行为。
   - **owner 仍然看得到。** 转走的项留在 /approvals 和会话 transcript 里（main-agent.md §8.1），卡上标「已转给 Main」或「已转给 agent」，owner 仍可以在那里作答，先到先得。它只离开「需要你」队列、N、角标和收件箱导航计数；手机收件箱的「待你处理」档也不再列它（它和队列是同一个 `deriveInboxQueue`）。
   - **转走的项不「覆盖」它的任务。** 一个 owner 阻塞任务的会话只有转走的交互时，这个任务按 B 计，显示「任务待你」卡（§4.6）。Hub 的 `owner_queue_count` 与网页的 `ownerBlockedTasks` 用同一口径。

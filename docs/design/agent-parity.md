@@ -25,7 +25,7 @@ The drift check (in the `remuda` test suite, so the gate runs it) fails, naming 
 - the generated file is stale;
 - a Hub route or a clap leaf appears in neither this file nor a commented "no human row" entry;
 - a row names a route no Hub route registers;
-- a row's class contradicts the machine half. A Today cell that begins exactly `Agent route.` claims its Hub routes are middleware-admitted. A `Gap.` or `Safety.` cell that names a middleware refusal ("not admitted", "refused", "the middleware") claims the opposite for its routes, unless the cell also names a segment where the route is admitted. Rows that explain several paths with qualifiers ("Agent route by another path", "Gap without `--project`") make no claim, and the check skips them.
+- a row's class contradicts the machine half. A Today cell that begins exactly `Agent route.` claims its Hub routes are middleware-admitted. A `Gap.` or `Safety.` cell that names a middleware refusal ("not admitted", "restrict_agent_routes", "`read_target`", "the middleware") claims the opposite for its routes, unless the cell also names a segment where the route is admitted. Rows that explain several paths with qualifiers ("Agent route by another path", "Gap without `--project`") make no claim, and the check skips them.
 
 The check does not decide the class for you: a handler-level refusal (`require_operator`, a missing grant) is a `Safety`/`Gap` row with no middleware claim, exactly as the columns below describe.
 
@@ -37,7 +37,7 @@ The ledger makes that rule auditable, and it keeps the seat's skill (`ma-skill`,
 
 ## Columns and classes
 
-- **Today (origin/main)** is what an Agent-origin caller gets on origin/main `c27e0eac`, with every prerequisite the code checks. It starts with one class:
+- **Today (origin/main)** is what an Agent-origin caller gets on origin/main today, with every prerequisite the code checks. It starts with one class:
   - **Agent route.** The middleware admits the path for Agent origin, and the handler admits it under the grant, scope and posture listed. Per-call D-017 approvals are listed too.
   - **Safety.** A real safety property stops it, and the row names the property:
     - approvals are answered only by humans (D-017, D-051(a));

@@ -1460,3 +1460,48 @@ async fn a_process_replaced_after_the_text_gets_no_enter() {
     );
     drop((agent, shell));
 }
+
+#[tokio::test]
+async fn a_claim_row_with_no_recorded_process_ends_even_with_its_server_unreachable() {
+    let harness = Harness::new().await;
+    let id = harness
+        .claim(harness.target("w1", "w1:t1", None))
+        .await
+        .expect("claim")
+        .meta
+        .id;
+    harness.wait_call("terminal.control", "w1:p1").await;
+    harness.node.shutdown().await.expect("node shutdown");
+    let mut row = harness.store.get_instance(&id).expect("row");
+    row.herdr_claim.as_mut().expect("claim").process = None;
+    harness.store.remove_instance(&id).expect("remove");
+    harness.store.insert_instance(row).expect("reinsert");
+    // The server is unreachable when the Node starts.
+    let away = harness.socket.with_extension("away");
+    std::fs::rename(&harness.socket, &away).expect("hide socket");
+    let own_dir = harness.root.path().join("sessions/mine");
+    let restarted = node(&harness.store, harness.data.path(), &own_dir);
+    restarted.set_herdr_claim_root(harness.root.path().to_path_buf());
+    restarted
+        .reconcile_herdr()
+        .await
+        .expect("startup reconcile");
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Exited,
+        "ended, not re-attached in the contact-lost state"
+    );
+    let journal = harness.journal(&id);
+    assert!(journal.contains(REASON_PROCESS_UNKNOWN), "{journal}");
+    assert!(
+        !restarted
+            .inner
+            .instance_drivers
+            .read()
+            .await
+            .contains_key(&id),
+        "nothing is re-attached"
+    );
+    assert!(restarted.tty().attach(&id).await.is_err(), "no bridge");
+    std::fs::rename(&away, &harness.socket).expect("restore socket");
+}

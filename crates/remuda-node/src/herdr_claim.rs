@@ -499,6 +499,23 @@ impl DevNode {
                 );
                 continue;
             };
+            // D-062 r4 item 4: a claim that recorded no process (round-1
+            // data) has nothing to verify, whatever the server says; it ends
+            // before any probe, so an unreachable server cannot re-attach it.
+            if claim.process.is_none() {
+                tracing::info!(instance = %id.as_id(), "claimed herdr pane recorded no process; ended at start");
+                end_claim(
+                    self.inner.store.as_ref(),
+                    &id,
+                    &claim.pane_id,
+                    REASON_PROCESS_UNKNOWN,
+                    &format!(
+                        "the claim on pane {} recorded no process identity; claim the pane again",
+                        claim.pane_id
+                    ),
+                );
+                continue;
+            }
             let client = Client::connect(&claim.socket_path).with_timeout(RPC_TIMEOUT);
             match probe(&client, &claim, instance.kind).await {
                 Probe::Gone { reason, evidence } => {

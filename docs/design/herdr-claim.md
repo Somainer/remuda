@@ -229,8 +229,9 @@ In every case the pane is never touched.
 **Node restart.** A graceful shutdown leaves claimed rows live; a crash leaves
 them as they were. At start, before any command is served, the Node checks
 each live claim: pane present and process alive → re-attach (watcher, TTY
-bridge, command queue); pane gone or process gone, or no recorded process →
-end with evidence as above; process unknown → re-attach with every write
+bridge, command queue); a claim with no recorded process → end
+(`herdr-process-unknown`) before any probe, whatever the server says; pane
+gone or process gone → end with evidence as above; process unknown → re-attach with every write
 refused, the first of the 3 probes counted; server unreachable → re-attach in
 the contact-lost state. Either way the
 re-attach journals the contact it observes (`ok` or `lost`), so a `lost` that

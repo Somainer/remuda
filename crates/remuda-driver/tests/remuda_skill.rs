@@ -587,13 +587,21 @@ fn every_context() -> Vec<SkillContext> {
         for herdr in [false, true] {
             for delegated_decisions in [false, true] {
                 for inbox in [false, true] {
-                    out.push(SkillContext {
-                        grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
-                        herdr,
-                        delegated_decisions,
-                        inbox,
-                        profile: None,
-                    });
+                    // cb-seat-profile: with and without the profile facts.
+                    for profile in [false, true] {
+                        out.push(SkillContext {
+                            grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
+                            herdr,
+                            delegated_decisions,
+                            inbox,
+                            profile: profile.then(|| remuda_protocol::SeatProfileFacts {
+                                revision: U64(2),
+                                display_name: Some("Main".to_owned()),
+                                role: Some("keeps the loop running".to_owned()),
+                                model_candidates: vec!["model-a".to_owned(), "model-b".to_owned()],
+                            }),
+                        });
+                    }
                 }
             }
         }
@@ -1288,4 +1296,28 @@ async fn a_real_claude_sdk_start_carries_the_skill() {
         }
         driver.close().await.expect("close");
     }
+}
+
+/// cb-seat-profile (D-063): the owner's model candidates reach the seat as a
+/// fact in its section, with the applied revision; without a profile the
+/// section says nothing about one.
+#[test]
+fn the_section_states_the_profile_candidates_as_a_fact() {
+    let mut context = facts(&["dispatch"]);
+    let without = render_section(&context);
+    assert!(!without.contains("model candidates"), "{without}");
+    context.profile = Some(remuda_protocol::SeatProfileFacts {
+        revision: U64(4),
+        display_name: Some("Main".to_owned()),
+        role: None,
+        model_candidates: vec!["model-a".to_owned(), "model-b".to_owned()],
+    });
+    let text = render_section(&context);
+    assert!(text.contains("Profile (revision 4"), "{text}");
+    assert!(
+        text.contains("model candidates `model-a`, `model-b`, the first being the default"),
+        "{text}"
+    );
+    assert!(text.contains("Remuda never switches it for you"), "{text}");
+    assert!(text.contains("`remuda lineage profile show`"), "{text}");
 }

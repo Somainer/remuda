@@ -1976,6 +1976,7 @@ async fn restart(
             chapter_cause: cause.into(),
             from_states: &["starting", "running"],
             restart: Some(decision),
+            profile: prepared.profile.clone(),
         })
         .await
         .map_err(crate::http::map_store)?;

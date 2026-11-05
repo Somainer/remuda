@@ -92,6 +92,11 @@ pub struct CreateInstanceBody {
     /// Stored on the spec and forwarded to the Node; the Node re-validates.
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+    /// cb-seat-profile (D-063): host-absolute skill directories the Node
+    /// installs into the native home (`spec.skills`). Human and Bot creators
+    /// only, like `binaryPath`; the Node reads and digests them.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
     #[serde(default)]
     placement: Option<Value>,
     #[serde(default)]
@@ -1477,6 +1482,10 @@ async fn create_instance_as(
         if let Some(effort) = &body.effort {
             obj.insert("effort".into(), effort.clone());
         }
+        if let Some(skills) = body.skills.as_ref().filter(|skills| !skills.is_empty()) {
+            crate::seat_profile::validate_skills(skills).map_err(HubError::BadRequest)?;
+            obj.insert("skills".into(), json!(skills));
+        }
         if let Some(path) = body
             .binary_path
             .as_deref()
@@ -2458,6 +2467,7 @@ async fn resume_lineage(
             chapter_cause: crate::store::OWNER_RESUME_CAUSE.into(),
             from_states: &["starting", "running", "paused"],
             restart: None,
+            profile: prepared.profile.clone(),
         })
         .await
         .map_err(map_store)?;
@@ -2616,6 +2626,9 @@ pub(crate) struct PreparedContinuation {
     pub(crate) operation: &'static str,
     /// The resolved driver, stamped on the successor row (r7 item 6a).
     pub(crate) driver: String,
+    /// cb-seat-profile: the lineage profile the spec was built from, recorded
+    /// on the successor row; `None` without a profile.
+    pub(crate) profile: Option<crate::seat_profile::AppliedProfile>,
 }
 
 /// Build the successor's create spec on `current`'s host from `recovery`:
@@ -2670,6 +2683,14 @@ pub(crate) async fn prepare_continuation(
             (spec, "instance.create")
         }
     };
+    // cb-seat-profile (D-063, main-agent.md §3.4.2): the next chapter's spec
+    // takes the lineage profile at its current revision; without one the
+    // spec stays the predecessor's (creation-time configuration, OA2).
+    let profile = state
+        .store
+        .seat_profile(lineage.lineage_id.clone())
+        .await?
+        .map(|profile| crate::seat_profile::apply_to_spec(&mut spec, &profile));
     let host = crate::store::Store::with_live_link(host, true);
     // D-047 observed-route resolution, mirroring the D-026 path: the
     // successor inherits the predecessor's *observed* route and gets a fresh
@@ -2745,6 +2766,7 @@ pub(crate) async fn prepare_continuation(
         spec,
         operation,
         driver,
+        profile,
     })
 }
 

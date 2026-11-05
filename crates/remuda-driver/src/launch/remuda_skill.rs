@@ -584,6 +584,32 @@ pub fn render_section(context: &SkillContext) -> String {
             .join(", ")
     };
     out.push_str(&format!("Grants: {grants}.\n\n"));
+    // cb-seat-profile (D-063): the owner's profile for this chapter, as a
+    // fact. The candidates are not a failover list: nothing in Remuda
+    // switches a model on its own.
+    if let Some(profile) = &context.profile {
+        out.push_str(&format!(
+            "Profile (revision {}, set by the owner; edits take effect at your next chapter):",
+            profile.revision.0
+        ));
+        if let Some(name) = &profile.display_name {
+            out.push_str(&format!(" name {name};"));
+        }
+        if let Some(role) = &profile.role {
+            out.push_str(&format!(" role {role};"));
+        }
+        let models = profile
+            .model_candidates
+            .iter()
+            .map(|model| format!("`{model}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            " model candidates {models}, the first being the default. They are a fact, not an \
+             instruction: whether to switch model is your decision, and Remuda never switches \
+             it for you. `remuda lineage profile show` reads the profile again.\n\n"
+        ));
+    }
 
     out.push_str(
         "Any seat:\n\

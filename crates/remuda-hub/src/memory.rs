@@ -2778,6 +2778,7 @@ mod tests {
                     chapter_cause: crate::store::OWNER_RESUME_CAUSE.into(),
                     from_states: &["starting", "running", "paused"],
                     restart: None,
+                    profile: None,
                 })
                 .await
                 .unwrap()

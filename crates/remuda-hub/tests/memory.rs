@@ -88,6 +88,7 @@ impl Ctx {
                 chapter_cause: remuda_hub::store_test_support::OWNER_RESUME_CAUSE.into(),
                 from_states: &["starting", "running", "paused"],
                 restart: None,
+                profile: None,
             })
             .await?;
         match outcome {

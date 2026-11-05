@@ -63,8 +63,10 @@ wire_enum!(LaunchUnavailableReason, "5.5", {
 });
 
 impl LaunchUnavailableReason {
-    /// Whether this category refuses the launch. Only a configured item that
-    /// exists but cannot be read does (main-agent.md §3.4.2).
+    /// Whether this category refuses the launch on its own. Only a configured
+    /// item that exists but cannot be read does (main-agent.md §3.4.2); a
+    /// `computer-use` refused by a D-045 gate refuses too, through the
+    /// snapshot's `refusal`, whatever its category.
     #[must_use]
     pub fn refuses(self) -> bool {
         self == Self::Unreadable
@@ -73,6 +75,12 @@ impl LaunchUnavailableReason {
 
 /// The refusal reason a launch with an unreadable configured item carries.
 pub const LAUNCH_CAPABILITY_UNREADABLE: &str = "launch-capability-unreadable";
+/// The refusal reason when a D-045 gate refuses `computer-use` for this
+/// launch's origin or permission mode (r2).
+pub const LAUNCH_CAPABILITY_NOT_PERMITTED: &str = "launch-capability-not-permitted";
+/// The refusal reason when the harness or carrier cannot deliver
+/// `computer-use` (r2).
+pub const LAUNCH_CAPABILITY_UNSUPPORTED: &str = "launch-capability-unsupported";
 
 /// One configured item; §5.5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

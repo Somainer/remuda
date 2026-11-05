@@ -678,3 +678,62 @@ fn an_oversized_file_is_refused_before_it_is_read() {
         Err(LaunchUnavailableReason::TooLarge)
     );
 }
+
+/// r2 item 4: a `computer-use` the D-045 gates refuse refuses the launch in
+/// the event too: `refusal` names the gate, never null.
+#[test]
+fn a_gated_computer_use_sets_the_refusal() {
+    let at = root();
+    let mut spec = spec(DriverKind::ClaudeSdk, AgentKind::Claude);
+    spec.permission_mode = serde_json::from_value(serde_json::json!({
+        "kind": "claude", "mode": "bypassPermissions", "interaction": "host"
+    }))
+    .unwrap();
+    let capabilities = vec!["computer-use".to_owned()];
+    let snap = snapshot(&SnapshotRequest {
+        launch: LaunchCapabilitiesLaunch::Create,
+        kind: AgentKind::Claude,
+        driver: DriverKind::ClaudeSdk,
+        origin: LaunchOrigin::Human,
+        permission: &spec.permission_mode,
+        capabilities: &capabilities,
+        args: &[],
+        skills: &[],
+        skill_context: None,
+        cwd: at.dir.path(),
+        launch_dir: &at.launch,
+        native_home: &at.home,
+        native_home_managed: true,
+    })
+    .unwrap();
+    assert_eq!(
+        snap.payload.unavailable[0].reason,
+        LaunchUnavailableReason::NotPermitted
+    );
+    let refusal = snap.payload.refusal.expect("the gate refuses the launch");
+    assert_eq!(refusal.reason, "launch-capability-not-permitted");
+    assert!(
+        refusal.next.hint.contains("computer-use"),
+        "{}",
+        refusal.next.hint
+    );
+
+    let mut ask = Ask::new(DriverKind::GenericPty, AgentKind::Codex);
+    ask.capabilities = capabilities.clone();
+    let payload = ask.run(&at).payload;
+    assert_eq!(
+        payload.unavailable[0].reason,
+        LaunchUnavailableReason::UnsupportedByHarness
+    );
+    assert_eq!(
+        payload.refusal.expect("refused").reason,
+        "launch-capability-unsupported"
+    );
+    // A configured skill a harness cannot read is unsupported too, and
+    // still never refuses.
+    let at = root();
+    let source = skill_source(at.dir.path(), "kit");
+    let mut ask = Ask::new(DriverKind::GenericPty, AgentKind::Codex);
+    ask.skills = vec![source.to_string_lossy().into_owned()];
+    assert!(ask.run(&at).payload.refusal.is_none());
+}

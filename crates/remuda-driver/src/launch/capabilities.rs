@@ -21,11 +21,12 @@ use crate::launch::remuda_skill::{self, SectionDelivery, SkillContext, SkillTree
 use crate::launch::skills::{self, CAPABILITY_COMPUTER_USE, native_home_is_shared};
 use crate::materializer::LaunchOrigin;
 use remuda_protocol::{
-    AgentKind, ApprovalPolicy, ClaudePermissionMode, DriverKind, LAUNCH_CAPABILITY_UNREADABLE,
-    LaunchCapabilitiesLaunch, LaunchCapabilitiesPayload, LaunchConfiguredItem, LaunchItemClass,
-    LaunchItemRoot, LaunchItemSource, LaunchItemVia, LaunchRefusal, LaunchRefusalNext,
-    LaunchResolvedItem, LaunchSkipReason, LaunchSkippedItem, LaunchUnavailableItem,
-    LaunchUnavailableReason, PermissionMode,
+    AgentKind, ApprovalPolicy, ClaudePermissionMode, DriverKind, LAUNCH_CAPABILITY_NOT_PERMITTED,
+    LAUNCH_CAPABILITY_UNREADABLE, LAUNCH_CAPABILITY_UNSUPPORTED, LaunchCapabilitiesLaunch,
+    LaunchCapabilitiesPayload, LaunchConfiguredItem, LaunchItemClass, LaunchItemRoot,
+    LaunchItemSource, LaunchItemVia, LaunchRefusal, LaunchRefusalNext, LaunchResolvedItem,
+    LaunchSkipReason, LaunchSkippedItem, LaunchUnavailableItem, LaunchUnavailableReason,
+    PermissionMode,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -209,7 +210,7 @@ pub fn snapshot(request: &SnapshotRequest<'_>) -> Option<LaunchSnapshot> {
     let (claude_argv, reads_skills) =
         skill_reader(request.driver, request.kind, request.native_home);
     remuda_skill_items(request, claude_argv, reads_skills, &mut lists);
-    computer_use_items(request, &mut lists);
+    let gated = computer_use_items(request, &mut lists);
     mcp_config_items(request, &mut lists);
     let skills = configured_skill_items(request, reads_skills, &mut lists);
 
@@ -218,24 +219,53 @@ pub fn snapshot(request: &SnapshotRequest<'_>) -> Option<LaunchSnapshot> {
         .iter()
         .filter(|item| item.reason.refuses())
         .collect();
-    let refusal = (!refusing.is_empty()).then(|| {
-        let names = refusing
-            .iter()
-            .map(|item| format!("{} {:?}", class_word(item.class), item.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        LaunchRefusal {
-            reason: LAUNCH_CAPABILITY_UNREADABLE.to_owned(),
-            next: LaunchRefusalNext {
-                action: "ask-owner".to_owned(),
-                hint: format!(
-                    "the configured {names} exists but the Node's user cannot read it; make it \
+    let refusal = (!refusing.is_empty())
+        .then(|| {
+            let names = refusing
+                .iter()
+                .map(|item| format!("{} {:?}", class_word(item.class), item.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            LaunchRefusal {
+                reason: LAUNCH_CAPABILITY_UNREADABLE.to_owned(),
+                next: LaunchRefusalNext {
+                    action: "ask-owner".to_owned(),
+                    hint: format!(
+                        "the configured {names} exists but the Node's user cannot read it; make it \
                      readable, or remove it from the launch (the lineage profile's skills, or \
                      the create's skills or args), then launch again"
-                ),
-            },
-        }
-    });
+                    ),
+                },
+            }
+        })
+        // r2 item 4: the D-045 gates refuse the launch in the materializer
+        // anyway; the event says so instead of leaving `refusal` null.
+        .or_else(|| {
+            gated.map(|reason| {
+                let (code, why) = match reason {
+                    LaunchUnavailableReason::NotPermitted => (
+                        LAUNCH_CAPABILITY_NOT_PERMITTED,
+                        "an agent-originated launch may not grant it, and it never goes with \
+                     unattended (skipped) tool approvals",
+                    ),
+                    _ => (
+                        LAUNCH_CAPABILITY_UNSUPPORTED,
+                        "this harness or carrier cannot deliver it (claude, or codex on shell-pty \
+                     with hooks)",
+                    ),
+                };
+                LaunchRefusal {
+                    reason: code.to_owned(),
+                    next: LaunchRefusalNext {
+                        action: "ask-owner".to_owned(),
+                        hint: format!(
+                            "the \"computer-use\" capability cannot run on this launch: {why}; \
+                         remove it, or change the permission mode or carrier, then launch again"
+                        ),
+                    },
+                }
+            })
+        });
     let refused = refusal.is_some();
     let profile_revision = request
         .skill_context
@@ -321,7 +351,10 @@ fn remuda_skill_items(
 /// `computer-use` (D-045): the capability, its embedded skill tree and its MCP
 /// server. The gates are the materializer's; a launch they refuse is refused
 /// there exactly as before, and the event names the category.
-fn computer_use_items(request: &SnapshotRequest<'_>, lists: &mut Lists) {
+fn computer_use_items(
+    request: &SnapshotRequest<'_>,
+    lists: &mut Lists,
+) -> Option<LaunchUnavailableReason> {
     for value in request.capabilities {
         lists.configure(LaunchItemClass::Capability, value, LaunchItemSource::Spec);
         if value != CAPABILITY_COMPUTER_USE {
@@ -337,7 +370,7 @@ fn computer_use_items(request: &SnapshotRequest<'_>, lists: &mut Lists) {
         .iter()
         .any(|value| value == CAPABILITY_COMPUTER_USE)
     {
-        return;
+        return None;
     }
     let skill = skills::SKILL_DIR;
     let server = skills::MCP_SERVER_NAME;
@@ -355,7 +388,7 @@ fn computer_use_items(request: &SnapshotRequest<'_>, lists: &mut Lists) {
         ] {
             lists.unavailable(class, name, reason);
         }
-        return;
+        return Some(reason);
     }
     let via = if request.kind == AgentKind::Claude {
         LaunchItemVia::Argv
@@ -402,6 +435,7 @@ fn computer_use_items(request: &SnapshotRequest<'_>, lists: &mut Lists) {
         None,
         via,
     );
+    None
 }
 
 /// The category the D-045 gates give a requested `computer-use`, if any.

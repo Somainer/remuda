@@ -1404,3 +1404,59 @@ async fn a_claim_row_with_no_recorded_process_ends_at_reattach() {
     assert!(pane_writes(&harness).is_empty());
     assert!(harness.destructive_calls().is_empty());
 }
+
+#[tokio::test]
+async fn a_process_replaced_after_the_text_gets_no_enter() {
+    let harness = Harness::new().await;
+    harness.node.set_herdr_claim_poll(Duration::from_secs(3600));
+    let agent = sleeper();
+    set_process(&harness, "w1:p2", agent.id(), "codex", None).await;
+    let id = claim_codex_on_p2(&harness).await.meta.id;
+    harness.wait_call("terminal.control", "w1:p2").await;
+    wait_first_probe(&harness, "w1:p2").await;
+    // The agent exits and a shell takes the pane exactly while the prompt's
+    // text is typed: the text has gone, its Enter must not follow.
+    let shell = sleeper();
+    harness
+        .client()
+        .call_raw(
+            "fake.replace_process_on_text",
+            json!({"pane_id": "w1:p2", "pid": shell.id(), "name": "bash"}),
+        )
+        .await
+        .expect("arm the replacement");
+    harness.clear_calls();
+    crate::transport::hubnode::dispatch_method(
+        &harness.node,
+        "instance.send",
+        json!({"instanceId": id.as_id().as_str(), "input": {"type": "prompt", "text": "rm -rf x"},
+               "origin": "human"}),
+    )
+    .await
+    .expect("send accepted");
+    harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
+    let journal = harness.journal(&id);
+    assert!(journal.contains(REASON_PROCESS_GONE), "{journal}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let methods: Vec<String> = harness
+        .calls()
+        .iter()
+        .filter_map(|call| call["method"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| *method == "pane.send_text")
+            .count(),
+        1,
+        "{methods:?}"
+    );
+    assert!(
+        !methods.iter().any(|method| matches!(
+            method.as_str(),
+            "pane.send_keys" | "terminal.input" | "agent.prompt"
+        )),
+        "the Enter reached the replacing process: {methods:?}"
+    );
+    drop((agent, shell));
+}

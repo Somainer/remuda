@@ -1037,6 +1037,10 @@ struct State {
     /// D-062 r3: panes whose `pane.process_info` fails (`true`: answers with
     /// no `process_info` at all) while the session snapshot still answers.
     pane_process_failure: HashMap<String, bool>,
+    /// D-062 r4: a foreground process that takes over the pane the moment a
+    /// `pane.send_text` reaches it (`fake.replace_process_on_text`), so a
+    /// test can replace the process between the text and its Enter.
+    pane_process_on_text: HashMap<String, (u32, String)>,
     /// JSONL append target recording the `env` map every `workspace.create`
     /// and `pane.split` actually received — the only place a driver test can
     /// assert on the pane environment the launch produced (the recipe's
@@ -1102,6 +1106,7 @@ impl State {
             pane_process: HashMap::new(),
             pane_shell: HashMap::new(),
             pane_process_failure: HashMap::new(),
+            pane_process_on_text: HashMap::new(),
         }
     }
 
@@ -1457,6 +1462,30 @@ fn handle_rpc(
                 st.pane_shell.remove(pane_id);
                 st.pane_process_failure.remove(pane_id);
             }
+            ok()
+        }
+        // D-062 r4: `{pane_id, pid, name}` — the next `pane.send_text` to the
+        // pane makes `pid` its foreground process.
+        "fake.replace_process_on_text" => {
+            let pane_id = req
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .ok_or(("invalid_request", "missing pane_id".to_string()))?;
+            let pid = req
+                .params
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .ok_or(("invalid_request", "missing pid".to_string()))?;
+            let name = req
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("process")
+                .to_string();
+            st.pane_process_on_text
+                .insert(pane_id.to_string(), (pid, name));
             ok()
         }
         // D-062 r3: `{pane_id, none?}` — `pane.process_info` for the pane
@@ -1816,6 +1845,9 @@ fn pane_send_text(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .entry(pane_id.to_string())
         .or_default()
         .push_str(text);
+    if let Some(process) = st.pane_process_on_text.remove(pane_id) {
+        st.pane_process.insert(pane_id.to_string(), process);
+    }
     ok()
 }
 

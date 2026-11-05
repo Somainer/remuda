@@ -184,7 +184,16 @@ write, the Node re-reads `pane.process_info` and the kernel start time and
 compares them with the recorded identity (§2). A mismatch ends the claim
 (`herdr-process-gone`, §6) and the write is dropped; an unknown answer (below)
 refuses the write. The TTY bridge carries this check itself (a write guard on
-the bridge), and the claimed driver never hands out an unguarded bridge.
+the bridge), and the claimed driver never hands out an unguarded bridge. A
+send typed as text (no herdr agent in the pane) is checked once more between
+the text and the Enter that submits it, and a mismatch drops the Enter (round
+4).
+
+This narrows the window, it does not close it: between a re-check and the
+herdr call that writes there are a few RPCs, so a process that replaces the
+claimed one in exactly that span can still receive the typed text (without
+its Enter) or TTY bytes already queued behind the check. herdr offers no
+"write only if this process is still in the foreground" call to close it.
 
 ## 6. Liveness, end and restart
 

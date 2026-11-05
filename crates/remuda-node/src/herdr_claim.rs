@@ -941,6 +941,10 @@ impl ClaimedPane {
             .pane_send_text(&self.claim.pane_id, prompt)
             .await
             .map_err(|error| pane_error("pane.send_text", &error))?;
+        // D-062 r4 item 3: the text alone runs nothing; check again before the
+        // Enter that would submit it, and drop the Enter (ending the claim)
+        // if the claimed process was replaced while the text was typed.
+        self.admit_write().await?;
         client
             .pane_send_keys(&self.claim.pane_id, vec!["enter".into()])
             .await

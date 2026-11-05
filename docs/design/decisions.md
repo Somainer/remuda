@@ -2432,8 +2432,11 @@ pane, its process or its server.
    host); the Hub checks its own rows first.
 6. **Liveness and end.** The Node polls each claim every 2 s and, in
    addition, re-checks the claimed process before every send, keystroke and
-   raw TTY input write, so a write in the window between two probes never
-   reaches a process that replaced it. Pane gone ends the instance `exited`
+   raw TTY input write, and again between a send's text and the Enter that
+   submits it. That narrows the window in which a write can reach a process
+   that replaced the claimed one from the 2 s poll to the few RPCs between a
+   re-check and herdr's send; it does not close it (the typed text of a send,
+   or TTY bytes already queued behind the check, can still land there). Pane gone ends the instance `exited`
    with `herdr-pane-gone`. Process gone — the process now in the claimed role
    (foreground leader for an agent, the shell for a shell claim) is not the
    recorded pid **with** the recorded kernel start time, so a changed leader

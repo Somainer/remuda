@@ -38,6 +38,10 @@ linux-gnu:
 gen-types:
     cargo run --locked -p remuda-protocol --example gen_types
 
+# Regenerate the machine half of the agent-parity ledger (D-060 §12).
+gen-parity:
+    cargo run --locked -p remuda --example gen_parity
+
 accept-m0:
     ./scripts/acceptance/m0.sh --mode stub --herdr-session remuda-test
 

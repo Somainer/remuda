@@ -1,0 +1,1662 @@
+{
+  "about": "Generated from the Hub route registrations and agent_route_admission (crates/remuda-hub), the documented OpenAPI, and the remuda clap tree. Do not edit; run `cargo run -p remuda --example gen_parity`.",
+  "notes": [
+    "routes: every `.route(..)` registration under crates/remuda-hub/src (recursively), unioned with the documented OpenAPI paths; the latter alone carries the nest-mounted /push carrier.",
+    "middleware: the verdict of remuda_hub::agent_route_admission, the predicate restrict_agent_routes calls for every Agent-origin request. `admitted` means the middleware passes it to the handler; `owner-scoped` adds the named ownership check; `refused` is the middleware's 403; `skipped` means the middleware resolves no caller (a login, Node-link or health path, the Node object pull, or the Node host-file staging endpoint) and the handler decides.",
+    "handler: a gate the handler calls unconditionally at its top level, or one a same-module helper it calls unconditionally does (at most two hops). A gate inside a branch, or one the scan cannot follow, is `handler-checked`: the scan reports only what the source states, and `handler-checked` is not a claim that the handler admits the route.",
+    "commands: the clap tree from Command::get_subcommands. hubRoutes is empty because the clap registry records an argv shape, not the REST calls a command makes; the human half's Hub route column is that record."
+  ],
+  "routes": [
+    {
+      "method": "DELETE",
+      "path": "/push/subscriptions",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/auth/passkeys/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/devices/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/hosts/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/hosts/{id}/workspaces",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/instances/{id}",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/lineages/{id}/memory/entries/{slug}",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/lineages/{id}/wake-ups/{wake}",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/projects/{id}",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/projects/{id}/members",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/providers/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/tasks/{id}/own",
+      "middleware": "admitted",
+      "handler": "grant: dispatch"
+    },
+    {
+      "method": "GET",
+      "path": "/healthz",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/node/v1/connect",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/push/config",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/attachments",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/attachments/{objectId}/content",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/auth/passkeys",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/board",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/bot/card-tickets",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/caller",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/commands",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/fleet/{id}",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/follow",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/gate/jobs",
+      "middleware": "refused",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/gate/logs/{id}",
+      "middleware": "refused",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/dirs",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/doctor",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/files",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/herdr",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/hostcap",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/workspaces",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/workspaces/{workspaceId}/changes",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}",
+      "middleware": "owner-scoped",
+      "owned": "instance",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/commands",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/commands/{commandId}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/config",
+      "middleware": "owner-scoped",
+      "owned": "instance",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/journal",
+      "middleware": "owner-scoped",
+      "owned": "instance",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/memory-writes",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/screen",
+      "middleware": "owner-scoped",
+      "owned": "instance",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/subagents/{agentId}/transcript",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/usage",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/interactions",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/glance",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/inbox",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/memory",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/memory/entries/{slug}",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/memory/index",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/memory/search",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/profile",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/lineages/{id}/wake-ups",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/memory/derived",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/node",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/objects/{id}",
+      "middleware": "skipped",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/own",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/owner/glance",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/owner/notices",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{id}",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{id}/gate",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/projects/{id}/gate/jobs/{jobId}",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/providers",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/providers/{id}",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/providers/{id}/supply",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/providers/{id}/usage",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/supply/catalog",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/{id}",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/{id}/placements",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workers",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workers/{id}",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/workers/{id}/digest",
+      "middleware": "owner-scoped",
+      "owned": "worker",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/worktrees",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/auth/passkeys/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/commands/{id}",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/hosts/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/instances/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/lineages/{id}/inbox",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/projects/{id}",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/providers/{id}",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/tasks/{id}",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/push/subscriptions",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/passkeys/login/finish",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/passkeys/login/start",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/passkeys/register/finish",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/auth/passkeys/register/start",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bot/card-tickets",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bot/card-tickets/expire-session",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bot/card-tickets/{id}/state",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/bot/owner-allowlist",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/commands/{id}/withdraw",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/pair",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/pair-code",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fleet/broadcast",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fleet/instances",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/fleet/{id}/commands",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/enroll-token",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/ssh",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/{id}/files/objects",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/{id}/files/read",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/{id}/files/search",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/hosts/{id}/workspaces",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/claim",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/{id}/commands",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/{id}/mcp-token",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/{id}/release",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/{id}/resume",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/instances/{id}/seen",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/interactions/{id}/answer",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/lineages/{id}/memory",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/lineages/{id}/memory/consolidate",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/lineages/{id}/memory/import",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/lineages/{id}/memory/restore",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/lineages/{id}/wake-ups",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/login",
+      "middleware": "skipped",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/objects",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/own/check",
+      "middleware": "admitted",
+      "handler": "scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/owner/notices/{id}/ack",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/owner/notify",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/placement/resolve",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{id}/gate",
+      "middleware": "admitted",
+      "handler": "grant: dispatch, land; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{id}/gate/jobs/{jobId}/cancel",
+      "middleware": "admitted",
+      "handler": "grant: dispatch, land; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{id}/gate/jobs/{jobId}/resolve",
+      "middleware": "admitted",
+      "handler": "operator-only; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence",
+      "middleware": "admitted",
+      "handler": "operator-only; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/projects/{id}/members",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/providers",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/providers/discover",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/providers/{id}/supply/events",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/providers/{id}/test",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/supply/resolve",
+      "middleware": "refused",
+      "handler": "operator-only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/archive",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/land",
+      "middleware": "admitted",
+      "handler": "grant: land"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/own",
+      "middleware": "admitted",
+      "handler": "grant: dispatch"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/placements",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/{id}/split",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/dispatch",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/observe",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/answer",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/brief",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/nudge",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/replace",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/resume",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/retire",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/state",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/stop",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/workers/{id}/switch-model",
+      "middleware": "admitted",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/worktrees",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/worktrees/{name}/lease",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/worktrees/{name}/return",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/lineages/{id}/memory/entries/{slug}",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/lineages/{id}/profile",
+      "middleware": "owner-scoped",
+      "owned": "lineage",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/providers/{id}/supply",
+      "middleware": "refused",
+      "handler": "handler-checked"
+    }
+  ],
+  "commands": [
+    {
+      "path": "agents",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "brief",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "brief lint",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "brief send",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd deliver",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd edit",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd ls",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd withdraw",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "dev",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "dispatch",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "dispatcher",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "doctor",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "fleet",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "fleet keys",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "fleet run",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "fleet send",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "gate",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "gate cancel",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "gate list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "gate log",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "glance",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "hook",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "hook emit",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "hook launch",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "host",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "host files",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "host files get",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "host files list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "host files search",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "host herdr",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "host herdr list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "hostcap",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "hub",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "hub rotate-bootstrap",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance claim",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance config",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance configure",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance create",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance keys",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance read",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance release",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance respond",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance rm",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance send",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance set",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance show",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance stop",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance wait",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "journal",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "journal diff",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "land",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile set",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "lineage profile show",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "mcp",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory consolidate",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory import",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory index",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory read",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory restore",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory rm",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory search",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "memory write",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "merge",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "node bridge",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node daemon",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node install",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node run",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node status",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "node uninstall",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "own",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "own check",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "own claim",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "own list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "own release",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "owner",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "owner notify",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile catalog",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile declare",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile delivery",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile event",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile probe",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile show",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "profile usage",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "project add-member",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project create",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project remove-member",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project set",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "project show",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "report",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "retire",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "ssh",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "ssh bootstrap",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "ssh list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "ssh node",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "ssh probe",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "task",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "task add",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "task list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "task set-state",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "task show",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "task split",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "version",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "wake",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "wake add",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "wake list",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "wake rm",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "watch",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker answer",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker digest",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker nudge",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker replace",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker resume",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker stop",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worker switch-model",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worktree",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "worktree create",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worktree ls",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worktree prune",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "worktree rm",
+      "group": false,
+      "hubRoutes": []
+    }
+  ]
+}

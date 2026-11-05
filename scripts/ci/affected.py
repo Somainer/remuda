@@ -5,6 +5,15 @@ import json
 from pathlib import Path
 import subprocess
 
+# Paths outside any crate directory that a crate's tests read. A change to
+# either half of the agent-parity ledger must run the crates that check it:
+# `crates/remuda/tests/agent_parity.rs` and `remuda-driver`'s
+# `tests/remuda_skill.rs` (which parses agent-parity.md).
+LEDGER_CRATES = {
+    "docs/design/agent-parity.md": ("remuda", "remuda-driver"),
+    "docs/design/agent-parity.generated.json": ("remuda",),
+}
+
 
 def select_crates(metadata, changed_paths):
     """Return sorted workspace names and why; include every reverse dependency.
@@ -31,6 +40,17 @@ def select_crates(metadata, changed_paths):
             raise ValueError(f"expected a repository-relative changed path: {raw_path}")
         if str(path) in {"Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml"}:
             return all_names, f"shared input: {path}"
+        if str(path) in LEDGER_CRATES:
+            # The ledger's readers live in tests, not under a crate directory:
+            # without this, `--affected` would skip the drift check
+            # (`crates/remuda/tests/agent_parity.rs`) and the skill test when
+            # only the ledger changed.
+            for name in LEDGER_CRATES[str(path)]:
+                owner = next((package["id"] for package in packages.values()
+                              if package["name"] == name), None)
+                if owner is not None:
+                    changed.add(owner)
+            continue
         owner = next((owner for directory, owner in directories
                       if path.is_relative_to(directory)), None)
         if owner is not None:

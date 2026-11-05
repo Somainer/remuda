@@ -1072,6 +1072,19 @@ An agent that wants a fresh context writes a handoff and closes itself. Phase 3 
 
 A self-close is refused with 409 and a reason while the chapter has a pending interaction or an in-flight D-017 approval (D-060 decision 10; part of `ma-restart`). This follows Cindy's canonical-replacement guard (`apps/desktop/src/main/maker-ipc/botCanonicalReplacementGuard.ts`).
 
+### 12.7 Journal search (cb-search, 2026-11-05)
+
+Memory holds what the seat chose to keep. Journal search finds what was actually said: a phrase a worker wrote two chapters ago, a tool result, the owner's words. It writes nothing and decides nothing. Route, CLI and limits: protocol.md §8.4.
+
+- **Search versus memory.** Search a fact the seat may have seen but did not store (`remuda search <words>`), then read the rows around the hit (`remuda instance read <instance> --after-seq <seq−1>`). When the answer is something the next chapter must know without searching, write a memory entry (§12.2) with the hit as its source (`--source <instance>:<seq>`). Search never replaces the index: the index arrives at chapter start, search only answers when asked.
+- **Scope is the journal read predicate.** A hit is returned only when the caller could read that instance's journal (`owns()` for an Agent: its own lineage's chapters and the instances its chapters dispatched; everything for a Human). The predicate is joined in the SQL before ranking and the limit, so foreign hits can neither hide your hits nor show up in a count.
+- **What is indexed.** Message text (user and assistant, the complete form of each message, at most 32 KiB), tool names and inputs (at most 2 KiB), and final tool results (at most 2 KiB), one indexed row per message or tool node (the latest). Secrets are redacted before indexing (`digest::redact_secrets`), so a redacted credential cannot be found. Thoughts, lifecycle and usage events are not indexed.
+- **Table and migration.** `journal_search_docs` (instance, seq, node, kind, role, observed time, redacted text) with an external-content FTS5 table `journal_fts` (`porter unicode61`, as memory), created at `user_version` 7 with no rows. A background job indexes the existing journal in primary-key order, at most 2000 rows per writer job, recording its high-water mark in `journal_search_backfill`; it resumes from the mark after a crash or restart, and `remuda search --status` shows its progress. New rows are indexed in the journal append transaction.
+- **Query.** FTS5 bm25 with memory's quoting (user text never becomes FTS syntax), then a `LIKE` pass for CJK and short terms; at most 50 hits, snippets of at most 200 characters, a 1.5 s budget (`partial: true` past it).
+- **Retention.** A trigger on `journal` deletes a row's index entry in the same transaction as the row, so deleting or purging an instance removes its hits. `scripts/hub-backup.sh` copies `hub.sqlite` whole, so a backup carries the index and its high-water mark and a restore needs no rebuild.
+- **Logs** carry counts and timings only, never the query or a snippet.
+- **PWA.** A search box on the desktop session list lists the hits; a hit opens `/s/:id/events?seq=<seq>`, the events tab scrolled to that row.
+
 ## 13 Phase 1 wire and state budget
 
 **State.**

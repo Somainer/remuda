@@ -180,6 +180,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `cmd ls` | `GET /v1/commands?mine=1&state=queued` | Agent route. The caller's own queued commands (Hub-stamped initiator) | — |
 | `cmd edit` | `PATCH /v1/commands/{id}` | Agent route. Own `instance.send` commands while provably undelivered; the send rule on the target | — |
 | `cmd withdraw` | `POST /v1/commands/{id}/withdraw` | Agent route. As `cmd edit`; a queued configure is withdrawn, then resent under a new commandId | — |
+| `cmd deliver` | commands, `instance.send`: the D-055 same-id re-POST of a Hub-held send | Agent route. The send rule; the Hub forwards a still-queued row once, with its edited text | — |
 
 ### Projects, tasks and ownership
 

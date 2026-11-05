@@ -684,6 +684,7 @@ async fn handle_stdio_frame(
             || crate::worktree::is_worktree_method(request.method.as_str())
             || crate::worker::is_worker_method(request.method.as_str())
             || crate::gate::is_gate_method(request.method.as_str())
+            || crate::wake_check::is_wake_check_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str())
             // D-057 §7.6: the lineage fence applies over every carrier.
             || request.method == remuda_protocol::METHOD_LINEAGE_FENCE

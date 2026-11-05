@@ -257,6 +257,10 @@ pub async fn dispatch_frame(
     if crate::gate::is_gate_method(method) {
         return node.dispatch_gate_rpc(method, &params).await;
     }
+    // cb-wake-check: a wake-up's check, on every carrier.
+    if crate::wake_check::is_wake_check_method(method) {
+        return node.wake_check_rpc(&params).await;
+    }
     if crate::workspace_scm::is_scm_method(method) {
         return crate::workspace_scm::handle_rpc_capped(node, method, &params).await;
     }

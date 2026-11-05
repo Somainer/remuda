@@ -2731,6 +2731,12 @@ impl Store {
                             crate::inbox::drain_sources(&mut conn);
                             // cb-wake-engine: wake results this job queued
                             // (their notices join the outbox below).
+                            // cb-wake-check r2: check reports first (applying
+                            // one may queue a result).
+                            crate::wake::drain_check_reports(
+                                &mut conn,
+                                time::OffsetDateTime::now_utc(),
+                            );
                             crate::wake::drain_outcomes(&mut conn, time::OffsetDateTime::now_utc());
                             // cb-inbox-deliver: the lineages whose delivery
                             // gate this job's state changes may have opened.

@@ -571,6 +571,7 @@ fn parent_routed(kind: InboxFactKind) -> bool {
             | InboxFactKind::HostOnline
             | InboxFactKind::HostOffline
             | InboxFactKind::WakeDue
+            | InboxFactKind::WakeFailed
             | InboxFactKind::ContextThreshold
     )
 }
@@ -868,6 +869,20 @@ fn line(conn: &Connection, row: &Waiting) -> Result<Line, StoreError> {
             "task {}'s wall budget of {} min expired at {at}; {who} keeps running.",
             voice::token(text_at(p, "taskId").unwrap_or("?")),
             p.get("maxWallMins").and_then(Value::as_i64).unwrap_or(0)
+        ),
+        // cb-wake-check: the run's check failed, so the run did not happen.
+        // Every field is the Hub's own; the check's output is not carried.
+        InboxFactKind::WakeFailed => format!(
+            "wake-up {} {}: its check on host {} failed ({}{}) at {at}; run {} did not happen.",
+            voice::token(text_at(p, "wakeId").unwrap_or("?")),
+            voice::token(text_at(p, "name").unwrap_or("?")),
+            voice::token(text_at(p, "hostId").unwrap_or("?")),
+            voice::token(text_at(p, "failureKind").unwrap_or("?")),
+            match p.get("checkExit").and_then(Value::as_i64) {
+                Some(code) => format!(", exit {code}"),
+                None => String::new(),
+            },
+            voice::token(text_at(p, "runId").unwrap_or("?")),
         ),
         InboxFactKind::WakeDue | InboxFactKind::ContextThreshold => {
             format!("{who}: {} at {at}.", row.kind.as_str())

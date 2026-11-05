@@ -6291,7 +6291,8 @@
           "stalled",
           "budget-expired",
           "wake-due",
-          "context-threshold"
+          "context-threshold",
+          "wake-failed"
         ],
         "type": "string"
       },
@@ -6788,7 +6789,7 @@
         "type": "object"
       },
       "WakeWhen": {
-        "description": "Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due cannot be a condition; context-threshold is refused (422 condition-unsupported) because nothing records it yet.",
+        "description": "Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due and wake-failed cannot be a condition (a wake-up's own runs record them); context-threshold is refused (422 condition-unsupported) because nothing records it yet.",
         "properties": {
           "kind": {
             "const": "when",
@@ -6836,7 +6837,7 @@
             "$ref": "#/components/schemas/WakeTrigger"
           },
           "check": {
-            "description": "Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported."
+            "$ref": "#/components/schemas/WakeCheckRequest"
           },
           "mode": {
             "$ref": "#/components/schemas/WakeMode"
@@ -6849,6 +6850,117 @@
           "text",
           "trigger",
           "notify"
+        ],
+        "type": "object"
+      },
+      "WakeCheckRequest": {
+        "additionalProperties": false,
+        "description": "The optional check (main-agent.md §11.2): a shell command one Node runs before each run, under a mandatory timeout, after an sh -n precheck. Exit 0 lets the run happen with the check's bounded stdout as its summary; exit 2 skips it; anything else, or the timeout, fails it. Admitted on the OA1 axis: an Agent adds one without the owner's approval only on its own host while it runs with its harness's permission control off; any other check needs the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED, then the same add with x-remuda-approval-id). The owner's own add is admitted on the host it names.",
+        "properties": {
+          "command": {
+            "description": "The shell command (sh -c), at most 2000 characters; required. The secret lint runs over it (422 WAKE_SECRET_REJECTED, field check.command, never echoed).",
+            "type": "string"
+          },
+          "hostId": {
+            "description": "The Node it runs on, a host in the lineage's scope (403 out-of-scope otherwise). An Agent may omit it for its own host; the owner must name it (400). The lineage must have a workspace there (409 check-no-workspace).",
+            "type": "string"
+          },
+          "timeoutSecs": {
+            "description": "1..=3600 seconds; required, there is no default (400 when missing).",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "WakeCheck": {
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "hostId": {
+            "description": "Fixed when it was added.",
+            "type": "string"
+          },
+          "timeoutSecs": {
+            "type": "integer"
+          },
+          "admission": {
+            "$ref": "#/components/schemas/WakeCheckAdmission"
+          },
+          "approvalId": {
+            "description": "The owner's approval that admitted it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "hostId",
+          "timeoutSecs",
+          "admission"
+        ],
+        "type": "object"
+      },
+      "WakeCheckAdmission": {
+        "description": "owner (the owner added it), own-host-bypass (an Agent on its own host, running with its harness's permission control off) or approved (the owner's one-shot approval).",
+        "enum": [
+          "owner",
+          "own-host-bypass",
+          "approved"
+        ],
+        "type": "string"
+      },
+      "WakeCheckState": {
+        "description": "pending (waiting for its host), running, passed (exit 0), skipped (exit 2), failed, or interrupted (the Hub or the Node restarted while it ran; never run again).",
+        "enum": [
+          "pending",
+          "running",
+          "passed",
+          "skipped",
+          "failed",
+          "interrupted"
+        ],
+        "type": "string"
+      },
+      "WakeCheckContainment": {
+        "description": "How a check's processes were contained once it ended (cleanup, not a security boundary: a check runs with its admitter's authority, so a survivor escalates nothing): cgroup (every process still in its verified per-check cgroup v2 domain killed; one that moved itself into a writable ancestor such as the Node's delegated cgroup, cleared its marker and killed its supervisor can outlive it), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.",
+        "enum": [
+          "cgroup",
+          "subreaper",
+          "process-group"
+        ],
+        "type": "string"
+      },
+      "WakeRunCheck": {
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/WakeCheckState"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "summary": {
+            "description": "How it exited, in a few words (exit 1, timed out after 30 s, syntax error); never its stderr.",
+            "type": "string"
+          },
+          "output": {
+            "description": "Its stdout, at most 4096 bytes. Untrusted data.",
+            "type": "string"
+          },
+          "outputTruncated": {
+            "description": "The stdout was longer and was cut.",
+            "type": "boolean"
+          },
+          "containment": {
+            "$ref": "#/components/schemas/WakeCheckContainment"
+          },
+          "containmentIncomplete": {
+            "description": "The sweep stopped at its hard limit with processes the kernel could not kill still live.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "state",
+          "hostId"
         ],
         "type": "object"
       },
@@ -6889,7 +7001,7 @@
             "$ref": "#/components/schemas/WakeTrigger"
           },
           "check": {
-            "description": "Reserved; always absent."
+            "$ref": "#/components/schemas/WakeCheck"
           },
           "mode": {
             "$ref": "#/components/schemas/WakeMode"
@@ -6920,6 +7032,11 @@
           "lastFiredAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "lastRunAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When its latest real run fired: one without a check, or whose check passed (exit 0). A skipped or failed check leaves it as it was."
           },
           "creator": {
             "$ref": "#/components/schemas/WakeCreator"
@@ -6979,11 +7096,14 @@
             "format": "date-time"
           },
           "checkExit": {
-            "description": "The optional check's exit code; null until the check exists.",
+            "description": "The check's exit code; null without a check, before it exits, and when it timed out, was refused by sh -n or could not start.",
             "type": [
               "integer",
               "null"
             ]
+          },
+          "check": {
+            "$ref": "#/components/schemas/WakeRunCheck"
           },
           "factId": {
             "description": "The wake-due inbox row (persistent mode).",
@@ -7002,7 +7122,7 @@
             "type": "integer"
           },
           "failureKind": {
-            "description": "not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed or child-ended.",
+            "description": "not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax, check-unavailable, check-no-workspace or check-cwd-unusable.",
             "type": "string"
           }
         },
@@ -14798,7 +14918,7 @@
       "post": {
         "operationId": "addLineageWakeUp",
         "summary": "Add a wake-up (`remuda wake add`)",
-        "description": "D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. Refusals: 400 invalid-wake-up (bounds), 422 WAKE_SECRET_REJECTED (field and rule only, never the text), 422 WAKE_UNSUPPORTED (check-unsupported, condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage).",
+        "description": "D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. A check (main-agent.md §11.2) runs on one Node with a mandatory timeout before each run: an Agent's check on another host, or from a chapter that keeps its harness's permission control on, waits for the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED; retry the same add with x-remuda-approval-id); changing a check is a new add. Refusals: 400 invalid-wake-up (bounds, a check without timeoutSecs, the owner's check without hostId), 403 out-of-scope (a check host outside the lineage's scope), 409 check-no-workspace (the lineage has no workspace on the check host: its chapter is not there and its project has no member workspace there; a check never runs in a workspace the Node picks), 422 WAKE_SECRET_REJECTED (field and rule only, never the text; check.command included), 422 WAKE_UNSUPPORTED (condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage), 409 wake-name-taken.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdPath"

@@ -330,6 +330,13 @@ async fn dispatch_hub(
             runtime.node.dispatch_gate_rpc(method, &params).await
         }
         _ if method == "gate.cancel" => runtime.node.cancel_gate(&params).await,
+        // cb-wake-check: a check runs for up to its timeout; like a gate it
+        // must not hold the dispatch lease while it does.
+        _ if crate::wake_check::is_wake_check_method(method) => {
+            #[cfg(unix)]
+            drop(_controller);
+            runtime.node.wake_check_rpc(&params).await
+        }
         // Everything this carrier does not need bookkeeping for goes to the
         // one dispatch table, which owns the methods and the honest "I do not
         // handle that". The `{"ok": true}` that used to live here answered for

@@ -1,18 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { hubStore, useHub, useMainEntry } from "../../lib/store";
-import { thisDeviceId } from "../../lib/interactionStatus";
 import { formatListTime } from "../../lib/format";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
 import type { Id } from "../../types/wire";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import { DecisionCard, type DecisionView, type HomeCardState } from "../approvals/ApprovalCard";
-import { useInboxClockNow } from "../mobile/useInboxPendingCount";
-import { syncInboxDeadlineClock } from "../mobile/inboxClock";
 import { useTaskLedger } from "../tasks/taskLedger";
 import { displayKeysByTaskId } from "../tasks/boardColumns";
 import { HOME_FRESHNESS, useHomeFreshness } from "./freshness";
-import { formatGlanceCount, glanceCounts, type GlanceSource } from "./glance";
+import { formatGlanceCount, glanceCounts } from "./glance";
+import { useGlanceSource } from "./glanceSource";
 import { GLANCE_TARGETS } from "./glanceNav";
 import {
   HOME_QUEUE_LIMIT,
@@ -57,27 +55,14 @@ export function HomeQueue({
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
+  // The same owner-wide ledger snapshot the source reads (shared per scope).
   const { tasks, projectName } = useTaskLedger(null);
-  const deviceId = useMemo(() => thisDeviceId(), []);
-  const nowMs = useInboxClockNow();
-  useEffect(() => {
-    syncInboxDeadlineClock(hub.interactions);
-  }, [hub.interactions]);
   const [params] = useSearchParams();
   const focus = params.get("focus");
 
-  const source = useMemo<GlanceSource>(
-    () => ({
-      instances: hub.instances,
-      interactions: hub.interactions,
-      hosts: hub.hosts,
-      tasks,
-      answering: hub.answering,
-      deviceId,
-      nowMs,
-    }),
-    [hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs],
-  );
+  // §5.1: the one client page N comes from — ①'s 需要你 reads it too.
+  const source = useGlanceSource();
+  const nowMs = source.nowMs;
   // §4.1 kind 4: the unacknowledged owner notices (not counted in N).
   const { notices } = useOwnerNotices();
   // §4.1 item 1: Main's own pending interactions are pinned, labelled and

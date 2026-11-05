@@ -412,6 +412,157 @@ pub struct AnswerBody {
     acting_open_id: Option<String>,
 }
 
+/// The merged interaction page `GET /v1/interactions` serves: durable Hub
+/// rows, the Hub's in-memory one-shot approvals, and each Node's live
+/// `interaction.list` copy (suppressed when the durable row is terminal).
+///
+/// Extracted so the owner glance (home.md §5.3) counts from the SAME page the
+/// queue and the OS badge derive from — a live Node card the owner can answer
+/// is a 需要你 the glance must not miss.
+pub(crate) async fn merged_interactions(
+    state: &AppState,
+    device: &crate::store::Device,
+    host_id: Option<String>,
+    instance_id: Option<String>,
+    kind: Option<String>,
+) -> Result<Vec<Value>, HubError> {
+    // c-cardsettle: the inbox feed carries every actionable pending row plus
+    // recently ended/expired rows (24h) for the 已离队 presentation after a
+    // poll or reload; strictly-pending badge counters use list_interactions
+    // (pending_only=true) elsewhere, so terminal rows never count as pending.
+    let mut items: Vec<Value> = state
+        .store
+        .list_inbox_interactions(host_id.clone(), instance_id.clone(), kind.clone())
+        .await?
+        .into_iter()
+        .map(|row| row.to_list_item())
+        .collect();
+    // cb-requested-by: durable rows are Node-sourced and `requestedBy` is
+    // Hub-stamped only. Ingest already drops a supplied record; this drops
+    // any that is still stored (a row written before ingest stripped it),
+    // from the item and from the stored event it carries, for every caller.
+    for item in &mut items {
+        crate::root_turn::strip_requested_by(item);
+    }
+    let mut hub_cards: Vec<Value> = state
+        .agent_approvals
+        .list(device)
+        .await
+        .into_iter()
+        .filter(|item| {
+            host_id.as_deref().is_none_or(|host| item["hostId"] == host)
+                && instance_id
+                    .as_deref()
+                    .is_none_or(|id| item["instanceId"] == id)
+                && kind.as_deref().is_none_or(|kind| kind == "approval")
+        })
+        .collect();
+    // cb-requested-by: the Hub's own one-shot cards are the PWA's approval
+    // card source. They store a reference only; a Human read gains the
+    // owner's words here. Only these cards are hydrated: a Node-supplied item
+    // never carries a record the Hub stamped.
+    crate::agent_scope::hydrate_owner_words(state, device, hub_cards.iter_mut()).await;
+    items.extend(hub_cards);
+    let mut seen: HashSet<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.get("interactionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let mut params = json!({});
+    if let Some(instance_id) = &instance_id
+        && let Some(obj) = params.as_object_mut()
+    {
+        obj.insert("instanceId".into(), json!(instance_id));
+    }
+    if let Some(kind) = &kind
+        && let Some(obj) = params.as_object_mut()
+    {
+        obj.insert("kind".into(), json!(kind));
+    }
+    let hosts = match &host_id {
+        Some(host_id) => vec![host_id.clone()],
+        None => state.nodes.host_ids().await,
+    };
+    for host_id in hosts {
+        match state
+            .nodes
+            .call(
+                &host_id,
+                "interaction.list",
+                params.clone(),
+                NODE_RPC_TIMEOUT,
+            )
+            .await
+        {
+            Ok(Some(frame)) => match rpc_result(frame) {
+                Ok(result) => {
+                    if let Some(batch) = result.get("items").and_then(Value::as_array) {
+                        // c-cardsettle r2 item 3: display retention (24 h) is
+                        // separate from authoritative dedup. A Node may still
+                        // list as pending an id the Hub settled; even when the
+                        // durable row is too old to be in the inbox page, the
+                        // Hub's terminal state wins and the live copy is
+                        // suppressed so it cannot return to the queue/badge.
+                        let candidate_ids: Vec<String> = batch
+                            .iter()
+                            .filter(|item| {
+                                kind.as_ref().is_none_or(|want| {
+                                    item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                                })
+                            })
+                            .filter_map(|item| {
+                                item.get("interactionId")
+                                    .or_else(|| item.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        let durable_terminal = state
+                            .store
+                            .terminal_interaction_ids(candidate_ids.clone())
+                            .await?;
+                        for item in batch {
+                            if !kind.as_ref().is_none_or(|want| {
+                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                            }) {
+                                continue;
+                            }
+                            let id = item
+                                .get("interactionId")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if durable_terminal.contains(id) {
+                                tracing::debug!(
+                                    interaction_id = %id,
+                                    "suppressing node live copy: durable Hub row is terminal"
+                                );
+                                continue;
+                            }
+                            if id.is_empty() || seen.insert(id.to_string()) {
+                                // A live Node item never carries a record the
+                                // Hub stamped: drop any it supplies.
+                                let mut item = item.clone();
+                                crate::root_turn::strip_requested_by(&mut item);
+                                items.push(flatten_interaction(item));
+                            }
+                        }
+                    }
+                }
+                Err(HubError::NotFound) => {}
+                Err(err) => tracing::debug!(error = %err, %host_id, "interaction.list"),
+            },
+            Ok(None) => {}
+            Err(err) => tracing::debug!(error = %err, %host_id, "interaction.list rpc"),
+        }
+    }
+    Ok(items)
+}
+
 /// `GET /v1/interactions` — durable Hub index, merged with live Node RPC.
 pub async fn list_interactions(
     State(state): State<AppState>,
@@ -450,148 +601,17 @@ pub async fn list_interactions(
             return Err(HubError::Forbidden);
         }
     }
-    // c-cardsettle: the inbox feed carries every actionable pending row plus
-    // recently ended/expired rows (24h) for the 已离队 presentation after a
-    // poll or reload; strictly-pending badge counters use list_interactions
-    // (pending_only=true) elsewhere, so terminal rows never count as pending.
-    let mut items: Vec<Value> = state
-        .store
-        .list_inbox_interactions(
-            query.host_id.clone(),
-            query.instance_id.clone(),
-            query.kind.clone(),
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.to_list_item())
-        .collect();
-    // cb-requested-by: durable rows are Node-sourced and `requestedBy` is
-    // Hub-stamped only. Ingest already drops a supplied record; this drops
-    // any that is still stored (a row written before ingest stripped it),
-    // from the item and from the stored event it carries, for every caller.
-    for item in &mut items {
-        crate::root_turn::strip_requested_by(item);
-    }
-    let mut hub_cards: Vec<Value> = state
-        .agent_approvals
-        .list(&device)
-        .await
-        .into_iter()
-        .filter(|item| {
-            query
-                .host_id
-                .as_deref()
-                .is_none_or(|host| item["hostId"] == host)
-                && query
-                    .instance_id
-                    .as_deref()
-                    .is_none_or(|id| item["instanceId"] == id)
-                && query.kind.as_deref().is_none_or(|kind| kind == "approval")
-        })
-        .collect();
-    // cb-requested-by: the Hub's own one-shot cards are the PWA's approval
-    // card source. They store a reference only; a Human read gains the
-    // owner's words here. Only these cards are hydrated: a Node-supplied item
-    // never carries a record the Hub stamped.
-    crate::agent_scope::hydrate_owner_words(&state, &device, hub_cards.iter_mut()).await;
-    items.extend(hub_cards);
-    let mut seen: HashSet<String> = items
-        .iter()
-        .filter_map(|item| {
-            item.get("interactionId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    let mut params = json!({});
-    if let Some(instance_id) = &query.instance_id
-        && let Some(obj) = params.as_object_mut()
-    {
-        obj.insert("instanceId".into(), json!(instance_id));
-    }
-    if let Some(kind) = &query.kind
-        && let Some(obj) = params.as_object_mut()
-    {
-        obj.insert("kind".into(), json!(kind));
-    }
-    let hosts = match &query.host_id {
-        Some(host_id) => vec![host_id.clone()],
-        None => state.nodes.host_ids().await,
-    };
-    for host_id in hosts {
-        match state
-            .nodes
-            .call(
-                &host_id,
-                "interaction.list",
-                params.clone(),
-                NODE_RPC_TIMEOUT,
-            )
-            .await
-        {
-            Ok(Some(frame)) => match rpc_result(frame) {
-                Ok(result) => {
-                    if let Some(batch) = result.get("items").and_then(Value::as_array) {
-                        // c-cardsettle r2 item 3: display retention (24 h) is
-                        // separate from authoritative dedup. A Node may still
-                        // list as pending an id the Hub settled; even when the
-                        // durable row is too old to be in the inbox page, the
-                        // Hub's terminal state wins and the live copy is
-                        // suppressed so it cannot return to the queue/badge.
-                        let candidate_ids: Vec<String> = batch
-                            .iter()
-                            .filter(|item| {
-                                query.kind.as_ref().is_none_or(|want| {
-                                    item.get("kind").and_then(Value::as_str) == Some(want.as_str())
-                                })
-                            })
-                            .filter_map(|item| {
-                                item.get("interactionId")
-                                    .or_else(|| item.get("id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .filter(|id| !id.is_empty())
-                            .collect();
-                        let durable_terminal = state
-                            .store
-                            .terminal_interaction_ids(candidate_ids.clone())
-                            .await?;
-                        for item in batch {
-                            if !query.kind.as_ref().is_none_or(|want| {
-                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
-                            }) {
-                                continue;
-                            }
-                            let id = item
-                                .get("interactionId")
-                                .or_else(|| item.get("id"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            if durable_terminal.contains(id) {
-                                tracing::debug!(
-                                    interaction_id = %id,
-                                    "suppressing node live copy: durable Hub row is terminal"
-                                );
-                                continue;
-                            }
-                            if id.is_empty() || seen.insert(id.to_string()) {
-                                // A live Node item never carries a record the
-                                // Hub stamped: drop any it supplies.
-                                let mut item = item.clone();
-                                crate::root_turn::strip_requested_by(&mut item);
-                                items.push(flatten_interaction(item));
-                            }
-                        }
-                    }
-                }
-                Err(HubError::NotFound) => {}
-                Err(err) => tracing::debug!(error = %err, %host_id, "interaction.list"),
-            },
-            Ok(None) => {}
-            Err(err) => tracing::debug!(error = %err, %host_id, "interaction.list rpc"),
-        }
-    }
+    // The merged page every owner surface reads: durable rows, the Hub's own
+    // in-memory approvals, and each host's live copy. The owner glance counts
+    // from THIS page, so its numbers cannot disagree with the inbox/badge.
+    let mut items = merged_interactions(
+        &state,
+        &device,
+        query.host_id.clone(),
+        query.instance_id.clone(),
+        query.kind.clone(),
+    )
+    .await?;
     // D-051: the Agent relaxation is applied to the fully merged page, so the
     // approval-kind exclusion cannot be bypassed via the in-memory grant
     // branch (merged above from `agent_approvals.list`,

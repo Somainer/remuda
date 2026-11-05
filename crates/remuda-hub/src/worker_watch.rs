@@ -1720,6 +1720,15 @@ async fn respawn_scoped(
         restart: None,
         seated_by: None,
         auto_continue: old.auto_continue,
+        // home-glance-d060 (home.md §5.3): a respawn is a successor
+        // (`resumedFrom` = the old worker), so it keeps the chain root's
+        // creator stamp — an Agent's worker the owner resumes is still
+        // dispatched. Only an unstamped pre-upgrade row falls back to the
+        // caller's.
+        creator_origin: old
+            .creator_origin
+            .clone()
+            .or_else(|| Some(crate::agent_scope::origin_wire(device).to_string())),
     };
     let (respawn_initiator, respawn_device_id) = initiator_and_device(state, device).await?;
     let (instance, _command) = crate::placement::spawn_on_host(
@@ -1779,17 +1788,24 @@ async fn relaunch_instance(
     worker: &WorkerRoster,
 ) -> Result<String, HubError> {
     let device = caller(state, headers).await?;
-    // cb-usage-resume: a relaunched worker keeps the autoContinue its
-    // previous instance had.
-    let previous_auto_continue = match &worker.instance_id {
+    let previous = match &worker.instance_id {
         Some(id) => state
             .store
             .get_instance(id.as_id().to_string())
             .await
-            .map_err(map_store)?
-            .is_some_and(|previous| previous.auto_continue),
-        None => false,
+            .map_err(map_store)?,
+        None => None,
     };
+    // cb-usage-resume: a relaunched worker keeps the autoContinue its
+    // previous instance had.
+    let previous_auto_continue = previous
+        .as_ref()
+        .is_some_and(|previous| previous.auto_continue);
+    // home-glance-d060 (home.md §5.3): a relaunch has no chain link (a fresh
+    // launch), but it is the same worker, so it keeps the previous instance's
+    // creator stamp: a Bot's worker the owner relaunches is not a hand-opened
+    // root. A worker with no stamped instance takes the caller's.
+    let previous_creator_origin = previous.and_then(|previous| previous.creator_origin);
     let host = state
         .store
         .get_host(worker.host_id.as_id().to_string())
@@ -1903,6 +1919,8 @@ async fn relaunch_instance(
         restart: None,
         seated_by: None,
         auto_continue: previous_auto_continue,
+        creator_origin: previous_creator_origin
+            .or_else(|| Some(crate::agent_scope::origin_wire(&device).to_string())),
     };
     // D-057 §7.1: a respawn the Hub authors on the caller's behalf carries
     // that caller's initiator and device id.

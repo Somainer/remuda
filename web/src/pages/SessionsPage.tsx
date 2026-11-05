@@ -9,7 +9,6 @@ import { spaceStore, type Space } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { PageHeader } from "../components/PageHeader";
 import { HomeGlance } from "../features/home/HomeGlance";
-import { TOP_LEVEL_WORKING } from "../features/home/glance";
 import { HostStrip } from "../features/home/HostStrip";
 import { scrollToQueue } from "../features/home/glanceNav";
 import { MainCard } from "../features/home/MainCard";
@@ -99,8 +98,6 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           actions={
             <HomeGlance
               placement="desktop"
-              // The list drops child sessions; the count must use that set.
-              workingInstances={TOP_LEVEL_WORKING}
               workingFilter={workingFilter}
               doneUnseenFilter={doneUnseenFilter}
               onNeedYou={scrollToQueue}

@@ -25,6 +25,14 @@ pub use imp::observe_exit_without_reaping;
 mod owner;
 
 #[cfg(unix)]
+mod contain;
+
+/// cb-wake-check r2: pre-exec containment of a spawned process tree (cgroup
+/// v2 leaf, child subreaper).
+#[cfg(unix)]
+pub use contain::ContainOnExec;
+
+#[cfg(unix)]
 mod recovery_git;
 
 /// R11 hardening for every recovery git invocation (replacement/graft/prompt

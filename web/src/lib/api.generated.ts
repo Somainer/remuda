@@ -1200,7 +1200,7 @@ export interface paths {
         put?: never;
         /**
          * Add a wake-up (`remuda wake add`)
-         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. Refusals: 400 invalid-wake-up (bounds), 422 WAKE_SECRET_REJECTED (field and rule only, never the text), 422 WAKE_UNSUPPORTED (check-unsupported, condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage).
+         * @description D-060 §11. A Human device manages any lineage's wake-ups and may name any chapter of it; an Agent only its own lineage, by its canonical id (403 otherwise); a Bot credential is refused (403). An Agent write passes the commit-time initiator check (a fenced or paused chapter gets 409 fenced). The Hub claims each due occurrence once; a persistent run is delivered as a wake-due inbox fact at the lineage's idle point, a fresh run creates a short-lived child through the ordinary Agent create. notify is required. The same add under the same name returns the stored wake-up with 200; a different one under that name is 409 wake-name-taken. A check (main-agent.md §11.2) runs on one Node with a mandatory timeout before each run: an Agent's check on another host, or from a chapter that keeps its harness's permission control on, waits for the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED; retry the same add with x-remuda-approval-id); changing a check is a new add. Refusals: 400 invalid-wake-up (bounds, a check without timeoutSecs, the owner's check without hostId), 403 out-of-scope (a check host outside the lineage's scope), 409 check-no-workspace (the lineage has no workspace on the check host: its chapter is not there and its project has no member workspace there; a check never runs in a workspace the Node picks), 422 WAKE_SECRET_REJECTED (field and rule only, never the text; check.command included), 422 WAKE_UNSUPPORTED (condition-unsupported), 409 wake-not-received (the lineage receives no facts), 409 wake-limit (64 per lineage), 409 wake-name-taken.
          */
         post: operations["addLineageWakeUp"];
         delete?: never;
@@ -1351,6 +1351,26 @@ export interface paths {
         put?: never;
         /** Check changed paths against a task's owns[] (the merge-gate scope check) */
         post: operations["ownCheck"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/owner/glance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The owner's world: count segments, today's completions and one headline per waiting/working session
+         * @description Human only: an Agent (a seat, or a Human token narrowed to one) is stopped by the route middleware with `agent-route`, and a Bot credential is refused with 403 `owner-only`. The scope is Main's lineage subtree plus the sessions the owner opened by hand (home.md §5.3). At most 50 rows in each of `waiting` and `working`; the `more` counters carry the overflow. `tzOffsetMinutes` is the owner's local offset east of UTC (`-Date().getTimezoneOffset()`), used only for `counts.doneToday`. Headline text is redacted untrusted data.
+         */
+        get: operations["ownerGlance"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2634,7 +2654,7 @@ export interface components {
          * @description What happened to the fact's subject.
          * @enum {string}
          */
-        InboxFactKind: "started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold";
+        InboxFactKind: "started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold" | "wake-failed";
         /** @description The row failed the re-check at batch formation and fell back to the owner push; it is neither held nor recorded as consumed. */
         InboxFallback: {
             /** Format: date-time */
@@ -2787,6 +2807,11 @@ export interface components {
             readonly chapterCause?: string | null;
             connectivity: string;
             createdAt?: string;
+            /**
+             * @description Origin of the device that created the chain ROOT (home.md §5.3): `human`, `bot`, `agent` or `hub`, or the upgrade backfill's `legacy`. A resume or continuation inherits its predecessor's stamp, so `agent` means dispatched by an Agent and a parent alone does not. Absent only on an unclassified pre-upgrade row.
+             * @enum {string}
+             */
+            readonly creatorOrigin?: "human" | "bot" | "agent" | "hub" | "legacy";
             cwd?: string | null;
             delegation?: string | null;
             driver: string;
@@ -3341,6 +3366,10 @@ export interface components {
             paths: string[];
             projectId: string;
             taskId: string;
+        };
+        /** @description Generated shape: OwnerGlance in crates/remuda-protocol/schema/protocol.schema.json. */
+        OwnerGlance: {
+            [key: string]: unknown;
         };
         /** @description One `owner notify` claim row (D-060 §11.5): what the seat (or the owner's own device) told the owner. Title and body are the writer's text. */
         OwnerNotice: {
@@ -4022,8 +4051,7 @@ export interface components {
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
         WakeAddRequest: {
-            /** @description Reserved for the optional check (main-agent.md §11.2): until it is built, a request carrying one is refused with 422, code WAKE_UNSUPPORTED, reason check-unsupported. */
-            check?: unknown;
+            check?: components["schemas"]["WakeCheckRequest"];
             mode?: components["schemas"]["WakeMode"];
             /** @description Unique in the lineage (at most 64 of A-Z a-z 0-9 . _ : -, not starting with wak_); the same add under the same name returns the stored wake-up. Generated when absent. */
             name?: string;
@@ -4049,6 +4077,39 @@ export interface components {
             /** @constant */
             kind: "at";
         };
+        WakeCheck: {
+            admission: components["schemas"]["WakeCheckAdmission"];
+            /** @description The owner's approval that admitted it. */
+            approvalId?: string;
+            command: string;
+            /** @description Fixed when it was added. */
+            hostId: string;
+            timeoutSecs: number;
+        };
+        /**
+         * @description owner (the owner added it), own-host-bypass (an Agent on its own host, running with its harness's permission control off) or approved (the owner's one-shot approval).
+         * @enum {string}
+         */
+        WakeCheckAdmission: "owner" | "own-host-bypass" | "approved";
+        /**
+         * @description How a check's processes were contained once it ended (cleanup, not a security boundary: a check runs with its admitter's authority, so a survivor escalates nothing): cgroup (every process still in its verified per-check cgroup v2 domain killed; one that moved itself into a writable ancestor such as the Node's delegated cgroup, cleared its marker and killed its supervisor can outlive it), subreaper (Linux: descendants, marked processes and the process group swept; a check that kills its supervisor and detaches with a cleared environment can outlive it) or process-group (only the group). Absent when nothing ran.
+         * @enum {string}
+         */
+        WakeCheckContainment: "cgroup" | "subreaper" | "process-group";
+        /** @description The optional check (main-agent.md §11.2): a shell command one Node runs before each run, under a mandatory timeout, after an sh -n precheck. Exit 0 lets the run happen with the check's bounded stdout as its summary; exit 2 skips it; anything else, or the timeout, fails it. Admitted on the OA1 axis: an Agent adds one without the owner's approval only on its own host while it runs with its harness's permission control off; any other check needs the owner's one-shot approval (409 HUMAN_APPROVAL_REQUIRED, then the same add with x-remuda-approval-id). The owner's own add is admitted on the host it names. */
+        WakeCheckRequest: {
+            /** @description The shell command (sh -c), at most 2000 characters; required. The secret lint runs over it (422 WAKE_SECRET_REJECTED, field check.command, never echoed). */
+            command?: string;
+            /** @description The Node it runs on, a host in the lineage's scope (403 out-of-scope otherwise). An Agent may omit it for its own host; the owner must name it (400). The lineage must have a workspace there (409 check-no-workspace). */
+            hostId?: string;
+            /** @description 1..=3600 seconds; required, there is no default (400 when missing). */
+            timeoutSecs?: number;
+        };
+        /**
+         * @description pending (waiting for its host), running, passed (exit 0), skipped (exit 2), failed, or interrupted (the Hub or the Node restarted while it ran; never run again).
+         * @enum {string}
+         */
+        WakeCheckState: "pending" | "running" | "passed" | "skipped" | "failed" | "interrupted";
         WakeCreator: {
             /** @description The chapter an Agent added it from. */
             instanceId?: string;
@@ -4090,7 +4151,8 @@ export interface components {
         WakeRun: {
             /** @description The inbox batch that carried it (persistent mode). */
             batchId?: string;
-            /** @description The optional check's exit code; null until the check exists. */
+            check?: components["schemas"]["WakeRunCheck"];
+            /** @description The check's exit code; null without a check, before it exits, and when it timed out, was refused by sh -n or could not start. */
             checkExit: number | null;
             /** @description The child created for it (fresh mode). */
             childInstanceId?: string;
@@ -4098,7 +4160,7 @@ export interface components {
             endedAt?: string;
             /** @description The wake-due inbox row (persistent mode). */
             factId?: number;
-            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed or child-ended. */
+            /** @description not-received, not-delivered, delivery, turn-failed, chapter-ended, fresh-refused, child-failed, child-ended, check-exit, check-timeout, check-syntax, check-unavailable, check-no-workspace or check-cwd-unusable. */
             failureKind?: string;
             /** Format: date-time */
             firedAt: string;
@@ -4118,6 +4180,19 @@ export interface components {
             state: components["schemas"]["WakeRunState"];
             wakeId: string;
         };
+        WakeRunCheck: {
+            containment?: components["schemas"]["WakeCheckContainment"];
+            /** @description The sweep stopped at its hard limit with processes the kernel could not kill still live. */
+            containmentIncomplete?: boolean;
+            hostId: string;
+            /** @description Its stdout, at most 4096 bytes. Untrusted data. */
+            output?: string;
+            /** @description The stdout was longer and was cut. */
+            outputTruncated?: boolean;
+            state: components["schemas"]["WakeCheckState"];
+            /** @description How it exited, in a few words (exit 1, timed out after 30 s, syntax error); never its stderr. */
+            summary?: string;
+        };
         /**
          * @description queued → running → success, failed or skipped (reserved for the check); a run running when the Hub restarted is interrupted and never replayed.
          * @enum {string}
@@ -4126,13 +4201,17 @@ export interface components {
         /** @description When a wake-up fires. */
         WakeTrigger: components["schemas"]["WakeAt"] | components["schemas"]["WakeEvery"] | components["schemas"]["WakeWhen"];
         WakeUp: {
-            /** @description Reserved; always absent. */
-            check?: unknown;
+            check?: components["schemas"]["WakeCheck"];
             /** Format: date-time */
             createdAt: string;
             creator: components["schemas"]["WakeCreator"];
             /** Format: date-time */
             lastFiredAt?: string;
+            /**
+             * Format: date-time
+             * @description When its latest real run fired: one without a check, or whose check passed (exit 0). A skipped or failed check leaves it as it was.
+             */
+            lastRunAt?: string;
             lineageId: string;
             /** @description Occurrences skipped because they came due while an earlier run was still queued or running: none of them gets a run of its own, not even once that run ends. The next run reports them and this resets. */
             missedCount: number;
@@ -4156,7 +4235,7 @@ export interface components {
          * @enum {string}
          */
         WakeUpState: "active" | "done";
-        /** @description Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due cannot be a condition; context-threshold is refused (422 condition-unsupported) because nothing records it yet. */
+        /** @description Fires each time a fact of factKind (about subjectInstanceId, when set) reaches the lineage's inbox after the add. wake-due and wake-failed cannot be a condition (a wake-up's own runs record them); context-threshold is refused (422 condition-unsupported) because nothing records it yet. */
         WakeWhen: {
             factKind: components["schemas"]["InboxFactKind"];
             /** @constant */
@@ -7146,6 +7225,31 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    ownerGlance: {
+        parameters: {
+            query?: {
+                /** @description Minutes east of UTC for the local-day 今日完成 count (default 0, clamped to ±14 h). */
+                tzOffsetMinutes?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner glance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnerGlance"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     ownerNotices: {

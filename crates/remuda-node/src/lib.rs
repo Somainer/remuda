@@ -43,6 +43,7 @@ mod store;
 pub mod subagent;
 mod transport;
 mod tty;
+mod wake_check;
 mod worker;
 /// Hook-driven Workflow card producer. Public for the integration test and
 /// potential reuse; it has no Node state beyond the per-session fold itself.

@@ -748,6 +748,9 @@ pub(crate) async fn dispatch_core(
         restart: None,
         seated_by: None,
         auto_continue: body.auto_continue,
+        // home-glance-d060 §5.3: the Hub-stamped creator; a dispatch by Main
+        // is an Agent row, a dispatch by the owner's device is hand-opened.
+        creator_origin: Some(crate::agent_scope::origin_wire(&device).to_string()),
     };
     // Capture what a rollback needs before the block below moves these.
     let rollback_name = name.clone();

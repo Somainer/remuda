@@ -159,3 +159,105 @@ it("a visible report answered unseen re-reports once at the answer's turn end, n
   await expect(hubStore.markSeen(ID, { visible: true })).resolves.toMatchObject({ turnEndSeq: "13" });
   expect(post).toHaveBeenCalledTimes(2);
 });
+
+/**
+ * [r4 item 3] ◉ and ⑤ read ONE glance set. A mark leaves the list and the
+ * count together at the click, and a glance read that was already in flight
+ * (it began before the seen write committed) cannot paint the row back; the
+ * first read that began after the commit is the Hub's truth again.
+ */
+it("strips a marked row from the glance's ◉ list and count together, across an in-flight read", async () => {
+  await boot(row({ durableSeq: "6" as U64, unseen: true, turnEndSeq: "6" as U64 }));
+  const glance = (ids: string[]) => ({
+    generatedAt: "2026-10-30T10:09:00.000Z",
+    timezoneOffsetMinutes: 0,
+    counts: { needYou: 0, doneUnseen: ids.length, working: 0, doneToday: 0 },
+    doneUnseenIds: ids,
+    waiting: [],
+    working: [],
+    more: { waiting: 0, working: 0 },
+  });
+  const read = vi.spyOn(api, "ownerGlance").mockResolvedValueOnce(glance([ID, "ins_other"]));
+  await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glance?.counts.doneUnseen).toBe(2);
+
+  // A glance read is in flight when the owner marks the row; it answers with
+  // the pre-commit state.
+  let answer!: (value: ReturnType<typeof glance>) => void;
+  read.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+  const inFlight = hubStore.refreshGlance();
+  let commit!: (view: SeenView) => void;
+  vi.spyOn(api, "instanceSeen").mockReturnValueOnce(new Promise((resolve) => { commit = resolve; }));
+  const marked = hubStore.markSeen(ID);
+  // At the click: both the list and the count lose it.
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_other"],
+    counts: { doneUnseen: 1 },
+  });
+  commit({ instanceId: ID, unseen: false, seenSeq: "6", turnEndSeq: "6" });
+  await marked;
+  answer(glance([ID, "ins_other"]));
+  await inFlight;
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_other"],
+    counts: { doneUnseen: 1 },
+  });
+
+  // A read that began after the commit is the Hub's truth, verbatim.
+  read.mockResolvedValueOnce(glance(["ins_other", "ins_third"]));
+  await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_other", "ins_third"],
+    counts: { doneUnseen: 2 },
+  });
+  // …and the mark is retired: the Hub may list the row again (a newer turn).
+  read.mockResolvedValueOnce(glance([ID]));
+  await hubStore.refreshGlance();
+  expect(hubStore.getSnapshot().glance?.doneUnseenIds).toEqual([ID]);
+});
+
+/**
+ * [r5 item 2] A refused seen write leaves the row unseen on the Hub, so the
+ * row must come back to ⑤ and ◉ — in the list, in its place, and in the
+ * count — not only on the instance. A still-unseen answer (a newer turn end)
+ * brings it back the same way.
+ */
+it("puts a refused or still-unseen mark's row back into the glance's ◉ list and count", async () => {
+  await boot(row({ durableSeq: "6" as U64, unseen: true, turnEndSeq: "6" as U64 }));
+  const served = {
+    generatedAt: "2026-10-30T10:09:00.000Z",
+    timezoneOffsetMinutes: 0,
+    counts: { needYou: 0, doneUnseen: 3, working: 0, doneToday: 0 },
+    doneUnseenIds: ["ins_newer", ID, "ins_older"],
+    waiting: [],
+    working: [],
+    more: { waiting: 0, working: 0 },
+  };
+  vi.spyOn(api, "ownerGlance").mockResolvedValueOnce(served);
+  await hubStore.refreshGlance();
+
+  let reject!: (error: Error) => void;
+  const post = vi.spyOn(api, "instanceSeen").mockReturnValueOnce(
+    new Promise((_, fail) => { reject = fail; }),
+  );
+  const refused = hubStore.markSeen(ID);
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_newer", "ins_older"],
+    counts: { doneUnseen: 2 },
+  });
+  reject(new Error("403"));
+  await expect(refused).rejects.toThrow("403");
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_newer", ID, "ins_older"],
+    counts: { doneUnseen: 3 },
+  });
+  expect(current().unseen).toBe(true);
+
+  // Accepted, but the Hub still reads it unseen (a newer turn end).
+  post.mockResolvedValueOnce({ instanceId: ID, unseen: true, seenSeq: "6", turnEndSeq: "7" });
+  await hubStore.markSeen(ID);
+  expect(hubStore.getSnapshot().glance).toMatchObject({
+    doneUnseenIds: ["ins_newer", ID, "ins_older"],
+    counts: { doneUnseen: 3 },
+  });
+});

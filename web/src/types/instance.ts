@@ -46,7 +46,20 @@ export type Instance = EntityMeta & {
   capabilities: CapabilitySnapshot;
   ownerFence: U64;
   activeRunIds: Id[];
-  parent: { instanceId: Id; runId: Id; commandId: Id } | null;
+  /**
+   * Creator edge (home.md §3.1 / §5.3). `instanceId` is the Hub's stamped
+   * `parentInstanceId`; `runId`/`commandId` are only known on optimistic
+   * client rows (a local resume), so a wire row carries nulls.
+   */
+  parent: { instanceId: Id; runId: Id | null; commandId: Id | null } | null;
+  /**
+   * The origin of the device that created the chain ROOT (home.md §5.3). A
+   * resume or continuation inherits it, so `agent` means "dispatched" (see
+   * `dispatchedChild`). Absent on rows from older Hubs.
+   */
+  creatorOrigin?: "human" | "bot" | "agent" | "hub" | "legacy";
+  /** D-026: the session whose conversation this one continues; null on a fresh launch. */
+  resumedFrom?: Id | null;
   journalId: Id;
   durableSeq: U64;
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;

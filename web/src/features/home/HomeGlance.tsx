@@ -1,32 +1,35 @@
-import { Fragment, useEffect, useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { useHub } from "../../lib/store";
-import { thisDeviceId } from "../../lib/interactionStatus";
+import { useNowTick } from "../../lib/useNowTick";
 import { hostIsOnline } from "../hosts/model";
-import { useInboxClockNow } from "../mobile/useInboxPendingCount";
-import { syncInboxDeadlineClock } from "../mobile/inboxClock";
-import { useTaskLedger } from "../tasks/taskLedger";
-import { useHomeFreshness } from "./freshness";
+import { HOME_FRESHNESS, useHomeFreshness } from "./freshness";
+import { useGlanceSource } from "./glanceSource";
+import { useOwnerGlancePoll } from "./useOwnerGlance";
 import {
   formatGlanceCount,
   formatUpdatedAt,
   glanceCounts,
   glancePieces,
-  type GlanceCounts,
-  type GlanceSource,
+  type GlanceLineInput,
 } from "./glance";
 import css from "./homeGlance.module.css";
 
 /**
- * ① 计数行 (home.md §5.1–5.2).
+ * ① 计数行 (home.md §5.1–5.2, §5.3).
  *
  * Phone: the 28px row under the 52px title row, sticky together with it (80px
- * total). Desktop: the same line inside the PageHeader. The counts are the
- * pure §5.1 derivation in `glance.ts` (H2's queue and the badge will read the
- * same function); this component only wires the store, the 5 s task ledger,
- * the inbox deadline clock and the §8 freshness verdict.
+ * total). Desktop: the same line inside the PageHeader, plus the desktop-only
+ * 「今日完成 N」 segment.
  *
- * Taps: 需要你 scrolls to the queue (today: the ledger's first blocked row —
- * the queue itself lands with H2); 完成未看 and 工作中 each filter the ledger
+ * 需要你 (§5.1 N) is ④'s number by construction: `glanceCounts().needYou`
+ * over the ONE client page ④'s header and the OS badge read
+ * (`useGlanceSource`), so it is known the moment ④ is and never disagrees with
+ * it. The other segments — 完成未看, 工作中, 今日完成 — read ONE
+ * `GET /v1/owner/glance` per poll, the projection home.md §5.3 defines over
+ * Main's subtree plus the sessions the owner opened by hand; before the first
+ * glance they read 「–」 and 今日完成 stays hidden, exactly as §5.2 asks.
+ *
+ * Taps: 需要你 scrolls to the queue; 完成未看 and 工作中 each filter the ledger
  * to that rank, and a second tap clears it.
  */
 export function HomeGlance({
@@ -36,7 +39,6 @@ export function HomeGlance({
   onDoneUnseen,
   workingFilter = false,
   doneUnseenFilter = false,
-  workingInstances,
 }: {
   placement: "phone" | "desktop";
   onNeedYou: () => void;
@@ -47,48 +49,36 @@ export function HomeGlance({
   workingFilter?: boolean;
   /** The done-unseen rank filter this segment currently applies. */
   doneUnseenFilter?: boolean;
-  /**
-   * Which instances this surface lists for 工作中 (default: every instance).
-   * `/sessions` hides child sessions, so it passes TOP_LEVEL_WORKING — the
-   * count must equal the rows the 工作中 tap can show.
-   */
-  workingInstances?: (instance: NonNullable<GlanceSource["instances"][number]>) => boolean;
 }) {
   const hub = useHub();
   const freshness = useHomeFreshness();
-  // Owner-wide (§5.1): N is the queue that matches the badge. A ?project=
-  // filter narrows the ledger/list only; the count keeps the global scope,
-  // which also means it shares the phone task layer's poller when that layer
-  // is unfiltered (default /m).
-  const { tasks } = useTaskLedger(null);
-  const deviceId = useMemo(() => thisDeviceId(), []);
-  const nowMs = useInboxClockNow();
-  useEffect(() => {
-    syncInboxDeadlineClock(hub.interactions);
-  }, [hub.interactions]);
-
-  // The §5.1 derivation lives in glance.ts so H2's queue header and the OS
-  // badge can read it later; the in-app badge is still A-only until
-  // home-queue adds B. A store re-notification with unchanged counts
-  // re-derives the same numbers and paints identically.
-  const counts = useMemo<GlanceCounts | null>(
-    () =>
-      freshness.state === "unknown"
-        ? null
-        : glanceCounts(
-            {
-              instances: hub.instances,
-              interactions: hub.interactions,
-              hosts: hub.hosts,
-              tasks,
-              answering: hub.answering,
-              deviceId,
-              nowMs,
-            },
-            workingInstances ? hub.instances.filter(workingInstances) : hub.instances,
-          ),
-    [freshness.state, hub.instances, hub.interactions, hub.hosts, tasks, hub.answering, deviceId, nowMs, workingInstances],
+  // A local clock for the glance-age check: the store emits on every poll, but
+  // a hung poll would otherwise never re-render this row.
+  const nowMs = useNowTick(5_000);
+  // §5.3: the glance is polled only while this home surface is mounted, and
+  // once per cycle; the mount read closes the cold-bootstrap 「–」 window.
+  useOwnerGlancePoll();
+  // §5.1: ④'s N, from ④'s own page — known with the first Hub snapshot, which
+  // is exactly when ④'s header stops reading 「–」.
+  const source = useGlanceSource();
+  const needYou = useMemo(
+    () => (freshness.state === "unknown" ? null : glanceCounts(source).needYou),
+    [freshness.state, source],
   );
+  const counts = useMemo<GlanceLineInput["counts"]>(() => {
+    const glance = hub.glance;
+    // A store that somehow holds a partial projection paints 「–」 rather than
+    // crashing the home (refreshGlance rejects malformed bodies at the
+    // boundary; this is the belt and braces).
+    const known = glance?.counts && typeof glance.counts.working === "number" ? glance.counts : null;
+    if (needYou === null && known === null) return null;
+    return {
+      needYou,
+      doneUnseen: known ? known.doneUnseen : null,
+      working: known ? known.working : null,
+      ...(known ? { doneToday: known.doneToday } : {}),
+    };
+  }, [hub.glance, needYou]);
 
   const hostsOnline = hub.hosts.filter((host) => hostIsOnline(host)).length;
   const pieces = glancePieces({
@@ -99,10 +89,18 @@ export function HomeGlance({
     // Keep the segment on screen while it is the only way to clear the filter.
     workingFilter,
     doneUnseenFilter,
+    // §5.2: 今日完成 is desktop-only.
+    showDoneToday: placement === "desktop",
   });
   // §8: stale greys the whole row and names the last successful update. A
-  // foreground grace is explicitly NOT stale.
-  const stale = freshness.state === "stale";
+  // foreground grace is explicitly NOT stale. A glance-only failure (the main
+  // refresh still healthy) freezes these numbers, so it greys the row and
+  // names the last GOOD glance — frozen numbers are never shown as fresh.
+  const glanceStale =
+    hub.glanceFailed ||
+    (hub.glanceAt !== null && nowMs - hub.glanceAt > HOME_FRESHNESS.staleAfterMs);
+  const stale = freshness.state === "stale" || (hub.glance !== null && glanceStale);
+  const updatedAt = hub.glanceAt ?? freshness.lastOkAt;
 
   return (
     <div
@@ -159,6 +157,10 @@ export function HomeGlance({
               </span>
               {piece.count === null ? "–" : formatGlanceCount(piece.count)} 工作中
             </button>
+          ) : piece.key === "doneToday" ? (
+            <span className={css.doneToday} data-testid="glance-done-today" data-key="doneToday">
+              今日完成 {formatGlanceCount(piece.count)}
+            </span>
           ) : piece.key === "greeting" ? (
             <span className={css.greeting} data-testid="glance-greeting">
               {piece.text} · 都处理完了
@@ -170,9 +172,9 @@ export function HomeGlance({
           )}
         </Fragment>
       ))}
-      {stale && freshness.lastOkAt !== null ? (
+      {stale && updatedAt !== null ? (
         <span className={css.updated} data-testid="glance-updated">
-          更新于 {formatUpdatedAt(freshness.lastOkAt)}
+          更新于 {formatUpdatedAt(updatedAt)}
         </span>
       ) : null}
     </div>

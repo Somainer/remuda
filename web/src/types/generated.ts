@@ -1707,7 +1707,7 @@ export type InboxFact = ({
 });
 
 /** InboxFactKind wire values; `protocol.md` §8.4. */
-export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold");
+export type InboxFactKind = ("started" | "exited" | "waiting" | "turn-done" | "turn-failed" | "interaction" | "interaction-superseded" | "gate" | "supply-reset" | "host-online" | "host-offline" | "stalled" | "budget-expired" | "wake-due" | "context-threshold" | "wake-failed");
 
 /** Why and when a row fell back to the owner push (§10.1 item 4). */
 export type InboxFallback = ({
@@ -3509,6 +3509,39 @@ export type OutstandingWork = ({
   [key: string]: unknown;
 });
 
+/** `GET /v1/owner/glance`: the owner's world as one read-only projection — Main's lineage subtree plus the sessions the owner opened by hand. */
+export type OwnerGlance = ({
+  "counts": OwnerGlanceCounts;
+  "doneUnseenIds": (((string))[]);
+  "generatedAt": (string);
+  "more": GlanceMore;
+  "timezoneOffsetMinutes": (number);
+  "waiting": ((OwnerGlanceRow)[]);
+  "working": ((OwnerGlanceRow)[]);
+  [key: string]: unknown;
+});
+
+/** The ① count segments of the owner home (home.md §5.1–§5.2). */
+export type OwnerGlanceCounts = ({
+  "doneToday": (number);
+  "doneUnseen": (number);
+  "needYou": (number);
+  "working": (number);
+  [key: string]: unknown;
+});
+
+/** One session row of an [`OwnerGlance`].  Every string that came from a worker, a tool or a session is untrusted data; `headline` is already redacted the way the worker digest redacts. */
+export type OwnerGlanceRow = ({
+  "headline": (string);
+  "instanceId": (string);
+  "kind": (string);
+  "phrase"?: (string | null);
+  "since"?: (number | null);
+  "taskId"?: (string | null);
+  "title"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** Ownership wire values; `protocol.md` §2.3. */
 export type Ownership = ("managed" | "adopted-control" | "observed-only");
 
@@ -4986,7 +5019,7 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 
 /** `POST /v1/lineages/{id}/wake-ups`. */
 export type WakeAddRequest = ({
-  "check"?: unknown;
+  "check"?: (WakeCheckRequest | (null));
   "mode"?: (WakeMode | (null));
   "name"?: (string | null);
   "notify": WakeNotify;
@@ -5007,6 +5040,63 @@ export type WakeAt = ({
   "at"?: (string | null);
   [key: string]: unknown;
 });
+
+/** A stored wake-up's check, and how it was admitted. */
+export type WakeCheck = ({
+  "admission": WakeCheckAdmission;
+  "approvalId"?: (string | null);
+  "command": (string);
+  "hostId": (string);
+  "timeoutSecs": (number);
+  [key: string]: unknown;
+});
+
+/** WakeCheckAdmission wire values; `protocol.md` §8.4. */
+export type WakeCheckAdmission = ("owner" | "own-host-bypass" | "approved");
+
+/** WakeCheckContainment wire values; `protocol.md` §8.4. */
+export type WakeCheckContainment = ("cgroup" | "subreaper" | "process-group");
+
+/** WakeCheckOutcome wire values; `protocol.md` §8.4. */
+export type WakeCheckOutcome = ("exited" | "timed-out" | "syntax" | "unavailable" | "no-workspace" | "cwd-unusable");
+
+/** `wake.check` params (Hub→Node). */
+export type WakeCheckParams = ({
+  "command": (string);
+  "cwd"?: (string | null);
+  "env": ({
+  [key: string]: (string);
+});
+  "instanceId"?: (string | null);
+  "runId": (string);
+  "timeoutSecs": (number);
+  "workspaceId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** `check` on an add. Every field is optional on the wire so that a missing one is refused with the Hub's own 400, not a body-parse error. */
+export type WakeCheckRequest = ({
+  "command"?: (string | null);
+  "hostId"?: (string | null);
+  "timeoutSecs"?: (number | null);
+});
+
+/** `wake.check` result. */
+export type WakeCheckResult = ({
+  "containment"?: (WakeCheckContainment | (null));
+  "containmentIncomplete"?: (boolean);
+  "exitCode"?: (number | null);
+  "outcome": WakeCheckOutcome;
+  "runId": (string);
+  "signal"?: (number | null);
+  "stdout": (string);
+  "stdoutTruncated": (boolean);
+  "summary": (string);
+  [key: string]: unknown;
+});
+
+/** WakeCheckState wire values; `protocol.md` §8.4. */
+export type WakeCheckState = ("pending" | "running" | "passed" | "skipped" | "failed" | "interrupted");
 
 /** Who added a wake-up. */
 export type WakeCreator = ({
@@ -5046,6 +5136,7 @@ export type WakeRemoved = ({
 /** One run of a wake-up. */
 export type WakeRun = ({
   "batchId"?: (string | null);
+  "check"?: (WakeRunCheck | (null));
   "checkExit": (number | null);
   "childInstanceId"?: (string | null);
   "endedAt"?: (string | null);
@@ -5061,6 +5152,18 @@ export type WakeRun = ({
   "startedAt"?: (string | null);
   "state": WakeRunState;
   "wakeId": (string);
+  [key: string]: unknown;
+});
+
+/** One run's check. */
+export type WakeRunCheck = ({
+  "containment"?: (WakeCheckContainment | (null));
+  "containmentIncomplete"?: (boolean);
+  "hostId": (string);
+  "output"?: (string | null);
+  "outputTruncated"?: (boolean);
+  "state": WakeCheckState;
+  "summary"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -5081,10 +5184,11 @@ export type WakeTrigger = (WakeAt & ({
 
 /** One wake-up row. */
 export type WakeUp = ({
-  "check"?: unknown;
+  "check"?: (WakeCheck | (null));
   "createdAt": (string);
   "creator": WakeCreator;
   "lastFiredAt"?: (string | null);
+  "lastRunAt"?: (string | null);
   "lineageId": (string);
   "missedCount": (number);
   "mode": WakeMode;

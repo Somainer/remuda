@@ -221,7 +221,7 @@
 | c | `L ∈ {exited, failed, closing}` | 7 exited |
 | d | `A ∈ {working, draining}` | 3 working |
 | e | `A = idle`，`unseen=true`，并且没有 `lastTurnError`，即最近一个结束的根回合是成功的（§7）。失败的回合不进这一档，而是在队列里出一张回合失败卡（§4.5） | 2 done-unseen |
-| f | `A = idle`，并且满足以下任一条：至少有一个子实例（子实例的 `parentInstanceId` 指向它）落在第 1、3 或 5 档；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | 4 awaiting-wake |
+| f | `A = idle`，并且满足以下任一条：至少有一个 Agent 派出的子实例（`parentInstanceId` 指向它，且按 §5.3 是「派出」而不是恢复）落在第 1、3 或 5 档；它所在血缘有一个未来的 wake（`home-wakes` 落地后） | 4 awaiting-wake |
 | g | `A = idle` | 6 idle |
 | h | 其余情形，也就是活着但 `A` 未知 | 3 working |
 
@@ -368,7 +368,33 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - 当日完成数；
 - 每个会话一句确定性的 headline，取自 D-060 的 worker digest 字段，不由 Hub 调模型生成。
 
-行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。
+**范围的精确定义。** 「Main 子树并上 owner 亲手开的会话」按 Hub 已存的字段定义：
+
+- **Main 子树**：先按**唯一的 Main 解析规则**定出 Main 的章节，再取它所在 `lineage_id` 的全部章节；从这些章节沿 `spec.parentInstanceId` 递归下溯，只要某个实例的创建者是它，就属于子树。再往下派生的章节也属于子树。Main 解析规则（Hub 端 `owner_glance::pick_main_seat`，客户端 `resolveMain`，两边跑同一份用例 `crates/remuda-hub/tests/fixtures/main_seat_cases.json`）：
+  1. 在所有持有 `address-owner` 的章节里，取**现行**章节：没有 `fenced_at`，并且没结束（不是 `exited` / `failed` / `closing`），或者是 §5 的失联行（`last_error = host-contact-lost`，可能仍在运行）；有多个时取 generation 最高的，再取创建较晚的章节；
+  2. **没有现行章节时取最近一版**：Main 暂停、关闭或结束后，取每条 `address-owner` 血缘的最新章节（generation 最高，再按章节创建时间），再在这些血缘里取**创建最晚的血缘**（血缘的创建时间 = 它最早一章的 `created_at`）；
+  3. 只按稳定的键排序：generation、`created_at`、id。`updated_at` 不参与，所以主机重连、心跳之类的触碰不会让 Main 换人；时间完全相同按 id 升序取第一个，结果也不依赖读取顺序。
+
+  因此 Main 暂停（关闭一条续跑血缘的章节 = 无继任的 fence，会给章节写上 `fenced_at`）时，它的血缘照样解析得出来，它派出去还在跑的 worker 仍计入 ① 和 ⑥。
+- **owner 亲手开的会话（hand-opened）**：**一条规则**——会话本身或其恢复/续跑链的**根**（该链第 1 章）是一个**真根**（没有 `parentInstanceId`、没有 `resumedFrom`，`lineage_id` 为空或等于自身），并且这个真根是 owner 自己的 **Human 设备**创建的。Hub 在创建时把认证设备的来源写进 `instances.creator_origin`（`human` / `bot` / `agent` / `hub`），不读请求体。**继任行不重新盖戳**：D-026 恢复、续跑继任章节、worker 的 scoped respawn 都从前一章继承 `creator_origin`，所以这个字段始终是**链根创建者**的来源，不是按下「恢复」的那台设备。没有 transcript 时 operator 在原 worktree 重新拉起 worker（relaunch）是一次没有链接的新启动，但它仍是同一个 worker，所以同样沿用上一个实例的戳：owner 重新拉起的 Bot worker 不会变成 hand-opened 的真根。升级前的旧行由打开数据库时的幂等回填补齐：没有 `resumedFrom` 的根里，有 Agent 派发审计行或 `spec.parentInstanceId` 的判为 `agent`；血缘 `origin_spec_ref.seatedOrigin` 是 Human 的判为 `human`；剩下的、没有创建者证据的真根判为 `legacy`，按 hand-opened 对待；带 `resumedFrom` 的继任行逐级继承前一章的戳（D-026 恢复把被恢复的会话同时写成 `parentInstanceId`，所以「有 parent」不能当作「Agent 派出」）。链的其余章节（`resumedFrom`，以及同一血缘 `generation > 1` 的续跑章节，第 2 章、第 3 章……）跟随根进入范围。由此：
+  - **Bot 创建的根不算**（包括 owner 后来用 Human 设备重新拉起的 Bot 会话——它的链根仍是 Bot 会话，不是一个真根）；
+  - 监督进程重启的 worker、自动续跑的继任章节不算——它们的链根是 Agent 派发的 worker；
+  - 没有创建戳、也没有可回填证据的行不算。
+- **不包括** hand-opened 会话自己派出的子会话：那是它自己的私有血缘（子会话带的是 `parentInstanceId`，不是恢复/续跑链）。因此一个 agent 的私有血缘（根不是 Main 子树、本身也不是 hand-opened 的那些）不在 glance 范围内。
+
+**「子会话」= Agent 派出的会话。** 桌面看板不列子会话、① 的档位点按会把它们列出来、§3.1 f 的 awaiting-wake 只看它们，三处用同一个判定（客户端 `dispatchedChild`）：有 `parentInstanceId`，并且 `creatorOrigin = agent`。没有创建戳的旧 Hub 行退回「有 `parentInstanceId` 且没有 `resumedFrom`」。所以 owner 恢复的会话仍是看板上的普通行，即使它的 `parentInstanceId` 指向被恢复的那一章；Agent 派出的 worker 被恢复或重派之后，不论是谁按下的，继承的戳仍是 `agent`，仍算子会话。
+
+**各段计数。** 计数分两种范围，**`needYou` 不分范围**：
+- `needYou`（§5.1 N）= **所有** owner 能看到的 `state=pending` 且截止时间未过的交互数 A（与 ④ 的标题、OS 角标同一来源：`/v1/interactions` 合并页），加上没有对应排队交互的 owner 阻塞任务数 B（`tasks.state=failed` 且带 `blockedReason`、`archivedAt` 为空；同一任务的会话已在 A 中排队时不再计；去重覆盖整个 fleet）。只有 `waiting`/`working` 的**行**按上面的 owner 范围收窄。§5.1 要求 ①、④ 标题和角标是同一个定义，所以三者同数；一条落在私有血缘上的待办会计入 ① 和 ④，但不会出现在 glance 的行里。Web 端 ① 的「需要你」不等 glance：它和 ④ 标题、角标读**同一份客户端数据**（`glanceCounts().needYou`），④ 一有首个快照它就有数，两者在构造上相同；glance 的 `needYou` 是同一定义的 Hub 侧答案，供 `remuda glance` 等不持有那份数据的读者使用。① 的其余段（◉、●、今日完成）仍只读 glance，首个 glance 之前是「–」。
+- `doneUnseen`（§5.2 ◉）= 范围内按 §3.1 排在第 2 档（idle、owner 未看、最近回合未失败）的会话数；Main 血缘内只有 `resolveMain` 指向的现行章节计入（§7）。被计入的会话 id 同时放在 `doneUnseenIds`（从新到旧，`updatedAt` 再按 id，至多 50 个），⑤ 正好列这一组；
+- `working`（§5.2 ●）= 范围内按 §3.1 排在第 3 档（live 且 activity 为 working/draining，或 activity 未分类）的会话数，子会话也计；
+- `doneToday`（§5.2 今日完成）= 范围内「最近一次结算的根回合结束时间」（`instances.turn_end_at`，与 ◉ 的 `turn_end_seq` 同一事务写入）落在 owner 本地日内的会话数。选根回合而不选任务，因为任务行没有完成时间戳。客户端用 `tzOffsetMinutes`（`-Date().getTimezoneOffset()`，UTC 以东分钟数，服务端夹到 ±14 h）告诉 Hub 本地日从哪开始。
+
+**行。** `waiting` 与 `working` 各按会话一行，各至多 50 行，溢出的数量在 `more.waiting` / `more.working`。每行一句 headline：等待行取待处理交互的 kind 加它的提问摘录；工作中行取**结构化短语** `phrase`，没有短语时退回最近一次回合结果，再没有就是会话标题。`phrase` 用的是原先客户端逐行读 journal 时的同一套规则（`liveSummary`）：正在运行的 workflow 加它当前 running 的 phase，写成 `Workflow <native run id> · phase <label>`（排队中的下一个 phase 不算），否则是最近一条助手文本的首行；两者都没有时 `phrase` 缺省，不会退回标题。headline 与 phrase 都复用 digest 的脱敏与截断，Hub 不调模型。等待行按最近的交互从新到旧，工作中行按 `updatedAt` 从新到旧，id 作并列时的次序。台账行（`/sessions` 与 `/m`）的「下一步」仍走 `nextStep` 的优先级：状态待确认、待处理交互自己的摘要、等待处理、正在拉起，然后才是工作中行的短语（先取 glance 的 `phrase`，再取正在跟随的会话自己的短语），都没有时是「运行中…」；idle 与已结束的行不读短语。headline 只给 ⑥ 与 `remuda glance` 用，从不当作行的「下一步」。glance 里没有行的会话（idle/exited）不再逐行读 journal。
+
+**授权。** 只有 owner 自己的 Human 设备能读：Agent、Bot、以及带 `x-remuda-instance-id` 被降级成 Agent 的 Human 凭据都得到 403。
+
+行数上限沿用 lineage glance（等待与工作中各 50 行）。它落地后，首页删除对每一行逐个读 journal 的 2.5 s 轮询（`HomeList.tsx`），每个轮询周期只读一次 glance。一次调用的开销是一组有界查询：范围递归一次、实例页一次、阻塞任务一次、`/v1/interactions` 同一合并页一次（durable 行 + Hub 内存里的一次性授权 + 各 Node 的 live 副本，`需要你` 与收件箱因此同源），以及至多 50 条工作中会话各自一段有界 journal（与 digest 的 256 行上限相同）。
 
 ## 6 Main 卡与「问 Main」
 
@@ -432,10 +458,11 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - **本地与其他设备：** 本设备乐观更新。其他设备在下一个轮询周期（`GET /v1/instances`）里看到 ◉ 消失。
 - **恢复与章节：** 恢复出来的实例、以及 Main 的后继章节都是新的实例 id，没有 seen 行；它们要等自己的回合结束之后才可能出现 ◉。首页只对 Main 的现行章节显示 ◉。
 - **⑤ 刚完成：**
-  - 手机最多 3 行，桌面最多 3 个行内项，超出写成「+N」；
+  - 列的**正好是 ◉ 计数的那一组**：owner glance（§5.3）的 `doneUnseenIds`，从新到旧，标题数字就是 `counts.doneUnseen`。手机和桌面读同一组，桌面不再另外去掉子会话，也不在实例列表上再推一遍（实例列表比 owner 范围大）；
+  - 手机最多 3 行，桌面最多 3 个行内项，超出写成「+N」。`doneUnseenIds` 至多 50 个，计数照常是总数，展开后超出列表的部分写成不可点的「+N」；
   - 行标题加粗，用 ◉ 标记；
-  - 操作是「打开」（同时标为已看）、「标为已看」、「全部看过」；
-  - 没有 ◉ 的行时，整段隐藏。
+  - 操作是「打开」（同时标为已看）、「标为已看」、「全部看过」。本设备乐观更新：标为已看的行同时离开列表和 ◉ 计数，在 seen 写入提交之前就已发出的 glance 读取也不会把它画回来；
+  - 没有 ◉ 的行时、glance 还没到或已过期时，整段隐藏。
 
 ## 8 新鲜度
 

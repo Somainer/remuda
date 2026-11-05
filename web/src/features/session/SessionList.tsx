@@ -23,9 +23,11 @@ import { LaunchedByMark } from "./LaunchedBy";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
 import { useHomeFreshness } from "../home/freshness";
+import { useOwnerGlancePoll } from "../home/useOwnerGlance";
 import { HubBanner } from "../home/HubBanner";
 import { NoSessions, SkeletonRows } from "../home/HomeStates";
 import { useHeldOrder, type HoldSource } from "../../lib/useHeldOrder";
+import { dispatchedChild } from "../../lib/dispatched";
 import {
   applyFilters,
   availableConditions,
@@ -91,17 +93,29 @@ export function SessionList({
   // emit on equal payloads, so labels advance on this local tick instead.
   const nowMs = useNowTick();
   const [params, setParams] = useSearchParams();
+  // home-glance-d060 r3 item 6: a compact-width /sessions renders no
+  // PageHeader/① row, but the rows' phrases still read the glance — the
+  // refcounted poll keeps one shared reader alive from here too.
+  useOwnerGlancePoll();
   const conditions = readConditions(params);
   const global = conditions.scope === "all";
   const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
   const allowed = availableConditions(scope);
 
-  // home.md §5.2 / the 最近 caption: child sessions are never desktop rows.
-  // Global scope searches every top-level instance the hub knows about; a
-  // Space-pinned list renders the caller's instances minus children, so the ①
-  // 工作中 count (TOP_LEVEL_WORKING) always equals the rows a tap can show.
-  const source = (global ? hub.instances : (instances ?? hub.instances))
-    .filter((instance) => instance.parent == null);
+  // home.md §5.2/§5.3: the unfiltered board hides the sessions an Agent
+  // dispatched (they are never plain desktop rows). A resume is NOT one: it
+  // names the resumed session as its parent but stays on the board
+  // (`dispatchedChild`). The ① rank tap, however, filters by the SAME rank the
+  // owner glance counted, and that count includes dispatched workers (⑥ lists
+  // them too), so a rank-filtered board INCLUDES them. The tapped rows are the
+  // rank over the rows this board holds, not the glance's owner scope: inside
+  // the owner's world they match the count, but a session outside it (another
+  // agent's private lineage) is listed without being counted, and a Space
+  // scope lists only that Space's share of the count.
+  const rankFiltered = conditions.rank.length > 0;
+  const source = (global ? hub.instances : (instances ?? hub.instances)).filter(
+    (instance) => rankFiltered || !dispatchedChild(instance),
+  );
 
   // Children that are still running lift their idle parent into awaiting-wake.
   // The child's own rank decides (blocked/working/starting), not connectivity.
@@ -191,7 +205,7 @@ export function SessionList({
     .filter((instance) => uiMode(instance) === "tty-attachable")
     .map((instance) => instance.id)
     .join(",");
-  // Stable key for the rows actually rendered; drives the phrase/screen poll.
+  // Stable key for the tty rows actually rendered; drives the screen poll.
   const rowKey = filtered.map((instance) => instance.id).join(",");
 
   // Switching Space drops host/workspace conditions that the new fixed scope
@@ -323,7 +337,6 @@ export function SessionList({
   useEffect(() => {
     if (variant !== "full") return;
     const ttyIds = ptyKey ? (ptyKey.split(",") as Id[]) : [];
-    const rowIds = rowKey ? (rowKey.split(",") as Id[]) : [];
     const onList = location.pathname === "/sessions";
     const visible = visibleRows.current;
     // Caller order is list order; lift on-screen rows ahead of the 4-slot
@@ -332,7 +345,9 @@ export function SessionList({
       [...ids].sort((a, b) => Number(visible.has(b)) - Number(visible.has(a)));
     const tick = () => {
       if (onList && ttyIds.length) hubStore.refreshScreens(visibleFirst(ttyIds));
-      void hubStore.hydrateRowSummaries(rowIds);
+      // home-glance-d060 §5.3: the row phrase is the owner glance's one
+      // deterministic headline; the per-row journal read is gone (the poll's
+      // single /v1/owner/glance carries every headline).
     };
     tick();
     const timer = window.setInterval(tick, 2500);
@@ -747,13 +762,20 @@ export function SessionList({
         // Desktop groups are status buckets, not project groups, so an idle fold
         // here would hide the only row whenever every session is idle. Project
         // folding stays on the phone home; this list only shares rank().
+        // 「子 agent 不在此列」 is true only on the unfiltered board: the ① rank
+        // tap lists dispatched workers too (see `source` above), so the caption
+        // goes with the filter rather than contradicting the rows.
         return (
           <section key={group.key} data-testid={`session-group-${group.key}`}>
             <div className={css.group}>
               <div className={`${css.groupTitle} ${group.key === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
-              <div className={css.groupMeta}>
+              <div className={css.groupMeta} data-testid={`session-group-meta-${group.key}`}>
                 {items.length}
-                {group.key === "blocked" ? " · 置顶，不进折叠组" : group.key === "recent" ? " · 子 agent 不在此列" : ""}
+                {group.key === "blocked"
+                  ? " · 置顶，不进折叠组"
+                  : group.key === "recent" && !rankFiltered
+                    ? " · 子 agent 不在此列"
+                    : ""}
               </div>
             </div>
             {items.map((instance) => {
@@ -773,7 +795,19 @@ export function SessionList({
               const worktree = workspace?.worktreeLabel ?? workspace?.label;
               const branch = workspace?.branch;
               const slot = slotById.get(instance.id) ?? 0;
-              const step = nextStep(instance, pending ?? null, screen, hubStore.summaryOf(instance.id));
+              // nextStep keeps its own precedence (unknown, the pending
+              // interaction's summary, blocked, starting, then a working row's
+              // phrase, else 运行中…). The phrase is the glance's structured
+              // one — a running workflow and its phase, else the last
+              // assistant line, by the rules the per-row journal read used —
+              // with a followed session's own summary below it. Never the
+              // headline: that falls back to the title.
+              const step = nextStep(
+                instance,
+                pending ?? null,
+                screen,
+                hubStore.glancePhraseOf(instance.id) ?? hubStore.summaryOf(instance.id),
+              );
               const exit = exitLabel(instance);
               const sheetOpen = actionFor === instance.id;
               const stale = staleIds.has(instance.id);

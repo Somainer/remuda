@@ -1661,12 +1661,25 @@ pub const OWNER_RESUME_CAUSE: &str = "owner-resume";
 /// Result of [`Store::claim_detach_state`] (D-062 r3 item 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaimDetach {
-    /// A detach reached the Node, or may have (forwarded, not refused).
+    /// The Node accepted or settled a detach (not refused).
     Delivered,
     /// A detach is queued and not yet forwarded; the sweeps deliver it.
     Pending,
+    /// A detach was forwarded but the Node never answered: its frame may
+    /// have died with the link (`node rpc dropped`) or its reply was lost.
+    /// Nothing journals a frame the Node never saw, so it is sent again.
+    Unconfirmed,
     /// No detach was queued, or every one was refused before the Node ran it.
     Missing,
+}
+
+/// SQL predicate over `commands` (columns prefixed with `alias`, e.g. `o.`)
+/// for a close the Node accepted or settled without refusing it.
+fn detach_delivered_sql(alias: &str) -> String {
+    format!(
+        "{alias}forwarded = 1 AND {alias}state <> 'queued'
+         AND COALESCE({alias}settlement_outcome, '') NOT IN ('rejected', 'withheld', 'cancelled')"
+    )
 }
 
 /// Result of [`Store::mark_forward_intent_gated`].
@@ -5525,6 +5538,50 @@ impl Store {
         .await
     }
 
+    /// D-062 r4 item 1: the newest detach of each claimed instance that is
+    /// Unconfirmed (forwarded, never answered) over a link OLDER than the
+    /// host's current one — its frame may have died with that link, and the
+    /// Node never answers a frame it never saw. Only when no close of the
+    /// instance was delivered or is newer. The sweeps re-send these.
+    pub(crate) async fn unconfirmed_claim_detaches(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        self.read("unconfirmed_claim_detaches", move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT c.id, c.instance_id, c.host_id, c.operation, c.state, c.resolution,
+                        c.forwarded, c.payload_json, c.idempotency_key, c.created_at,
+                        c.updated_at, c.settlement_outcome, c.settlement_reason,
+                        c.settlement_http_status, c.settlement_http_body,
+                        c.initiator_instance_id, c.initiator_lineage_id,
+                        c.initiator_generation, c.initiator_device_id,
+                        c.initiator_root_turn_json
+                 FROM instances i
+                 JOIN commands c ON c.instance_id = i.id
+                 JOIN hosts h ON h.id = c.host_id
+                 WHERE i.driver = 'herdr-claimed'
+                   AND c.operation = 'instance.close'
+                   AND c.state = 'queued' AND c.forwarded = 1
+                   AND c.resolution IN ('unknown', 'reconciling')
+                   AND (c.link_generation IS NULL OR c.link_generation < h.link_generation)
+                   AND (?1 IS NULL OR c.host_id = ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM commands o
+                        WHERE o.instance_id = c.instance_id AND o.operation = 'instance.close'
+                          AND o.id <> c.id
+                          AND ((o.created_at, o.id) > (c.created_at, c.id)
+                               OR ({delivered})))
+                 ORDER BY c.created_at ASC, c.id ASC",
+                delivered = detach_delivered_sql("o."),
+            ))?;
+            let rows = stmt
+                .query_map(params![host_id], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// D-062 r3 item 1: where a claim's Node detach stands, read from its
     /// `instance.close` commands rather than from the release audit (which
     /// records the human's request, not its delivery).
@@ -5533,33 +5590,30 @@ impl Store {
         instance_id: String,
     ) -> Result<ClaimDetach, StoreError> {
         self.read("claim_detach_state", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT state, forwarded, COALESCE(settlement_outcome, '')
-                 FROM commands
-                 WHERE instance_id = ?1 AND operation = 'instance.close'",
-            )?;
-            let rows = stmt
-                .query_map(params![instance_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            // Forwarded and not refused: the Node got it (or may have; the
-            // close is idempotent and its journal converges the row).
-            if rows
-                .iter()
-                .any(|(_, forwarded, outcome)| *forwarded && outcome != "rejected")
-            {
+            let count = |predicate: &str| -> Result<bool, StoreError> {
+                Ok(conn.query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM commands
+                                         WHERE instance_id = ?1 AND operation = 'instance.close'
+                                           AND {predicate})"
+                    ),
+                    params![instance_id],
+                    |row| row.get(0),
+                )?)
+            };
+            // Only an answer from the Node (accepted, settled) is delivery. A
+            // forwarded close the Node never answered may never have reached
+            // it, and then nothing journals it: it is Unconfirmed, not done.
+            if count(&detach_delivered_sql(""))? {
                 return Ok(ClaimDetach::Delivered);
             }
-            if rows
-                .iter()
-                .any(|(state, forwarded, _)| state == "queued" && !forwarded)
-            {
+            if count("state = 'queued' AND forwarded = 0")? {
                 return Ok(ClaimDetach::Pending);
+            }
+            if count(
+                "state = 'queued' AND forwarded = 1 AND resolution IN ('unknown', 'reconciling')",
+            )? {
+                return Ok(ClaimDetach::Unconfirmed);
             }
             Ok(ClaimDetach::Missing)
         })

@@ -43,6 +43,13 @@ struct FakeNode {
     /// Refuse this many `instance.close` frames with an explicit error (the
     /// Node did not run them) before accepting.
     refuse_closes: std::sync::atomic::AtomicUsize,
+    /// D-062 r4 item 1: drop this many `instance.close` frames in transit
+    /// AFTER the Hub marked them forwarded — the Node never sees them and
+    /// nothing answers (`node rpc dropped`).
+    drop_closes: std::sync::atomic::AtomicUsize,
+    /// When set, the link dies with the dropped close (the transport is
+    /// unregistered), as when a socket tears down with frames queued.
+    vanish_with_dropped_close: Mutex<Option<(remuda_hub::HubTestHandle, String)>>,
 }
 
 impl FakeNode {
@@ -101,6 +108,22 @@ impl NodeTransport for FakeNode {
     {
         let method = method.to_owned();
         Box::pin(async move {
+            if method == "instance.close"
+                && self
+                    .drop_closes
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                let vanish = self.vanish_with_dropped_close.lock().unwrap().take();
+                if let Some((hub, host)) = vanish {
+                    hub.test_disconnect_node(&host).await;
+                }
+                return Err(remuda_hub::HubError::Internal("node rpc dropped".into()));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -1778,6 +1801,143 @@ async fn owner_notify_never_types_into_a_claimed_pane() -> Result<()> {
         "{:?}",
         fixture.node.methods()
     );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+// ---- D-062 r4 item 1: a close the Node never answered is sent again ----
+
+/// Claim w1:t1 with the fake Node's uniqueness on; returns the instance id.
+async fn claimed_unique(fixture: &Fixture) -> Result<String> {
+    fixture
+        .node
+        .node_uniqueness
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = claimed(fixture).await?;
+    assert!(fixture.node.held.lock().unwrap().contains_key(&id));
+    Ok(id)
+}
+
+/// The instance's `instance.close` rows as (state, forwarded, resolution).
+fn closes_of(fixture: &Fixture, id: &str) -> Result<Vec<(String, bool, String)>> {
+    let db = fixture.db()?;
+    let mut stmt = db.prepare(
+        "SELECT state, forwarded, resolution FROM commands
+          WHERE instance_id = ?1 AND operation = 'instance.close' ORDER BY created_at, id",
+    )?;
+    let rows = stmt
+        .query_map([id], |row| {
+            Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+async fn release_call(fixture: &Fixture, id: &str) -> Result<Value> {
+    let (status, body) = fixture
+        .call(
+            "POST",
+            &format!("/v1/instances/{id}/release"),
+            &fixture.human(),
+            None,
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "release {status}: {body}");
+    Ok(body)
+}
+
+#[tokio::test]
+async fn a_detach_dropped_with_its_link_is_sent_again_after_the_hello() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed_unique(&fixture).await?;
+    // The release's close is marked forwarded, then dies with the link.
+    fixture
+        .node
+        .drop_closes
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    *fixture.node.vanish_with_dropped_close.lock().unwrap() =
+        Some((fixture.hub.test_handle(), fixture.host.clone()));
+    let first = release_call(&fixture, &id).await?;
+    assert_eq!(first["released"], true, "{first}");
+    assert!(fixture.node.params_of("instance.close").is_empty());
+    assert!(
+        fixture.node.held.lock().unwrap().contains_key(&id),
+        "still claimed on the Node"
+    );
+    let closes = closes_of(&fixture, &id)?;
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(
+        (closes[0].0.as_str(), closes[0].1),
+        ("queued", true),
+        "{closes:?}"
+    );
+    assert!(
+        matches!(closes[0].2.as_str(), "unknown" | "reconciling"),
+        "{closes:?}"
+    );
+    // The Node reconnects: a hello installs a newer link.
+    let store = fixture.hub.store().context("store")?;
+    store
+        .bump_host_link_generation(fixture.host.clone())
+        .await?;
+    fixture
+        .hub
+        .test_set_node_transport(&fixture.host, fixture.node.clone())
+        .await;
+    fixture
+        .hub
+        .test_handle()
+        .test_run_post_hello(&fixture.host)
+        .await;
+    let node = fixture.node.clone();
+    eventually("the unanswered detach reaches the Node", || {
+        node.params_of("instance.close").len() == 1
+    })
+    .await?;
+    assert!(fixture.node.held.lock().unwrap().is_empty());
+    // Several hello/tick passes later it was still sent exactly once more.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    assert_eq!(
+        closes_of(&fixture, &id)?.len(),
+        2,
+        "one fresh close, no more"
+    );
+    let again = release_call(&fixture, &id).await?;
+    assert_eq!(again["released"], false, "delivered now: {again}");
+    let (status, claimed) = fixture
+        .call(
+            "POST",
+            "/v1/instances/claim",
+            &fixture.human(),
+            Some(&fixture.claim_body("w1:t1", None)),
+        )
+        .await?;
+    assert_eq!(status, 200, "the pane can be claimed again: {claimed}");
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_release_of_an_unanswered_detach_sends_it_again() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed_unique(&fixture).await?;
+    // The close is forwarded and never answered; the link stays up.
+    fixture
+        .node
+        .drop_closes
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let first = release_call(&fixture, &id).await?;
+    assert_eq!(first["released"], true, "{first}");
+    assert!(fixture.node.params_of("instance.close").is_empty());
+    // Not a no-op: the release sends the detach again, now.
+    let second = release_call(&fixture, &id).await?;
+    assert_eq!(second["released"], true, "{second}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    assert!(fixture.node.held.lock().unwrap().is_empty());
+    let third = release_call(&fixture, &id).await?;
+    assert_eq!(third["released"], false, "{third}");
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
     fixture.hub.shutdown().await;
     Ok(())
 }

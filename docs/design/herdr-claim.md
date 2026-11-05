@@ -130,13 +130,22 @@ Remuda does **not** own the claimed process.
   forwarded at once when the host is online, otherwise left queued and
   forwarded on the host's next `node.hello` and by the Hub's 1 s tick (each
   command is sent at most once). Release is idempotent, and what decides is
-  the detach's **delivery**, read from its command row, never the release
-  audit: releasing an instance that already ended answers 200 with
-  `released: false` when a detach was delivered (forwarded and not refused) or
-  is still queued (it is driven again now); with none, or only ones the Node
-  refused, it queues one and answers `released: true`. A claim whose commit
-  reply is lost (the Node may hold it) is failed on the Hub and its detach is
-  queued at once, so no claim is left that the Hub cannot release.
+  the detach's **delivery**, read from its command rows, never the release
+  audit. Delivered means the Node **answered**: it accepted or settled the
+  close without refusing it. Releasing an instance that already ended (or
+  whose host was lost) answers 200 with `released: false` when a detach was
+  delivered or is still queued (it is driven again now). A close that was
+  forwarded but never answered is *unconfirmed* — its frame may have died with
+  the link (`node rpc dropped`), and nothing journals a frame the Node never
+  saw — so the release sends it again (`released: true`), and so do the hello
+  and tick passes once the host is on a newer link. Sending again means a
+  fresh idempotent close carrying the original gate stamp, not a resend of the
+  old command id, so the durable forward mark keeps meaning "never resend"; a
+  Node without the claim answers it harmlessly. With no detach at all, or only
+  ones the Node refused, the release queues one and answers `released: true`.
+  A claim whose commit reply is lost (the Node may hold it) is failed on the
+  Hub and its detach is queued at once, so no claim is left that the Hub
+  cannot release.
 - The only things that act on the pane are `instance send` (the prompt
   input), `instance keys` and interrupt, and TTY control/observe from the PWA.
 - A Node shutdown is not a release: the claimed rows stay live and the next

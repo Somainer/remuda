@@ -547,11 +547,14 @@ async fn release(
     let host_lost = instance.lifecycle == "exited"
         && instance.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER);
     if matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") && !host_lost {
-        // D-062 r3 item 1: an ended or failed claim row may still be live on
-        // its Node (a claim whose commit reply was lost, a row from before
-        // the detach existed). What decides is the detach's delivery, never
-        // the release audit: one already delivered makes this a no-op, one
-        // still queued is driven now, and with none at all one is queued.
+        // An ended or failed claim row may still be live on its Node (a
+        // claim whose commit reply was lost, a release whose close never
+        // arrived). What decides is the detach's delivery, never the release
+        // audit (D-062 r3 item 1, r4 item 1):
+        // - delivered: a no-op;
+        // - queued, not yet sent: driven now, nothing new queued;
+        // - sent but never answered: sent again (a fresh idempotent close);
+        // - none, or only refused ones: one is queued.
         let detach = if instance.herdr_claim.is_some() {
             state
                 .store
@@ -561,34 +564,60 @@ async fn release(
         } else {
             ClaimDetach::Delivered
         };
-        let released = detach == ClaimDetach::Missing;
-        if released {
-            queue_detach(&state, &device, &instance, "ended-without-release").await?;
-        } else if detach == ClaimDetach::Pending {
-            deliver_detaches(&state, &instance.host_id).await;
-        }
-        let instance = state
-            .store
-            .get_instance(instance_id)
-            .await?
-            .ok_or(HubError::NotFound)?;
-        return Ok(Json(json!({ "instance": instance, "released": released })));
+        let released = match detach {
+            ClaimDetach::Missing => {
+                queue_detach(&state, &device, &instance, "ended-without-release").await?;
+                true
+            }
+            ClaimDetach::Unconfirmed => {
+                // Serialized with the sweeps, which re-send the same detach.
+                let _pass = state.herdr_detaches.lock().await;
+                let again = state
+                    .store
+                    .claim_detach_state(instance_id.clone())
+                    .await
+                    .map_err(map_store)?;
+                if again == ClaimDetach::Unconfirmed {
+                    queue_detach(&state, &device, &instance, "unconfirmed-detach-resent").await?;
+                }
+                again == ClaimDetach::Unconfirmed
+            }
+            ClaimDetach::Pending => {
+                deliver_detaches(&state, &instance.host_id).await;
+                false
+            }
+            ClaimDetach::Delivered => false,
+        };
+        return released_body(&state, instance_id, released).await;
     }
     queue_detach(&state, &device, &instance, "released").await?;
+    settle_released(&state, &instance_id).await?;
+    released_body(&state, instance_id, true).await
+}
+
+async fn settle_released(state: &AppState, instance_id: &str) -> Result<(), HubError> {
     state
         .publish_settlement(
             state
                 .store
-                .settle_instance_exited(instance_id.clone(), "released".into()),
+                .settle_instance_exited(instance_id.to_owned(), "released".into()),
         )
         .await
         .map_err(map_store)?;
+    Ok(())
+}
+
+async fn released_body(
+    state: &AppState,
+    instance_id: String,
+    released: bool,
+) -> Result<Json<Value>, HubError> {
     let instance = state
         .store
         .get_instance(instance_id)
         .await?
         .ok_or(HubError::NotFound)?;
-    Ok(Json(json!({ "instance": instance, "released": true })))
+    Ok(Json(json!({ "instance": instance, "released": released })))
 }
 
 /// Queue the Node detach for a claim (an idempotent `instance.close`),
@@ -631,14 +660,39 @@ async fn queue_detach(
     Ok(())
 }
 
-/// D-062 r3 item 1: forward every claim detach still queued for `host_id`.
-/// Runs after the host's hello and from the Hub tick, so a detach queued
-/// while the Node was away (or whose send never left the Hub) reaches it.
-/// Each command is sent at most once: `forward_if_online` serializes attempts
-/// per command and its durable forward mark refuses a second send.
+/// D-062 r3/r4 item 1: drive every claim detach the host still owes, after
+/// its hello and from the Hub tick:
+/// - a detach queued while the Node was away (or whose send never left the
+///   Hub) is forwarded;
+/// - a detach forwarded over an OLDER link that the Node never answered — its
+///   frame may have died with that link, and nothing journals a frame the
+///   Node never saw — is sent again as a fresh idempotent close carrying the
+///   original gate stamp (a new command, not a resend of the old id, so the
+///   durable forward mark keeps meaning "never resend"). A Node without the
+///   claim answers it harmlessly.
+///
+/// Passes are serialized (`AppState::herdr_detaches`); each command is sent
+/// at most once (`forward_if_online`'s leader and durable mark).
 pub(crate) async fn deliver_detaches(state: &AppState, host_id: &str) {
+    let _pass = state.herdr_detaches.lock().await;
+    deliver_detaches_locked(state, host_id).await;
+}
+
+async fn deliver_detaches_locked(state: &AppState, host_id: &str) {
     if state.nodes.kind_of(host_id).await.is_none() {
         return;
+    }
+    match state
+        .store
+        .unconfirmed_claim_detaches(Some(host_id.to_owned()))
+        .await
+    {
+        Ok(unconfirmed) => {
+            for command in unconfirmed {
+                resend_detach(state, &command).await;
+            }
+        }
+        Err(error) => tracing::warn!(%host_id, %error, "unconfirmed claim detaches not read"),
     }
     let pending = match state
         .store
@@ -659,24 +713,60 @@ pub(crate) async fn deliver_detaches(state: &AppState, host_id: &str) {
     }
 }
 
-/// The Hub tick's half of [`deliver_detaches`]: every online host with a
-/// queued detach. Skipped while a previous pass still runs.
+/// Queue a fresh close for an Unconfirmed detach, with the original
+/// payload: the same human request, already stamped by the gate. The
+/// pending pass that follows forwards it.
+async fn resend_detach(state: &AppState, unconfirmed: &crate::store::CommandRecord) {
+    let Some(instance_id) = unconfirmed.instance_id.clone() else {
+        return;
+    };
+    match state
+        .store
+        .queue_command(
+            None,
+            Some(instance_id.clone()),
+            unconfirmed.host_id.clone(),
+            "instance.close".into(),
+            unconfirmed.payload.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    {
+        Ok((command, _)) => tracing::info!(
+            %instance_id,
+            unconfirmed = %unconfirmed.command_id,
+            resent = %command.command_id,
+            "unanswered claim detach sent again"
+        ),
+        Err(error) => {
+            tracing::warn!(%instance_id, %error, "unconfirmed claim detach not re-queued")
+        }
+    }
+}
+
+/// The Hub tick's half of [`deliver_detaches`]: every online host that owes
+/// a detach. Skipped while another pass runs.
 pub(crate) async fn deliver_all_detaches(state: &AppState) {
     let Ok(_pass) = state.herdr_detaches.try_lock() else {
         return;
     };
-    let pending = match state.store.undelivered_claim_detaches(None).await {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::warn!(%error, "queued claim detaches not read");
-            return;
+    let mut hosts: Vec<String> = Vec::new();
+    for owed in [
+        state.store.undelivered_claim_detaches(None).await,
+        state.store.unconfirmed_claim_detaches(None).await,
+    ] {
+        match owed {
+            Ok(commands) => hosts.extend(commands.into_iter().map(|command| command.host_id)),
+            Err(error) => tracing::warn!(%error, "owed claim detaches not read"),
         }
-    };
-    let mut hosts: Vec<String> = pending.into_iter().map(|command| command.host_id).collect();
+    }
     hosts.sort();
     hosts.dedup();
     for host_id in hosts {
-        deliver_detaches(state, &host_id).await;
+        deliver_detaches_locked(state, &host_id).await;
     }
 }
 

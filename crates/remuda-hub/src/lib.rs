@@ -218,8 +218,8 @@ pub struct AppState {
     /// cb-wake-engine: the tick health `/healthz` reports and the fresh-mode
     /// drive.
     pub(crate) wake: crate::wake::WakeState,
-    /// D-062 r3 item 1: one tick pass of the queued claim-detach delivery
-    /// at a time.
+    /// D-062 r3/r4 item 1: one claim-detach delivery pass at a time (hello,
+    /// tick, and a release re-sending an unanswered detach).
     pub(crate) herdr_detaches: Arc<tokio::sync::Mutex<()>>,
 }
 

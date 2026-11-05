@@ -28,6 +28,7 @@ describe("claude-sdk is never rendered as claude-print", () => {
       "agy-print",
       "generic-pty",
       "shell-pty",
+      "herdr-claimed",
     ] satisfies DriverKind[]) {
       expect(mapDriver(kind)).toBe(kind);
     }

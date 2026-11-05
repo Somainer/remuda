@@ -20,6 +20,7 @@ import { isEmberEffort } from "./effort";
 import { RowActions, ROW_ACTIONS_HOST } from "../home/RowActions";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
+import { HerdrClaimBadge, closeVerb, isClaimed, releaseConfirmText } from "./HerdrClaimBadge";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { compareRanked, liveChildParents, rank, rankStateWord } from "../mobile/homeRows";
 import { useHomeFreshness } from "../home/freshness";
@@ -456,6 +457,7 @@ export function SessionList({
                 <span className={`${css.compactName} ${status === "exited" || status === "unknown" ? css.compactNameMute : ""}`}>
                   {hubStore.titleOf(instance.id)}
                 </span>
+                <HerdrClaimBadge instance={instance} />
               </div>
               <div className={css.compactMeta}>
                 {hubStore.hostName(instance.hostId)} / {workspace?.label} · {formatListTime(instance.updatedAt, nowMs)}
@@ -467,6 +469,7 @@ export function SessionList({
     );
   }
 
+  const stopForClaimed = hub.instances.some((row) => row.id === stopFor && isClaimed(row));
   return (
     <div
       className={css.root}
@@ -859,6 +862,7 @@ export function SessionList({
                       ) : null}
                       <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt, nowMs)}</span>
                       <LaunchedByMark launchedBy={instance.launchedBy} />
+                      <HerdrClaimBadge instance={instance} />
                       {screen?.done ? (
                         <span className={css.done} data-testid="board-done">
                           DONE
@@ -1137,7 +1141,7 @@ export function SessionList({
                             setStopFor(instance.id);
                           }}
                         >
-                          停止
+                          {closeVerb(instance, "停止")}
                         </button>
                       </div>
                     </form>
@@ -1151,7 +1155,9 @@ export function SessionList({
       </div>
       <Modal open={stopFor !== null} onClose={() => setStopFor(null)} labelledBy="board-stop-title">
         <p id="board-stop-title" data-testid="board-stop-confirm">
-          停止会话「{stopFor ? hubStore.titleOf(stopFor) : ""}」？（主机 {stopFor ? hubStore.hostName(hub.instances.find((row) => row.id === stopFor)?.hostId ?? "") : ""}）
+          {stopForClaimed
+            ? releaseConfirmText(stopFor ? hubStore.titleOf(stopFor) : "")
+            : `停止会话「${stopFor ? hubStore.titleOf(stopFor) : ""}」？（主机 ${stopFor ? hubStore.hostName(hub.instances.find((row) => row.id === stopFor)?.hostId ?? "") : ""}）`}
         </p>
         <button type="button" onClick={() => setStopFor(null)}>取消</button>
         <button
@@ -1164,7 +1170,7 @@ export function SessionList({
             if (id) void hubStore.close(id);
           }}
         >
-          停止
+          {stopForClaimed ? "释放" : "停止"}
         </button>
       </Modal>
       {gestureEnabled && slots.length ? (

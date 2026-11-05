@@ -29,6 +29,9 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
     if crate::dir_browser::is_host_dirs_method(method) {
         return node.host_dirs_rpc(method, params).await;
     }
+    if crate::herdr_claim::is_herdr_claim_method(method) {
+        return node.herdr_claim_rpc(method, params).await;
+    }
     if crate::files::is_host_files_method(method) {
         return node.host_files_rpc(method, params).await;
     }

@@ -135,6 +135,19 @@ async fn patch_instance(
         return Err(HubError::Forbidden);
     }
     if let Some(auto_continue) = body.auto_continue {
+        // D-062 r3 item 5: a claimed herdr pane takes no continuation.
+        if auto_continue
+            && state
+                .store
+                .get_instance(instance_id.clone())
+                .await
+                .map_err(http::map_store)?
+                .is_some_and(|instance| crate::herdr_claims::is_claimed(&instance))
+        {
+            return Err(crate::herdr_claims::takes_no_hub_input(
+                "auto-continue after a usage limit",
+            ));
+        }
         state
             .store
             .set_auto_continue(instance_id.clone(), auto_continue)

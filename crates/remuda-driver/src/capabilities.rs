@@ -29,7 +29,9 @@ pub enum MatrixMark {
 /// The started-driver tests pin each answer against the real `screen_read`.
 #[must_use]
 pub fn reads_screen(kind: DriverKind) -> bool {
-    matches!(kind, DriverKind::ShellPty)
+    // D-062: a claimed external pane has no transcript; its visible screen
+    // (`pane.read`) is the only evidence the stall fallback can read.
+    matches!(kind, DriverKind::ShellPty | DriverKind::HerdrClaimed)
 }
 
 /// Look up one cell of the §3.3 matrix (plus M0 `claude-bg`).
@@ -134,6 +136,11 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
         // `unsupported` would be a claim; `unknown` is what we know.
         (ShellPty, Steer) => MatrixMark::Unknown,
         (ShellPty, _) => MatrixMark::NotProvided,
+        // D-062: a claimed external pane. Remuda only bridges its TTY and
+        // types into it; nothing structured, no resume, no model switch.
+        (HerdrClaimed, TtyAttach | LiveAttach) => MatrixMark::SupportedStar,
+        (HerdrClaimed, Steer) => MatrixMark::Unknown,
+        (HerdrClaimed, _) => MatrixMark::NotProvided,
     }
 }
 
@@ -323,6 +330,7 @@ fn adapter_transport(kind: DriverKind) -> AdapterTransport {
         DriverKind::AgyPrint => AdapterTransport::AgyNative,
         DriverKind::GenericPty => AdapterTransport::GenericHerdr,
         DriverKind::ShellPty => AdapterTransport::ShellPty,
+        DriverKind::HerdrClaimed => AdapterTransport::HerdrClaimed,
     }
 }
 

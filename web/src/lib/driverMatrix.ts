@@ -134,6 +134,7 @@ export const DRIVER_LABELS: Record<import("../types/nativeRef").DriverKind, stri
   "grok-acp": "grok ACP",
   "agy-print": "agy print",
   "generic-pty": "通用 PTY (generic-pty)",
+  "herdr-claimed": "外部 herdr (herdr-claimed) · 认领，不托管",
 };
 
 /**

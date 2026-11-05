@@ -24,6 +24,8 @@ wire_enum!(DriverKind, "3.1", {
     AgyPrint => "agy-print",
     GenericPty => "generic-pty",
     ShellPty => "shell-pty",
+    // D-062: an external herdr pane a human started, claimed (not owned).
+    HerdrClaimed => "herdr-claimed",
 });
 
 wire_enum!(HostState, "2.1", {
@@ -1447,4 +1449,6 @@ wire_enum!(AdapterTransport, "3.2", {
     AgyNative => "agy-native",
     GenericHerdr => "generic-herdr",
     ShellPty => "shell-pty",
+    // D-062: TTY bridge and pane input on a claimed external herdr pane.
+    HerdrClaimed => "herdr-claimed",
 });

@@ -149,6 +149,9 @@ impl DevNode {
     /// anything that can block — a herdr socket that will not answer must not
     /// also hide an unrelated carrier's casualties.
     pub async fn reconcile_herdr(&self) -> Result<(), NodeError> {
+        // D-062: claimed external panes first — they live in sessions this
+        // Node does not own, so nothing below may settle or sweep them.
+        self.reconcile_herdr_claims().await?;
         self.reconcile_native_pty().await?;
         // Pin the hook relay now, so the copy captures the build the Node is
         // running rather than whatever lands before the first hooked launch,
@@ -382,6 +385,11 @@ impl DevNode {
             {
                 continue;
             }
+            // D-062: a claimed external pane is re-attached (or ended with
+            // evidence) by `reconcile_herdr_claims`, never by this sweep.
+            if instance.driver == remuda_protocol::DriverKind::HerdrClaimed {
+                continue;
+            }
             // Herdr-carried: the pane may still exist and be adoptable, so its
             // row is not this sweep's to settle. Doing it here would journal a
             // 「会话已结束」 for a session the operator is still looking at.
@@ -526,6 +534,18 @@ impl DevNode {
         self.inner.census_epoch.begin_shutdown();
         let mut tasks = tokio::task::JoinSet::new();
         for instance in self.inner.store.list_instances()? {
+            // D-062: a Node shutdown is not a release. A live claim keeps its
+            // row so the next Node start re-attaches it; only the watcher and
+            // the TTY bridge stop, and the external pane is never touched.
+            if instance.driver == remuda_protocol::DriverKind::HerdrClaimed
+                && !matches!(
+                    instance.lifecycle,
+                    InstanceLifecycle::Exited | InstanceLifecycle::Failed
+                )
+            {
+                self.suspend_claim(&instance.meta.id).await;
+                continue;
+            }
             let node = self.clone();
             tasks.spawn(async move {
                 node.close_ended_instance(&instance.meta.id, "node-shutdown")

@@ -457,7 +457,10 @@ pub fn driver_capability_snapshot(driver: DriverKind) -> CapabilitySnapshot {
             artifact: unsupported.clone(),
             tty_attach: if matches!(
                 driver,
-                DriverKind::GenericPty | DriverKind::ClaudePty | DriverKind::ShellPty
+                DriverKind::GenericPty
+                    | DriverKind::ClaudePty
+                    | DriverKind::ShellPty
+                    | DriverKind::HerdrClaimed
             ) {
                 supported.clone()
             } else {

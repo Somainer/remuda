@@ -1820,6 +1820,9 @@
             "type": "boolean",
             "readOnly": true,
             "description": "cb-usage-resume (main-agent.md §11.6): after a subscription usage limit resets, the Hub sends the instance one continuation input (origin `hub`): `continue` when the failed turn produced output, otherwise that turn's own input again; at most 3 between two pieces of substantive progress, and any Human or Agent input to the instance cancels the wait. Default off. Copied to every chapter of a continuity lineage; the owner changes it with `PATCH /v1/instances/{id}`."
+          },
+          "herdrClaim": {
+            "$ref": "#/components/schemas/HerdrClaim"
           }
         },
         "required": [
@@ -7206,6 +7209,119 @@
           "name"
         ],
         "type": "object"
+      },
+      "HerdrClaim": {
+        "type": "object",
+        "description": "D-062: the external herdr pane a `herdr-claimed` instance claims.",
+        "required": [
+          "session",
+          "socketPath",
+          "workspaceId",
+          "tabId",
+          "paneId"
+        ],
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "Session name (`default` = the user's default socket) or absolute API socket path, as the operator named it."
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "Resolved API socket."
+          },
+          "workspaceId": {
+            "type": "string"
+          },
+          "tabId": {
+            "type": "string"
+          },
+          "paneId": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string",
+            "description": "Agent kind herdr detected in the pane at claim time."
+          },
+          "process": {
+            "type": "object",
+            "description": "Foreground process at claim time; command is the executable base name only.",
+            "required": [
+              "pid",
+              "command"
+            ],
+            "properties": {
+              "pid": {
+                "type": "integer"
+              },
+              "command": {
+                "type": "string"
+              },
+              "startTicks": {
+                "type": "string"
+              }
+            }
+          },
+          "contact": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "lost"
+            ],
+            "description": "`lost` while the herdr server does not answer; never process end."
+          }
+        }
+      },
+      "InstanceClaimRequest": {
+        "type": "object",
+        "required": [
+          "hostId",
+          "herdrSession",
+          "workspaceId",
+          "tabId"
+        ],
+        "properties": {
+          "hostId": {
+            "type": "string"
+          },
+          "herdrSession": {
+            "type": "string",
+            "description": "Session name or absolute API socket path."
+          },
+          "workspaceId": {
+            "type": "string"
+          },
+          "tabId": {
+            "type": "string"
+          },
+          "paneId": {
+            "type": "string",
+            "description": "Required when the tab has more than one pane."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex",
+              "grok",
+              "agy",
+              "shell"
+            ],
+            "description": "Defaults to herdr's agent kind for the pane (`terminal` when it reports none)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "projectId": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object",
+            "description": "Explicit scope `{projectIds, hostIds, workspaceIds}`, as on create; not combined with projectId."
+          }
+        }
       },
       "OwnerGlance": {
         "type": "object",
@@ -14976,6 +15092,173 @@
         "tags": [
           "instances"
         ]
+      }
+    },
+    "/v1/hosts/{id}/herdr": {
+      "get": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostHerdrDiscover",
+        "summary": "List the host's reachable herdr sessions, workspaces, tabs and panes (human-only, D-062)",
+        "description": "Human operator origin only; Agent, Bot and narrowed callers get 403 with reason and next. Proxied to the addressed online Node's herdr.discover RPC. Metadata only: the Node never reads pane content (no pane.read / agent.read) and never lists its own carrier session. Each pane carries herdr's agent kind and status, the foreground process (pid and executable base name) and the instance that already claims it, if any.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "description": "Restrict to one herdr session: a name (`default` is the user's default socket) or an absolute API socket path.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Node answer (`{sessions:[…]}`)"
+          }
+        }
+      }
+    },
+    "/v1/instances/claim": {
+      "post": {
+        "tags": [
+          "instances"
+        ],
+        "operationId": "instanceClaim",
+        "summary": "Claim an external herdr pane as an instance (human-only, D-062)",
+        "description": "Human operator origin only. The Node first validates the target read-only (the workspace exists, the tab is in it, the pane is in the tab; without paneId the tab must have exactly one pane, else 400 listing its pane ids). The Hub then indexes a `herdr-claimed` instance (permissionMode `external`, launchedBy `user`) and the Node commits the claim, recording the ids and the pane's foreground process. A claim is not ownership: release or close only detaches. One live claim per (host, socket, pane): a second claim is 409 naming the existing instance.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstanceClaimRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "instance": {
+                      "$ref": "#/components/schemas/InstanceRecord"
+                    },
+                    "claim": {
+                      "$ref": "#/components/schemas/HerdrClaim"
+                    }
+                  },
+                  "required": [
+                    "instance",
+                    "claim"
+                  ]
+                }
+              }
+            },
+            "description": "Claimed instance"
+          }
+        }
+      }
+    },
+    "/v1/instances/{id}/release": {
+      "post": {
+        "tags": [
+          "instances"
+        ],
+        "operationId": "instanceRelease",
+        "summary": "Release a claimed herdr pane (detach only, human-only, D-062)",
+        "description": "Human operator origin only. Detaches from the claimed pane: the Node stops watching and bridging it and the instance ends with reason `released`. The pane, its process and its herdr server keep running. Idempotent: an instance that already ended answers 200 with released=false. 400 for an instance that is not `herdr-claimed`.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "instance": {
+                      "$ref": "#/components/schemas/InstanceRecord"
+                    },
+                    "released": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "instance",
+                    "released"
+                  ]
+                }
+              }
+            },
+            "description": "Release outcome"
+          }
+        }
       }
     }
   },

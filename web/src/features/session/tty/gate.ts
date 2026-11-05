@@ -14,7 +14,9 @@ export function isPtyBacked(instance: Instance): boolean {
   if (
     instance.driver === "shell-pty" ||
     instance.driver === "generic-pty" ||
-    instance.driver === "claude-pty"
+    instance.driver === "claude-pty" ||
+    // D-062: a claimed external herdr pane is a terminal first.
+    instance.driver === "herdr-claimed"
   ) {
     return true;
   }

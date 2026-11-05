@@ -546,8 +546,39 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
             })?;
             Ok(0)
         }
-        Cli::Observe { frames, cols, rows } => {
-            write_observe_frames(&frames, cols, rows)?;
+        Cli::Observe {
+            frames,
+            cols,
+            rows,
+            mode,
+            pane,
+            calls,
+        } => {
+            let logged = calls.is_file();
+            if logged {
+                append_call(
+                    &calls,
+                    &format!("terminal.{mode}"),
+                    &json!({ "pane_id": pane, "target": format!("{cols}x{rows}") }),
+                );
+            }
+            write_frames(&frames, cols, rows, logged)?;
+            if logged {
+                // D-062 claim tests: stay attached like a real control session
+                // and record how many input bytes reached which pane.
+                let mut stdin = io::stdin();
+                let mut buf = [0_u8; 4096];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => append_call(
+                            &calls,
+                            "terminal.input",
+                            &json!({ "pane_id": pane, "target": n.to_string() }),
+                        ),
+                    }
+                }
+            }
             Ok(0)
         }
         Cli::Help => {
@@ -565,6 +596,12 @@ enum Cli {
         frames: PathBuf,
         cols: u16,
         rows: u16,
+        /// `observe` / `control`, as herdr's CLI spells it.
+        mode: String,
+        /// Pane the session was opened for.
+        pane: String,
+        /// The opt-in call log next to the socket (D-062 claim tests).
+        calls: PathBuf,
     },
     Help,
 }
@@ -726,7 +763,21 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         if !frames_explicit && neighbor.is_file() {
             frames = neighbor;
         }
-        return Ok(Cli::Observe { frames, cols, rows });
+        // `terminal session <mode> <pane>`; the bare `terminal <pane>` form
+        // older fixtures use has no mode word.
+        let (mode, pane) = match positional.as_slice() {
+            [_, session, mode, pane, ..] if session == "session" => (mode.clone(), pane.clone()),
+            [_, pane, ..] => ("observe".to_string(), pane.clone()),
+            _ => ("observe".to_string(), String::new()),
+        };
+        return Ok(Cli::Observe {
+            frames,
+            cols,
+            rows,
+            mode,
+            pane,
+            calls: calls_neighbor(&socket),
+        });
     }
     // `serve` is the fake's own spelling; `server` is what herdr's CLI uses and
     // therefore what `HerdrServer::ensure` passes.
@@ -784,6 +835,18 @@ fn print_help() {
 /// for `N` milliseconds before continuing, so a test can script a mode switch
 /// (e.g. the pane entering the alt screen) at a deterministic moment.
 pub fn write_observe_frames(frames: &Path, cols: u16, rows: u16) -> Result<(), FakeHerdrError> {
+    write_frames(frames, cols, rows, false)
+}
+
+/// [`write_observe_frames`], optionally holding the session open: a
+/// `terminal.closed` envelope is skipped so the relay stays attached like a
+/// live pane (D-062 claim tests).
+fn write_frames(
+    frames: &Path,
+    cols: u16,
+    rows: u16,
+    keep_open: bool,
+) -> Result<(), FakeHerdrError> {
     let body = std::fs::read_to_string(frames)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -811,6 +874,9 @@ pub fn write_observe_frames(frames: &Path, cols: u16, rows: u16) -> Result<(), F
             continue;
         }
         let mut value: Value = serde_json::from_str(trimmed)?;
+        if keep_open && value.get("type").and_then(Value::as_str) == Some("terminal.closed") {
+            continue;
+        }
         if let Some(obj) = value.as_object_mut()
             && obj.get("type").and_then(Value::as_str) == Some("terminal.frame")
         {
@@ -856,7 +922,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
     let trace_path = std::env::var_os("FAKE_HERDR_TRACE")
         .map(PathBuf::from)
         .or_else(|| Some(options.socket.with_extension("trace.jsonl")));
-    let state = Arc::new(Mutex::new(State::new(
+    let mut initial = State::new(
         options.script,
         options.agent_start_delay,
         options.unavailable_calls,
@@ -873,7 +939,9 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.refuse_shell_exit_send_text,
         options.refuse_close_subscribes_marker.clone(),
         trace_path,
-    )));
+    );
+    initial.call_log = Some(calls_neighbor(&options.socket));
+    let state = Arc::new(Mutex::new(initial));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
     // select; an idle server parks in `accept()` at zero CPU.
@@ -954,6 +1022,25 @@ struct State {
     control_dispatch_record_file: Option<PathBuf>,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
+    /// D-062 claim tests: `<socket>.calls.jsonl`. When that file exists, every
+    /// RPC appends one line naming its method and the ids it targets (never
+    /// any text it carries), so a test can prove which panes were touched and
+    /// that nothing was closed.
+    call_log: Option<PathBuf>,
+    /// D-062 claim tests: per-pane foreground process override set through
+    /// `fake.set_pane_process`, so `pane.process_info` can report a real pid
+    /// the test controls.
+    pane_process: HashMap<String, (u32, String)>,
+    /// D-062 r2: per-pane shell pid override (`fake.set_pane_process` with
+    /// `shell_pid`), so a claim test can replace the pane's shell.
+    pane_shell: HashMap<String, u32>,
+    /// D-062 r3: panes whose `pane.process_info` fails (`true`: answers with
+    /// no `process_info` at all) while the session snapshot still answers.
+    pane_process_failure: HashMap<String, bool>,
+    /// D-062 r4: a foreground process that takes over the pane the moment a
+    /// `pane.send_text` reaches it (`fake.replace_process_on_text`), so a
+    /// test can replace the process between the text and its Enter.
+    pane_process_on_text: HashMap<String, (u32, String)>,
     /// JSONL append target recording the `env` map every `workspace.create`
     /// and `pane.split` actually received — the only place a driver test can
     /// assert on the pane environment the launch produced (the recipe's
@@ -1015,6 +1102,11 @@ impl State {
             refuse_shell_exit_send_text,
             refuse_close_subscribes_marker,
             server_generation: 1,
+            call_log: None,
+            pane_process: HashMap::new(),
+            pane_shell: HashMap::new(),
+            pane_process_failure: HashMap::new(),
+            pane_process_on_text: HashMap::new(),
         }
     }
 
@@ -1251,6 +1343,78 @@ fn lock_state(
         .map_err(|_| FakeHerdrError::Args("state poisoned".into()))
 }
 
+/// `<socket>.calls.jsonl`: the opt-in call log a D-062 claim test creates
+/// before it starts the fake (or its terminal relay) to record which panes
+/// every RPC and terminal session touched.
+pub fn calls_neighbor(socket: &Path) -> PathBuf {
+    let mut name = socket
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".calls.jsonl");
+    socket.with_file_name(name)
+}
+
+/// Append one id-only line to an existing call log. Never records text,
+/// keys or any other payload: the log proves *where* a call landed.
+fn append_call(path: &Path, method: &str, params: &Value) {
+    if !path.is_file() {
+        return;
+    }
+    let mut line = serde_json::Map::new();
+    line.insert("method".into(), json!(method));
+    for key in [
+        "pane_id",
+        "tab_id",
+        "workspace_id",
+        "target",
+        "target_pane_id",
+    ] {
+        if let Some(value) = params.get(key) {
+            line.insert(key.into(), value.clone());
+        }
+    }
+    let mut text = Value::Object(line).to_string();
+    text.push('\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = Write::write_all(&mut file, text.as_bytes());
+    }
+}
+
+fn record_call(st: &State, method: &str, params: &Value) {
+    if let Some(path) = &st.call_log {
+        append_call(path, method, params);
+    }
+}
+
+/// `fake.set_pane_process {pane_id, pid, name}`: make `pane.process_info`
+/// report `pid` as the pane's foreground process (D-062 claim tests).
+fn set_pane_process(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    let pane_id = params
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .ok_or(("invalid_request", "missing pane_id".into()))?;
+    let pid = params
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or(("invalid_request", "missing pid".into()))?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("process")
+        .to_string();
+    st.pane_process.insert(pane_id.to_string(), (pid, name));
+    if let Some(shell) = params
+        .get("shell_pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        st.pane_shell.insert(pane_id.to_string(), shell);
+    }
+    ok()
+}
+
 /// Append `{method, env}` for one pane-creating RPC so driver tests can assert
 /// on the environment the fake herdr actually received (the pane env is the
 /// layer a harness-home pin would ride, not the recipe allowlist).
@@ -1288,8 +1452,58 @@ fn handle_rpc(
     let mut st = state
         .lock()
         .map_err(|_| ("internal_error", "state poisoned".into()))?;
+    record_call(&st, &req.method, &req.params);
     match req.method.as_str() {
         "ping" => serde_json::to_value(pong(&st)).map_err(json_err),
+        "fake.set_pane_process" => set_pane_process(&mut st, &req.params),
+        "fake.clear_pane_process" => {
+            if let Some(pane_id) = req.params.get("pane_id").and_then(Value::as_str) {
+                st.pane_process.remove(pane_id);
+                st.pane_shell.remove(pane_id);
+                st.pane_process_failure.remove(pane_id);
+            }
+            ok()
+        }
+        // D-062 r4: `{pane_id, pid, name}` — the next `pane.send_text` to the
+        // pane makes `pid` its foreground process.
+        "fake.replace_process_on_text" => {
+            let pane_id = req
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .ok_or(("invalid_request", "missing pane_id".to_string()))?;
+            let pid = req
+                .params
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .ok_or(("invalid_request", "missing pid".to_string()))?;
+            let name = req
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("process")
+                .to_string();
+            st.pane_process_on_text
+                .insert(pane_id.to_string(), (pid, name));
+            ok()
+        }
+        // D-062 r3: `{pane_id, none?}` — `pane.process_info` for the pane
+        // fails (or, with `none: true`, answers without process info).
+        "fake.fail_pane_process" => {
+            let pane_id = req
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .ok_or(("invalid_request", "missing pane_id".to_string()))?;
+            let none = req
+                .params
+                .get("none")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            st.pane_process_failure.insert(pane_id.to_string(), none);
+            ok()
+        }
         "session.snapshot" => snapshot(&st),
         "workspace.create" => {
             trace_pane_env(&st, "workspace.create", &req.params);
@@ -1631,6 +1845,9 @@ fn pane_send_text(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .entry(pane_id.to_string())
         .or_default()
         .push_str(text);
+    if let Some(process) = st.pane_process_on_text.remove(pane_id) {
+        st.pane_process.insert(pane_id.to_string(), process);
+    }
     ok()
 }
 
@@ -1834,7 +2051,30 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
         .or_else(|| st.panes.keys().next().map(String::as_str))
         .ok_or(("invalid_request", "missing pane_id".into()))?
         .to_string();
-    let foreground_processes = if st.shell_panes.contains(&pane_id)
+    match st.pane_process_failure.get(&pane_id) {
+        Some(true) => {
+            return serde_json::to_value(PaneProcessInfoResult {
+                kind: "pane_process_info".into(),
+                process_info: None,
+            })
+            .map_err(json_err);
+        }
+        Some(false) => {
+            return Err((
+                "internal_error",
+                format!("process info for {pane_id} is not available"),
+            ));
+        }
+        None => {}
+    }
+    let foreground_processes = if let Some((pid, name)) = st.pane_process.get(&pane_id) {
+        vec![PaneProcessInfoProcess {
+            pid: *pid,
+            name: name.clone(),
+            argv0: Some(name.clone()),
+            argv: Some(vec![name.clone()]),
+        }]
+    } else if st.shell_panes.contains(&pane_id)
         || !st.agents.values().any(|agent| agent.pane_id == pane_id)
     {
         vec![PaneProcessInfoProcess {
@@ -1858,11 +2098,12 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
             argv: Some(vec!["fake-herdr".into()]),
         }]
     };
+    let shell_pid = st.pane_shell.get(&pane_id).copied().unwrap_or(4242);
     serde_json::to_value(PaneProcessInfoResult {
         kind: "pane_process_info".into(),
         process_info: Some(PaneProcessInfo {
             pane_id,
-            shell_pid: Some(4242),
+            shell_pid: Some(shell_pid),
             foreground_process_group_id: foreground_processes.first().map(|process| process.pid),
             foreground_processes,
         }),

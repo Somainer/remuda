@@ -190,7 +190,25 @@ fn memory_launch_table_has_one_row_per_admitted_pair() {
                  row for exactly the pairs the Node admits"
             );
         }
-        // Every arm of the materializer's driver match is reachable by a row.
+        // Every arm of the materializer's driver match is reachable by a row,
+        // except a driver no create admits at all (D-062 `herdr-claimed`: a
+        // claimed pane is never launched). Its arm must refuse, so no memory
+        // ever reaches a launch through it.
+        if !kinds
+            .iter()
+            .any(|kind| super::validate_kind_driver(*kind, *driver).is_ok())
+        {
+            assert_eq!(
+                *driver,
+                D::HerdrClaimed,
+                "{driver:?} is admitted for no kind"
+            );
+            assert!(
+                std::panic::catch_unwind(|| materialize(*driver, K::Claude, &[], false)).is_err(),
+                "{driver:?} has no §12.3 row, so its materializer arm must refuse"
+            );
+            continue;
+        }
         assert!(
             rows.iter().any(|(row_driver, _)| row_driver == driver),
             "{driver:?} has no row in the §12.3 table"

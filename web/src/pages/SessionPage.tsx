@@ -25,6 +25,9 @@ import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
+import { HerdrClaimBadge, isClaimed, releaseConfirmText } from "../features/session/HerdrClaimBadge";
+import { useClaimedScreen } from "../features/session/useClaimedScreen";
+import { Modal } from "../components/Modal";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { claudeDefaultTier, contextPercent } from "../features/session/effort";
@@ -309,6 +312,8 @@ function SessionPageBody({
   // that (and on compact) it is a ⋯ item.
   const wide = useWideDesktop();
   const [moreOpen, setMoreOpen] = useState(false);
+  // D-062: releasing a claimed herdr pane confirms first (the pane keeps running).
+  const [releasing, setReleasing] = useState(false);
   // D-040 (3) / D-053: run details is folded by default and its open state is
   // remembered on this device; the ⋯ item is its only trigger.
   const [runDetailsOpen, setRunDetailsOpen] = useState(readRunDetailsOpen);
@@ -582,6 +587,11 @@ function SessionPageBody({
     hub.events === undefined &&
     bubbles.length === 0 &&
     !isTtyLabFixtureId(instanceId);
+
+  // D-062: the screen projection of a claimed herdr pane is its live viewport.
+  const claimedScreen = useClaimedScreen(
+    instance && isClaimed(instance) && resolvedView === "structured" ? instance.id : null,
+  );
 
   if (!instance && hub.ready) {
     return <p style={{ padding: 16 }}>会话不存在</p>;
@@ -864,15 +874,41 @@ function SessionPageBody({
         onStop={
           status === "exited" || mainLineage
             ? null
-            : () => {
-                void hubStore.close(instance.id);
-              }
+            : isClaimed(instance)
+              ? () => setReleasing(true)
+              : () => {
+                  void hubStore.close(instance.id);
+                }
         }
+        stopLabel={isClaimed(instance) ? { aria: "Release", title: "释放（pane 继续运行）" } : undefined}
         more={
           <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
         }
       />
       <MainSessionBar instance={instance} mobile={mobile} />
+      {isClaimed(instance) ? (
+        <div data-testid="session-herdr-claim" style={{ padding: "2px 12px", display: "flex", minWidth: 0 }}>
+          <HerdrClaimBadge instance={instance} testId="session-herdr-claim-badge" />
+        </div>
+      ) : null}
+      <Modal open={releasing} onClose={() => setReleasing(false)} labelledBy="session-release-title">
+        <p id="session-release-title" data-testid="session-release-confirm">
+          {releaseConfirmText(title)}
+        </p>
+        <button type="button" onClick={() => setReleasing(false)}>
+          取消
+        </button>
+        <button
+          type="button"
+          data-testid="session-release-confirm-yes"
+          onClick={() => {
+            setReleasing(false);
+            void hubStore.close(instance.id).catch(() => hubStore.toast("释放失败，请重试"));
+          }}
+        >
+          释放
+        </button>
+      </Modal>
       <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
         {diagnosticRows}
       </RunDetails>
@@ -924,7 +960,7 @@ function SessionPageBody({
             加载 snapshot…
           </p>
         ) : genericPty ? (
-          <ScreenView instance={instance} events={events} />
+          <ScreenView instance={instance} events={events} live={claimedScreen} />
         ) : (
           <Transcript
             ref={transcriptRef}
@@ -1090,12 +1126,18 @@ function SessionPageBody({
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
-            genericPty ? ptyYoloChipLabel(instance.kind) : hub.permissionMode
+            // D-062: a claimed pane runs with whatever mode its owner set;
+            // Remuda records it as unknown and never invents one.
+            isClaimed(instance)
+              ? "external"
+              : genericPty
+                ? ptyYoloChipLabel(instance.kind)
+                : hub.permissionMode
           }
           // generic-PTY read-only chip: the Node yolo preset (bypass /
           // always-approve / skip-permissions) is a danger state and is in no
           // live table, so mark it explicitly (c-effortui r4 item 5(b)).
-          permissionDanger={genericPty}
+          permissionDanger={genericPty && !isClaimed(instance)}
           launchPermissionMode={genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)}
           permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
           permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}

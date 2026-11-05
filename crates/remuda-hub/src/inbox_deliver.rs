@@ -343,6 +343,12 @@ fn gate(conn: &Connection, lineage_id: &str) -> Result<Result<Chapter, Hold>, St
         Some((current, generation, _)) => (current, Some(generation)),
         None => (lineage_id.to_owned(), None),
     };
+    // D-062 r3 item 5: a claimed herdr pane never takes a batch. Like a gone
+    // chapter its rows fall back to the owner push, so no batch forms (a
+    // refused one would be handed back and re-formed forever).
+    if crate::herdr_claims::claimed_row(conn, &chapter_id)? {
+        return Ok(Err(Hold::Gone));
+    }
     #[allow(clippy::type_complexity)]
     let row: Option<(
         String,

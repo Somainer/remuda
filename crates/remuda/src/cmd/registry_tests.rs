@@ -230,3 +230,108 @@ fn fleet_run_declares_hosts_and_labels() {
     assert!(names.iter().any(|n| n == "labels"));
     assert!(fleet.find_subcommand("send").is_some());
 }
+
+#[test]
+fn instance_claim_and_release_parse_the_d062_flags() {
+    let cli = Cli::try_parse_from([
+        "remuda",
+        "instance",
+        "claim",
+        "--host",
+        "devbox",
+        "--herdr-session",
+        "work",
+        "--workspace",
+        "w2",
+        "--tab",
+        "w2:t19",
+        "--pane",
+        "w2:p5K",
+        "--kind",
+        "claude",
+        "--name",
+        "human claude",
+        "--project",
+        "prj_1",
+    ])
+    .expect("instance claim");
+    let Command::Instance(args) = cli.command else {
+        panic!("instance command")
+    };
+    let cmd::instance::InstanceCommand::Claim(claim) = args.command else {
+        panic!("claim")
+    };
+    assert_eq!(claim.host, "devbox");
+    assert_eq!(claim.herdr_session, "work");
+    assert_eq!(
+        (claim.workspace.as_str(), claim.tab.as_str()),
+        ("w2", "w2:t19")
+    );
+    assert_eq!(claim.pane.as_deref(), Some("w2:p5K"));
+    assert_eq!(claim.kind.as_deref(), Some("claude"));
+    assert_eq!(claim.project.as_deref(), Some("prj_1"));
+    assert!(
+        Cli::try_parse_from([
+            "remuda",
+            "instance",
+            "claim",
+            "--host",
+            "h",
+            "--herdr-session",
+            "s",
+            "--workspace",
+            "w1",
+            "--tab",
+            "w1:t1",
+            "--kind",
+            "emacs",
+        ])
+        .is_err(),
+        "--kind is claude|codex|grok|agy|shell"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "remuda",
+            "instance",
+            "claim",
+            "--host",
+            "h",
+            "--herdr-session",
+            "s",
+            "--workspace",
+            "w1",
+            "--tab",
+            "w1:t1",
+            "--project",
+            "p",
+            "--scope-project",
+            "q",
+        ])
+        .is_err(),
+        "--project and --scope-* conflict"
+    );
+    let cli = Cli::try_parse_from(["remuda", "instance", "release", "ins_1"]).expect("release");
+    let Command::Instance(args) = cli.command else {
+        panic!("instance command")
+    };
+    assert!(matches!(
+        args.command,
+        cmd::instance::InstanceCommand::Release { instance_id } if instance_id == "ins_1"
+    ));
+    let host = Cli::command()
+        .find_subcommand("host")
+        .expect("host")
+        .clone();
+    let herdr = host.find_subcommand("herdr").expect("host herdr");
+    let ls = herdr
+        .find_subcommand("ls")
+        .or_else(|| herdr.find_subcommand("list"));
+    let names: Vec<String> = ls
+        .expect("host herdr ls")
+        .get_arguments()
+        .map(|a| a.get_id().as_str().to_string())
+        .collect();
+    for flag in ["host", "session", "json"] {
+        assert!(names.iter().any(|n| n == flag), "herdr ls missing {flag}");
+    }
+}

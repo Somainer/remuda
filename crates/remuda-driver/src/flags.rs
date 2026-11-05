@@ -112,6 +112,8 @@ fn extra_allowlist(driver: DriverKind) -> &'static [&'static str] {
         DriverKind::GrokAcp => EXTRA_GROK,
         DriverKind::AgyPrint => EXTRA_AGY,
         DriverKind::ShellPty | DriverKind::GenericPty => EXTRA_CLAUDE,
+        // D-062: a claimed pane is never launched, so it takes no argv at all.
+        DriverKind::HerdrClaimed => &[],
     }
 }
 

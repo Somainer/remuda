@@ -1297,7 +1297,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 **2026-11-05 修订注（cb-command-queue）：自己排队的命令可列出、编辑、撤回；`instance.configure` 带 generation 与明确的 `deferred`。** 不新开 ADR。本 ADR 的规则全部不变：Hub 与 Node 绝不因 ACK 不明而重发；unknown 的命令绝不以新 commandId 自动重试；send 可重放、configure 不可重放；离线排队的 configure 重放仍 409。在此之上增加：
 
-1. **「自己的」= Hub 盖章的发起者。** Agent 只看见、只能操作 initiator 为自己实例或同一血缘的命令；Human 或 Bot 设备的是它自己认证排队的命令（排队设备 id 只存 Hub）；未收窄的 owner 可列出并撤回范围内所有人的。Hub 自己写入的输入（`origin: hub`）不属于任何调用方。授权不因此变化：目标实例仍须是调用方今天可以命令的；别人的命令是 404。
+1. **「自己的」= Hub 盖章的发起者。** Agent 只看见、只能操作 initiator 为自己实例或同一血缘的命令；Human 或 Bot 设备的是它自己认证排队的命令（排队设备 id 只存 Hub）；未收窄的 owner 可列出并撤回范围内所有人的，但只能编辑自己排队的。Hub 自己写入的输入（`origin: hub`）不属于任何调用方。授权不因此变化：目标实例仍须是调用方今天可以命令的；别人的命令是 404。
 2. **「排队中」=「尚未送达」。** 只有两种情形可编辑、撤回：Hub 行 `queued`+`forwarded=0`（在 Hub 的串行 writer 里对 `forwarded=0` 做 CAS，转发的 intent 标记只对仍 `queued` 的行生效，撤回与转发恰好一方获胜）；或 PTY 承载在 Node 投递队列里持有的 prompt（经 Node `command.withdraw` / `command.edit`，对投递声明先到先得）。其余一律 409 `already-delivered`，从不猜测。
 3. **编辑保留 commandId，按 `expectedRevision` CAS 加一；已转发的命令在任何 id 下都不因编辑而再次发出。** 只改 `instance.send` 的文本与附件。转发在 intent 标记之后重读行，所以只可能发出编辑后的版本。同 id 重放若带编辑前的原始 payload 仍是同一条命令（返回当前行，仍排队则照 G1 转发一次），不会被当作 `COMMAND_ID_CONFLICT` 而退回「状态待确认」、诱导用户「仍要再送一条？」造成重复。
 4. **排队的 configure 不可编辑，只能撤回后以新 commandId 重发**，与本 ADR 2026-09-25 的「configure 不可重放」一致。撤回已 merge 的 configure 时，仍保持其所设值的字段恢复为之前的值。

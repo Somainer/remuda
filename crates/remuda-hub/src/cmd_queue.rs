@@ -336,18 +336,20 @@ struct Owned {
 
 /// Resolve `command_id` for an edit or withdraw by `device`: visible to it
 /// (else 404), and addressed to an instance it may still command today (the
-/// send rule for an Agent).
+/// send rule for an Agent). Only a withdrawal reaches another caller's
+/// command (the unnarrowed owner's); an edit is always the caller's own.
 async fn owned_command(
     state: &AppState,
     device: &Device,
     command_id: &str,
+    edit: bool,
 ) -> Result<Owned, HubError> {
     let row = state
         .store
         .get_command(command_id.to_owned())
         .await?
         .ok_or(HubError::NotFound)?;
-    let viewer = viewer(state, device, false).await?;
+    let viewer = viewer(state, device, edit).await?;
     if !visible(&viewer, &row) {
         return Err(HubError::NotFound);
     }
@@ -432,7 +434,7 @@ async fn edit_command(
             "an edit carries `text`, `attachments` or both".into(),
         ));
     }
-    let owned = owned_command(&state, &device, &command_id).await?;
+    let owned = owned_command(&state, &device, &command_id, true).await?;
     if owned.row.operation != "instance.send" {
         return Err(HubError::not_editable(
             "a queued instance.configure cannot be edited (D-055); withdraw it and send a new one",
@@ -714,7 +716,7 @@ async fn withdraw_command(
         Some(revision) => Some(revision.value("expectedRevision")?),
         None => None,
     };
-    let owned = owned_command(&state, &device, &command_id).await?;
+    let owned = owned_command(&state, &device, &command_id, false).await?;
     if owned.row.settlement_outcome.as_deref() == Some("withdrawn") {
         return Ok(Json(json!({ "command": owned.row })));
     }

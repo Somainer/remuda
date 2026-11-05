@@ -2277,10 +2277,10 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 **「自己的」按 Hub 盖章的发起者判定，**绝不取自请求体，也不改变任何授权：
 - Agent 调用方只看见、只能操作 `initiator.instanceId` 是自己实例、或 `initiator.lineageId` 是自己血缘的命令（同一血缘的后继章节接手前一章节排的队）；
 - Human 或 Bot 设备的「自己的」是由该设备认证排队的命令；排队设备 id 记在 Hub 的命令行上，只存 Hub，不出现在任何响应里；
-- 未收窄的 owner（Human 设备，不带 `x-remuda-instance-id`）不带 `mine=1` 时列出并可撤回、编辑范围内任何调用方排队的命令；带 `mine=1` 时只看自己设备的；Agent 与 Bot 不论带不带 `mine=1` 都只看自己的；
+- 未收窄的 owner（Human 设备，不带 `x-remuda-instance-id`）不带 `mine=1` 时列出并可撤回范围内任何调用方排队的命令，但只能编辑自己设备排队的（别人排队的命令谁也不能编辑）；带 `mine=1` 时只看自己设备的；Agent 与 Bot 不论带不带 `mine=1` 都只看自己的；
 - Hub 自己写入的输入（`origin: hub`：inbox 事实批、重启通知、wake 投递）不属于任何调用方，不列出，不能编辑或撤回——它们未送达时由 Hub 自己在新 id 下重新组批；
 - 编辑与撤回时，目标实例仍必须是调用方今天可以命令的：Agent 适用 send 规则（`owns()`，或在其显式收窄的范围内）；
-- 不是自己的命令一律 404，与命令不存在相同；所以 Agent 永远编辑不了 Human 的命令，也编辑不了另一个 Agent 的命令。
+- 不是自己的命令一律 404，与命令不存在相同（owner 撤回别人的命令是唯一例外）；所以 Agent 永远编辑不了 Human 的命令，也编辑不了另一个 Agent 的命令，owner 也编辑不了 Main 排队的命令。
 
 **「排队中」即「尚未送达」。** 只有能证明命令还没到达 harness 时才允许编辑与撤回，两种情形：
 - `held: "hub"`：Hub 行 `state=queued` 且 `forwarded=0`（host 离线、fence 未确认、排在 owner 输入之后等）。编辑与撤回在 Hub 的串行 writer 里对 `forwarded=0` 做 CAS；转发的 intent 标记（`mark_forward_intent*`）在同一个 writer 里只对仍为 `queued` 的行生效，所以撤回与转发恰好一方获胜：撤回在先，行结算为 `withdrawn`，转发看到它已结算就什么也不写；转发在先，撤回得 409。转发在 intent 标记之后重读行内容，所以编辑后的文本是唯一可能发出的版本。

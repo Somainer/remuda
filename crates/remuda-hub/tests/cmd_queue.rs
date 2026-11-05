@@ -453,6 +453,13 @@ async fn authority_matrix_follows_the_stamp() -> Result<()> {
     // A state other than queued is refused, not silently widened.
     assert_eq!(ctx.get(&main, "/v1/commands?state=settled").await?.0, 400);
 
+    // The owner may withdraw Main's command but never edit it.
+    assert_eq!(
+        ctx.edit(&ctx.human, &agent_cmd, 0, "owner rewrite")
+            .await?
+            .0,
+        404
+    );
     // The owner withdraws Main's command; the actor is recorded.
     let (status, withdrawn) = ctx.withdraw(&ctx.human, &agent_cmd).await?;
     assert_eq!(status, 200, "{withdrawn}");

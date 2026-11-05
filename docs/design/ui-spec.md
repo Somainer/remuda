@@ -1084,7 +1084,7 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 **角标数 = 首页「需要你」数（D-061）。** 它等于两部分之和：真正在等 owner 的交互，加上没有对应交互的 owner 阻塞任务。Main 的提问只算一次；完成未看、通知和回合失败都不计入（[home.md](./home.md) §5.1）。因此：
 - v0.2.4「OS 角标与收件箱队列同源」改为「OS 角标 = 首页 N」；
 - 导航上「收件箱」的数字仍是收件箱队列本身，两者的差恰好是「任务待你」卡的张数；
-- Hub 的 `with_badge` 计数由 `home-queue`（加入任务）和 `routed-to`（只计 `routedTo=owner`）对齐到同一口径。
+- Hub 的 `with_badge` 计数由 `home-queue`（加入任务）和 `routed-to`（只计 `routedTo=owner`）对齐到同一口径；转给 Main 的提问不计入角标，lift 推送的角标已经把被 lift 的项算进去（[home.md](./home.md) §5.1）。
 
 **权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
 

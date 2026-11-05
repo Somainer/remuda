@@ -87,7 +87,7 @@ pub struct ParityModel {
     pub about: String,
     /// How to read the file, and what each column can and cannot claim.
     pub notes: Vec<String>,
-    /// Every Hub route, sorted by path then method.
+    /// Every Hub route, sorted by method, then path.
     pub routes: Vec<ParityRoute>,
     /// Every clap path, sorted.
     pub commands: Vec<ParityCommand>,

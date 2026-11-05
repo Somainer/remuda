@@ -639,17 +639,41 @@ pub fn read_skill_tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, LaunchUnav
             if !file_type.is_file() {
                 continue;
             }
-            let bytes = fs::read(&path).map_err(|error| io_reason_inside(&error))?;
-            total += bytes.len() as u64;
-            if files.len() + 1 > MAX_SKILL_FILES || total > MAX_SKILL_BYTES {
+            // The caps are checked BEFORE a byte is read: a configured tree
+            // holding one huge (or sparse) file must not be pulled into the
+            // Node's memory. `DirEntry::metadata` is an lstat, never followed.
+            let len = entry
+                .metadata()
+                .map_err(|error| io_reason_inside(&error))?
+                .len();
+            if files.len() >= MAX_SKILL_FILES || total.saturating_add(len) > MAX_SKILL_BYTES {
                 return Err(LaunchUnavailableReason::TooLarge);
             }
+            // Bounded by what is left of the budget, so a file that grows
+            // between the stat and the read is still refused, never loaded.
+            let bytes = read_at_most(&path, MAX_SKILL_BYTES - total)?;
+            total += bytes.len() as u64;
             let rel = relative(root, &path).ok_or(LaunchUnavailableReason::InvalidName)?;
             files.push((rel, bytes));
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+/// Read `path`, refusing it (`too-large`) the moment it holds more than
+/// `limit` bytes; at most `limit + 1` bytes are ever read.
+fn read_at_most(path: &Path, limit: u64) -> Result<Vec<u8>, LaunchUnavailableReason> {
+    use std::io::Read as _;
+    let file = fs::File::open(path).map_err(|error| io_reason_inside(&error))?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_reason_inside(&error))?;
+    if bytes.len() as u64 > limit {
+        return Err(LaunchUnavailableReason::TooLarge);
+    }
+    Ok(bytes)
 }
 
 /// Inside a tree that exists, a vanished entry is a read failure too.

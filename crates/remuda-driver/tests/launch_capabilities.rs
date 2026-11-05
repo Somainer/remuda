@@ -635,3 +635,46 @@ fn secret_bearing_inputs_never_reach_the_event() {
     let kit: &ConfiguredSkill = &snap.skills[0];
     assert!(kit.files.iter().any(|(rel, _)| rel == "token.txt"));
 }
+
+/// r2 item 1: the caps are checked before a byte is read. A sparse file
+/// claiming a terabyte would exhaust the Node if it were loaded; it is
+/// refused `too-large` from its size alone, and so is a tree whose small
+/// files add up past the budget.
+#[test]
+fn an_oversized_file_is_refused_before_it_is_read() {
+    use remuda_driver::launch::capabilities::{MAX_SKILL_BYTES, read_skill_tree};
+    let at = root();
+    let source = skill_source(at.dir.path(), "huge-kit");
+    let huge = fs::File::create(source.join("blob.bin")).unwrap();
+    huge.set_len(1 << 40).unwrap();
+    drop(huge);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        read_skill_tree(&source),
+        Err(LaunchUnavailableReason::TooLarge)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "refused from metadata, not by reading a terabyte"
+    );
+    let mut ask = Ask::new(DriverKind::ClaudeSdk, AgentKind::Claude);
+    ask.skills = vec![source.to_string_lossy().into_owned()];
+    let snap = ask.run(&at);
+    assert_eq!(
+        snap.payload.unavailable[0].reason,
+        LaunchUnavailableReason::TooLarge
+    );
+    assert!(snap.payload.refusal.is_none(), "too-large never refuses");
+
+    // Several files, each under the cap, whose sum is over it.
+    let at = root();
+    let source = skill_source(at.dir.path(), "wide-kit");
+    for index in 0..3 {
+        let file = fs::File::create(source.join(format!("part-{index}.bin"))).unwrap();
+        file.set_len(MAX_SKILL_BYTES / 2).unwrap();
+    }
+    assert_eq!(
+        read_skill_tree(&source),
+        Err(LaunchUnavailableReason::TooLarge)
+    );
+}

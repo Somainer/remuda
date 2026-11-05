@@ -1285,7 +1285,10 @@ function createMockApi(): HubApi {
     async ownerGlance(tzOffsetMinutes) {
       // The demo database has no journal tails, so every headline falls back to
       // the session title; the counts stay the same §5.1/§5.2 rules.
-      const pending = mockDb.interactions.filter((row) => row.state === "pending");
+      // D-061: an item routed to Main or another agent is not the owner's.
+      const pending = mockDb.interactions.filter(
+        (row) => row.state === "pending" && row.routedTo !== "main" && row.routedTo !== "agent",
+      );
       const queued = new Set(pending.map((row) => row.instanceId));
       const waiting = [...queued].flatMap((instanceId) => {
         const row = mockDb.instances.find((item) => item.id === instanceId);

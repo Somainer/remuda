@@ -968,6 +968,56 @@ mod gate_scan {
     /// [`super::verify_direct`] refuses an unstamped pane write. Each must
     /// still exist and still go through that helper.
     const SEAMS: &[(&str, &str)] = &[("lib.rs", "test_call_node_op")];
+    /// Node transport sends and, per argument count, the method's index:
+    /// `ConnectedNodes::call(host, method, params, timeout)`,
+    /// `NodeTransport::call(method, params, timeout)`,
+    /// `ConnectedNodes::notify(host, method, params)`,
+    /// `NodeTransport::notify(method, params)`, and their UFCS forms, whose
+    /// receiver is one more leading argument.
+    const TRANSPORT_SENDS: &[(&str, &[(usize, usize)])] = &[
+        (".call(", &[(3, 0), (4, 1)]),
+        (".notify(", &[(2, 0), (3, 1)]),
+        ("::call(", &[(4, 1), (5, 2)]),
+        ("::notify(", &[(3, 1), (4, 2)]),
+    ];
+    /// Method constants that are never a pane write, with their values (the
+    /// test checks each value is not in [`PANE_WRITE_OPS`]). Any other
+    /// ALL_CAPS method argument may be one.
+    const READ_ONLY_METHODS: &[(&str, &str)] = {
+        use remuda_protocol::hubnode as hn;
+        &[
+            ("METHOD_API_OPEN", hn::METHOD_API_OPEN),
+            ("METHOD_API_BODY", hn::METHOD_API_BODY),
+            ("METHOD_API_HEAD", hn::METHOD_API_HEAD),
+            ("METHOD_API_CHUNK", hn::METHOD_API_CHUNK),
+            ("METHOD_API_END", hn::METHOD_API_END),
+            ("METHOD_API_CANCEL", hn::METHOD_API_CANCEL),
+            ("METHOD_API_CREDIT", hn::METHOD_API_CREDIT),
+            ("METHOD_API_EGRESS", hn::METHOD_API_EGRESS),
+            ("METHOD_HERDR_DISCOVER", hn::METHOD_HERDR_DISCOVER),
+            ("METHOD_HERDR_RESOLVE", hn::METHOD_HERDR_RESOLVE),
+            ("METHOD_INSTANCE_CLAIM", hn::METHOD_INSTANCE_CLAIM),
+            ("METHOD_TTY_SCREEN", hn::METHOD_TTY_SCREEN),
+            ("METHOD_SUBAGENT_TRANSCRIPT", hn::METHOD_SUBAGENT_TRANSCRIPT),
+            (
+                "METHOD_LINEAGE_FENCE",
+                remuda_protocol::METHOD_LINEAGE_FENCE,
+            ),
+            ("METHOD_GATE_LAND", remuda_protocol::METHOD_GATE_LAND),
+            ("METHOD_GATE_UNPIN", remuda_protocol::METHOD_GATE_UNPIN),
+            (
+                "METHOD_GATE_ABORT_LANDING",
+                remuda_protocol::METHOD_GATE_ABORT_LANDING,
+            ),
+            (
+                "METHOD_GATE_RESOLVE_LANDING",
+                remuda_protocol::METHOD_GATE_RESOLVE_LANDING,
+            ),
+        ]
+    };
+    /// Receivers of a `.notify(` that is not a Node transport, `(file,
+    /// receiver)`: the Web Push service in alerts.
+    const NOT_NODE_RECEIVERS: &[(&str, &str)] = &[("alerts.rs", "push")];
     /// Gate calls: the Human-only gate and its two backstops.
     const GATES: &[&str] = &["authorize_pane_write(", "verify_forward(", "verify_direct("];
     /// The transport layer itself routes nothing.
@@ -1199,10 +1249,10 @@ mod gate_scan {
             // A variable, a field or an expression carries any method.
             return true;
         }
-        PANE_WRITE_OPS.iter().any(|op| {
-            let named = op.replace('.', "_").to_ascii_uppercase();
-            last.contains(&named)
-        })
+        // A constant is a possible write unless it is a known read-only
+        // method (its value is checked against PANE_WRITE_OPS below): a
+        // `const RELAY: &str = "instance.send"` says nothing in its name.
+        !READ_ONLY_METHODS.iter().any(|(name, _)| *name == last)
     }
 
     /// Whether the match at `at` starts an identifier (not `xcall_node(`).
@@ -1230,19 +1280,39 @@ mod gate_scan {
                 let body = &text[start..end];
                 let gated = GATES.iter().any(|gate| body.contains(gate));
                 let mut sends: Vec<(String, String)> = Vec::new();
-                // Any `.call(`: a Node transport call by its arity.
-                let mut search = 0;
-                while let Some(found) = body[search..].find(".call(") {
-                    let at = search + found;
-                    search = at + ".call(".len();
-                    let args = arguments(body, at + ".call(".len() - 1);
-                    let method = match args.len() {
-                        0..=2 => continue,
-                        3 => args[0].clone(),
-                        4 => args[1].clone(),
-                        _ => "<unknown arity>".to_owned(),
-                    };
-                    sends.push((".call".to_owned(), method));
+                // Any Node transport send, by its shape and arity (the method
+                // argument's index for each arity; fewer arguments is not a
+                // Node transport send, more is flagged).
+                for (pattern, by_arity) in TRANSPORT_SENDS {
+                    let mut search = 0;
+                    while let Some(found) = body[search..].find(pattern) {
+                        let at = search + found;
+                        search = at + pattern.len();
+                        let receiver: String = body[..at]
+                            .chars()
+                            .rev()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        if NOT_NODE_RECEIVERS.contains(&(file.as_str(), receiver.as_str())) {
+                            continue;
+                        }
+                        let args = arguments(body, at + pattern.len() - 1);
+                        let fewest = by_arity.iter().map(|(arity, _)| *arity).min().unwrap_or(0);
+                        if args.len() < fewest {
+                            continue;
+                        }
+                        let method = by_arity
+                            .iter()
+                            .find(|(arity, _)| *arity == args.len())
+                            .map_or_else(
+                                || "<unknown arity>".to_owned(),
+                                |(_, index)| args[*index].clone(),
+                            );
+                        sends.push(((*pattern).to_owned(), method));
+                    }
                 }
                 for (home, helper, method_arg, private) in HELPERS {
                     if *private && *home != file.as_str() {
@@ -1322,6 +1392,20 @@ mod gate_scan {
             body("node_ops.rs", "call_admitted_frame").contains("herdr_claims::verify_direct("),
             "call_admitted_frame must keep the direct-RPC backstop"
         );
+        // The read-only allowlist really is read-only, and each exempt
+        // receiver still exists.
+        for (name, value) in READ_ONLY_METHODS {
+            assert!(
+                !PANE_WRITE_OPS.contains(value),
+                "{name} = {value} is a pane write; it cannot be allowlisted"
+            );
+        }
+        for (file, receiver) in NOT_NODE_RECEIVERS {
+            assert!(
+                text(file).contains(&format!("{receiver}.notify(")),
+                "{file}: no {receiver}.notify( left to exempt"
+            );
+        }
         // Production code after a file's first test item is scanned too.
         for (file, late) in [
             ("lib.rs", "fn expire_stale_requested"),
@@ -1377,6 +1461,25 @@ mod gate_scan {
             r#"async fn variable_op(state: AppState, op: &str) {
                 transport.call(op, params, timeout).await;
             }"#,
+            // D-062 r4 item 2: a constant whose name says nothing.
+            r#"const RELAY: &str = "instance.send";
+            async fn relay_const(state: AppState) {
+                state.nodes.call(&host, RELAY, params, timeout).await;
+            }"#,
+            // A notify, which no runtime backstop sees.
+            r#"async fn notify_keys(state: AppState) {
+                state.nodes.notify(&host, "instance.keys", params).await;
+            }"#,
+            r#"async fn notify_raw(link: Arc<dyn NodeTransport>) {
+                link.notify("tty.write", params).await;
+            }"#,
+            // The UFCS forms.
+            r#"async fn ufcs_call(state: AppState) {
+                ConnectedNodes::call(&state.nodes, &host, "instance.send", params, timeout).await;
+            }"#,
+            r#"async fn ufcs_notify(state: AppState) {
+                crate::transport::ConnectedNodes::notify(&state.nodes, &host, "tty.write", params).await;
+            }"#,
             // A comment inside the arguments does not hide the method.
             r#"async fn commented(state: AppState) {
                 state.nodes.call(
@@ -1425,6 +1528,10 @@ mod gate_scan {
             }"#,
             // Not a Node transport call: too few arguments.
             r#"fn service(svc: S) { svc.call(request); }"#,
+            // A notify of a read-only method.
+            r#"async fn egress(state: AppState) {
+                state.nodes.notify(&host, METHOD_API_EGRESS, params).await;
+            }"#,
         ];
         for text in passed {
             let found = fixture(text);

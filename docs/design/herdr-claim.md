@@ -41,12 +41,14 @@ per-instance `human-only` result. The Node refuses the same writes to a
 claimed pane unless the frame's Hub-stamped `origin` is `human` — a frame with
 **no** origin is refused too, so an omission cannot downgrade the check. A
 source-scan test (`herdr_claims::gate_scan`) fails if a Hub function sends a
-pane-write Node RPC without the gate: it reads every `.call(` on any Node
-transport whatever the receiver is named, every call of a method-forwarding
+pane-write Node RPC without the gate: it reads every `.call(` and `.notify(`
+on any Node transport whatever the receiver is named, their UFCS forms
+(`ConnectedNodes::call(&state.nodes, …)`), every call of a method-forwarding
 helper (`call_node`, `call_node_pinned`, `call_admitted`,
 `call_admitted_frame`, the host-files and SCM proxies, the workspace mutation),
-and treats a non-literal method as possibly a pane write; RED fixtures prove
-each shape is caught. A claimed pane cannot be resumed at all (400).
+and treats any non-literal method — a variable, or a constant not on an
+explicit read-only allowlist whose values the test checks — as possibly a pane
+write; RED fixtures prove each shape is caught. A claimed pane cannot be resumed at all (400).
 
 **Hub-origin input never reaches a claimed pane** (round 3). Remuda did not
 start the process in it, so Hub voice typed into it is unsafe. The gate above

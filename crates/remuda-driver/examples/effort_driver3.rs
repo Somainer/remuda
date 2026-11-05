@@ -148,6 +148,7 @@ async fn main() {
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
+            configured_skills: Vec::new(),
             settings_overlay: None,
         },
     );

@@ -399,6 +399,7 @@ fn kind_name(obs: &Observation) -> &'static str {
             remuda_protocol::ObservationKind::Permission => "permission",
             remuda_protocol::ObservationKind::RawTty => "raw_tty",
             remuda_protocol::ObservationKind::Opaque => "opaque",
+            remuda_protocol::ObservationKind::LaunchCapabilities => "launch.capabilities",
         },
     }
 }

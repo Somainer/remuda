@@ -51,5 +51,10 @@ pub(crate) fn facts(
         herdr: advertises_herdr(host),
         delegated_decisions,
         inbox,
+        // cb-seat-profile: what this chapter launched with, from its own row.
+        profile: crate::seat_profile::facts_of(
+            instance.profile_revision,
+            instance.profile_json.as_ref(),
+        ),
     })
 }

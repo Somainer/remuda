@@ -1245,6 +1245,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/lineages/{id}/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A lineage's seat profile, whether an edit waits for the next chapter, and the newest launch snapshot
+         * @description cb-seat-profile (D-063, main-agent.md §3.4.2). Human devices may read any lineage; an Agent may read only its own lineage (the seat reads its own profile); a Bot credential gets 403. `pending` is true while the live chapter's applied revision is older than the profile's (「待下一章节生效」). `lastLaunch` is the newest launch.capabilities event of the lineage's chapters.
+         */
+        get: operations["getLineageProfile"];
+        /**
+         * Edit a lineage's seat profile with a revision compare-and-set
+         * @description Only an unnarrowed Human device: an Agent (the seat itself included), a Bot or a Human token narrowed with x-remuda-instance-id gets 403 reason profile-human-only. expectedRevision 0 creates the profile from the live chapter's spec; a stale revision gets 409 PROFILE_REVISION_CONFLICT with currentRevision. An absent field keeps its value. The edit takes effect at the next chapter (restart or resume), never mid-chapter. Each edit writes an audit row lineage.profile.set with the changed field names only.
+         */
+        put: operations["putLineageProfile"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/lineages/{id}/wake-ups": {
         parameters: {
             query?: never;
@@ -2890,6 +2914,8 @@ export interface components {
             role?: "worker" | "project-coordinator" | "top-coordinator";
             scope?: components["schemas"]["InstanceScope"];
             settingsOverlayPath?: string;
+            /** @description cb-seat-profile (D-063): host-absolute skill directories the Node installs into the native home. Human and Bot creators only (an Agent gets 403, as for binaryPath). */
+            skills?: string[];
             taskId?: string;
             title?: string;
             /** @description Requested renderer. Omission inherits the host default, then fullscreen. */
@@ -2995,6 +3021,8 @@ export interface components {
             } & {
                 [key: string]: unknown;
             };
+            /** @description cb-seat-profile: the newest launch.capabilities payload of this chapter; absent before its first launch event. */
+            launchCapabilities?: components["schemas"]["LaunchCapabilities"];
             /**
              * @description Who ran the launch command (D-028 §1.0 rule 4). Provenance only, never a capability level: a user-launched session is entitled to exactly the same signals as a Remuda-launched one. Derived from mode/promotedAt for rows written before D-028.
              * @enum {string|null}
@@ -3048,6 +3076,8 @@ export interface components {
             readonly parentInstanceId?: string | null;
             /** @description Requested harness permission mode from the create/configure spec; the transcript-observed effective mode is permissionEffective (D-057 §3.3). */
             permissionMode?: string | null;
+            /** @description cb-seat-profile: the lineage profile revision this chapter's spec was built from; absent without one. */
+            profileRevision?: number;
             /** @description When the terminal was promoted. Absent unless mode is "promoted". */
             promotedAt?: string | null;
             providerProfileId?: string | null;
@@ -3064,6 +3094,8 @@ export interface components {
              * @enum {string|null}
              */
             readonly signalTier?: "hook" | "file" | "osc" | "screen" | "none" | null;
+            /** @description cb-seat-profile: configured skill directories (spec.skills). */
+            skills?: string[];
             title?: string | null;
             /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
             readonly tui?: components["schemas"]["TuiMode"];
@@ -3190,6 +3222,47 @@ export interface components {
             scannedRows?: string;
             /** @enum {string} */
             state: "pending" | "running" | "done";
+        };
+        /** @description Generated shape: LaunchCapabilitiesPayload in crates/remuda-protocol/schema/protocol.schema.json (the launch.capabilities journal payload, protocol.md §5.5). */
+        LaunchCapabilities: {
+            configured: {
+                class: string;
+                name: string;
+                source: string;
+            }[];
+            driver: string;
+            harness: string;
+            /** @enum {string} */
+            launch: "create" | "resume";
+            /** @description U64 decimal string */
+            profileRevision: string | null;
+            refusal: {
+                next?: {
+                    action?: string;
+                    hint?: string;
+                };
+                reason?: string;
+            } | null;
+            /** @description Configured skill trees removed from the shared native home before this launch (r2); absent on older events. */
+            removed?: string[];
+            resolved: {
+                class: string;
+                digest: string | null;
+                name: string;
+                path: string | null;
+                root: string | null;
+                via: string;
+            }[];
+            skipped: {
+                class: string;
+                name: string;
+                reason: string;
+            }[];
+            unavailable: {
+                class: string;
+                name: string;
+                reason: string;
+            }[];
         };
         /** @description One chapter of a lineage (D-057 §5). */
         LineageChapter: {
@@ -4095,6 +4168,71 @@ export interface components {
          * @enum {string}
          */
         RoutedTo: "owner" | "main" | "agent";
+        /** @description Generated shape: SeatProfile in crates/remuda-protocol/schema/protocol.schema.json. */
+        SeatProfile: {
+            createdAt: string;
+            displayName: string | null;
+            effort: {
+                name?: string;
+                ultracode?: boolean;
+            } | null;
+            lineageId: string;
+            modelCandidates: string[];
+            permissionMode: string;
+            revision: number;
+            role: string | null;
+            skills: string[];
+            updatedAt: string;
+            updatedBy: string;
+        };
+        /** @description Generated shape: SeatProfileChapter in crates/remuda-protocol/schema/protocol.schema.json. */
+        SeatProfileChapter: {
+            appliedRevision: number | null;
+            generation: number;
+            instanceId: string;
+        };
+        SeatProfileConflict: {
+            /** @enum {string} */
+            code: "PROFILE_REVISION_CONFLICT";
+            currentRevision: number;
+            error: string;
+            next: {
+                action?: string;
+                hint?: string;
+            };
+            reason: string;
+        };
+        /** @description Generated shape: SeatProfilePutResult in crates/remuda-protocol/schema/protocol.schema.json. */
+        SeatProfilePutResult: {
+            changed: string[];
+            pending: boolean;
+            profile: components["schemas"]["SeatProfile"];
+        };
+        SeatProfileUpdate: {
+            displayName?: string | null;
+            effort?: {
+                name: string;
+                ultracode?: boolean;
+            } | string | null;
+            /** @description 0 creates the profile */
+            expectedRevision: number;
+            modelCandidates?: string[];
+            permissionMode?: string;
+            role?: string | null;
+            skills?: string[];
+        };
+        /** @description Generated shape: SeatProfileView in crates/remuda-protocol/schema/protocol.schema.json. */
+        SeatProfileView: {
+            lastLaunch: {
+                generation: number;
+                instanceId: string;
+                payload: components["schemas"]["LaunchCapabilities"];
+            } | null;
+            lineageId: string;
+            liveChapter: components["schemas"]["SeatProfileChapter"];
+            pending: boolean;
+            profile: components["schemas"]["SeatProfile"] | null;
+        };
         SeenRequest: {
             /** @description Highest journal seq the client has shown for this instance, as the decimal string the Hub serializes (a JSON integer is also accepted). Clamped to the instance's durable seq; a value at or below the current seen seq changes nothing. */
             durableSeq: string | number;
@@ -7230,6 +7368,71 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    getLineageProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Seat profile view */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeatProfileView"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    putLineageProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeatProfileUpdate"];
+            };
+        };
+        responses: {
+            /** @description Profile after the edit */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeatProfilePutResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            /** @description Stale expectedRevision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeatProfileConflict"];
+                };
+            };
+            422: components["responses"]["Error"];
         };
     };
     lineageWakeUps: {

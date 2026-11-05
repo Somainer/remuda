@@ -1487,6 +1487,42 @@ async fn fake_node(
                     if let Some(kind) = spec.get("kind").and_then(Value::as_str) {
                         instance_kinds.insert(instance_id.clone(), kind.to_owned());
                     }
+                    // cb-seat-profile (D-063): a launch naming configured
+                    // skill directories journals the launch snapshot a real
+                    // Node writes before the harness starts. This fake host
+                    // holds none of them, so each is unavailable `missing`
+                    // (which never refuses); the applied profile revision
+                    // rides `skillContext.profile`.
+                    if let Some(skills) = spec
+                        .get("skills")
+                        .and_then(Value::as_array)
+                        .filter(|skills| !skills.is_empty())
+                    {
+                        let names: Vec<String> = skills
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned())
+                            .collect();
+                        append_n = append_event(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            "launch.capabilities",
+                            json!({
+                                "launch": if method == "instance.resume" { "resume" } else { "create" },
+                                "harness": spec.get("kind").and_then(Value::as_str).unwrap_or("claude"),
+                                "driver": spec.get("driver").and_then(Value::as_str).unwrap_or("claude-print"),
+                                "profileRevision": params.pointer("/skillContext/profile/revision").cloned().unwrap_or(Value::Null),
+                                "configured": names.iter().map(|name| json!({"class": "skill", "name": name, "source": "spec"})).collect::<Vec<_>>(),
+                                "resolved": [],
+                                "skipped": [],
+                                "unavailable": names.iter().map(|name| json!({"class": "skill", "name": name, "reason": "missing"})).collect::<Vec<_>>(),
+                                "refusal": null
+                            }),
+                        )
+                        .await?;
+                    }
                     if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
                         claude_ptys.insert(instance_id.clone());
                         // Model the real driver's launch prerequisite, so this

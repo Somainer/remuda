@@ -1065,6 +1065,9 @@ pub enum ObservationPayload {
     /// `opaque` payload; §5.1.
     #[serde(rename = "opaque")]
     Opaque(Box<OpaquePayload>),
+    /// `launch.capabilities` payload; §5.5 (cb-seat-profile, D-063).
+    #[serde(rename = "launch.capabilities")]
+    LaunchCapabilities(Box<crate::LaunchCapabilitiesPayload>),
 }
 
 impl ObservationPayload {
@@ -1089,6 +1092,7 @@ impl ObservationPayload {
             Self::Permission(..) => ObservationKind::Permission,
             Self::RawTty(..) => ObservationKind::RawTty,
             Self::Opaque(..) => ObservationKind::Opaque,
+            Self::LaunchCapabilities(..) => ObservationKind::LaunchCapabilities,
         }
     }
 }

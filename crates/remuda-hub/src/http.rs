@@ -92,6 +92,11 @@ pub struct CreateInstanceBody {
     /// Stored on the spec and forwarded to the Node; the Node re-validates.
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+    /// cb-seat-profile (D-063): host-absolute skill directories the Node
+    /// installs into the native home (`spec.skills`). Human and Bot creators
+    /// only, like `binaryPath`; the Node reads and digests them.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
     #[serde(default)]
     placement: Option<Value>,
     #[serde(default)]
@@ -169,6 +174,37 @@ fn suggested_max_per_hour() -> u32 {
 
 fn default_kind() -> String {
     "claude".into()
+}
+
+/// D-045 Q4, harness-agnostic: the refusal for `computer-use` together with
+/// unattended (skipped) tool approvals on one launch of `kind`, or `None`.
+/// The message names the kind AND the exact refused spellings. Shared by the
+/// create gate and a seat-profile edit (cb-seat-profile r2), so a profile can
+/// never set a mode the lineage's next chapter could not launch with.
+pub(crate) fn computer_use_unattended(kind: &str, permission_mode: Option<&str>) -> Option<String> {
+    let (unattended, refused_spellings): (bool, &[&str]) = match kind {
+        "claude" => (
+            matches!(permission_mode, Some("bypassPermissions" | "bypass")),
+            &["bypassPermissions", "bypass"],
+        ),
+        // Codex auto-approves every action with `never` (CLI
+        // `--ask-for-approval never`; legacy `no-request`).
+        "codex" => (
+            matches!(permission_mode, Some("never" | "no-request")),
+            &["never", "no-request"],
+        ),
+        _ => (false, &[]),
+    };
+    unattended.then(|| {
+        format!(
+            "refusing \"computer-use\" together with unattended/skipped tool approvals \
+             on the same {kind:?} launch (permissionMode {:?}; refused {kind} spellings: {}): \
+             desktop control plus auto-approved actions has no recovery path; \
+             remove one of the two",
+            permission_mode.unwrap_or("-"),
+            refused_spellings.join(", ")
+        )
+    })
 }
 
 /// Parse the D-047 `apiVia`/`apiRoute` pair from a create/dispatch body.
@@ -1508,6 +1544,10 @@ async fn create_instance_as(
         if let Some(effort) = &body.effort {
             obj.insert("effort".into(), effort.clone());
         }
+        if let Some(skills) = body.skills.as_ref().filter(|skills| !skills.is_empty()) {
+            crate::seat_profile::validate_skills(skills).map_err(HubError::BadRequest)?;
+            obj.insert("skills".into(), json!(skills));
+        }
         if let Some(path) = body
             .binary_path
             .as_deref()
@@ -1900,39 +1940,12 @@ async fn create_instance_as(
             .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
         {
             // D-045 Q4, harness-agnostic: refuse unattended desktop control.
-            // The message names the kind AND the exact refused spellings.
             // (Gate 1 origin refusal is hoisted to right after device binding,
             // before placement/approval.)
-            let (unattended, refused_spellings): (bool, &[&str]) = match body.kind.as_str() {
-                "claude" => (
-                    matches!(
-                        body.permission_mode.as_deref(),
-                        Some("bypassPermissions" | "bypass")
-                    ),
-                    &["bypassPermissions", "bypass"],
-                ),
-                "codex" => (
-                    matches!(
-                        body.permission_mode.as_deref(),
-                        // Codex auto-approves every action with `never` (CLI
-                        // `--ask-for-approval never`; legacy `no-request`).
-                        Some("never" | "no-request")
-                    ),
-                    &["never", "no-request"],
-                ),
-                _ => (false, &[]),
-            };
-            if unattended {
-                return Err(HubError::BadRequest(format!(
-                    "refusing \"computer-use\" together with unattended/skipped tool approvals \
-                     on the same {:?} launch (permissionMode {:?}; refused {} spellings: {}): \
-                     desktop control plus auto-approved actions has no recovery path; \
-                     remove one of the two",
-                    body.kind,
-                    body.permission_mode.as_deref().unwrap_or("-"),
-                    body.kind,
-                    refused_spellings.join(", ")
-                )));
+            if let Some(message) =
+                computer_use_unattended(&body.kind, body.permission_mode.as_deref())
+            {
+                return Err(HubError::BadRequest(message));
             }
             if !matches!(body.kind.as_str(), "claude" | "codex") {
                 return Err(HubError::BadRequest(format!(
@@ -2517,6 +2530,7 @@ async fn resume_lineage(
             chapter_cause: crate::store::OWNER_RESUME_CAUSE.into(),
             from_states: &["starting", "running", "paused"],
             restart: None,
+            profile: prepared.profile.clone(),
         })
         .await
         .map_err(map_store)?;
@@ -2587,7 +2601,7 @@ pub(crate) async fn recovery_source(
     lineage: &crate::store::LineageRecord,
     current: &crate::store::InstanceRecord,
 ) -> Result<RecoverySource, HubError> {
-    if let Some(session) = current.native_session_id.clone() {
+    if let Some(session) = native_session(current) {
         return Ok(RecoverySource::Chapter(session));
     }
     let chapters = state
@@ -2602,12 +2616,24 @@ pub(crate) async fn recovery_source(
             .store
             .get_instance_read(chapter.instance_id.clone())
             .await?
-            && let Some(session) = earlier.native_session_id
+            && let Some(session) = native_session(&earlier)
         {
             return Ok(RecoverySource::Earlier(session));
         }
     }
     Ok(RecoverySource::Fresh)
+}
+
+/// The chapter's native session id, if it ever reported one. A Node names a
+/// launch that never started (its create rejected or refused, cb-seat-profile)
+/// with the instance's own id as a placeholder in its entity's `nativeRef`;
+/// that is no conversation to `--resume`, so the continuation is a fresh
+/// launch from the origin spec instead.
+fn native_session(chapter: &crate::store::InstanceRecord) -> Option<String> {
+    chapter
+        .native_session_id
+        .clone()
+        .filter(|session| *session != chapter.instance_id)
 }
 
 /// Why a successor's create could not be prepared, typed by whether retrying
@@ -2675,6 +2701,9 @@ pub(crate) struct PreparedContinuation {
     pub(crate) operation: &'static str,
     /// The resolved driver, stamped on the successor row (r7 item 6a).
     pub(crate) driver: String,
+    /// cb-seat-profile: the lineage profile the spec was built from, recorded
+    /// on the successor row; `None` without a profile.
+    pub(crate) profile: Option<crate::seat_profile::AppliedProfile>,
 }
 
 /// Build the successor's create spec on `current`'s host from `recovery`:
@@ -2729,6 +2758,14 @@ pub(crate) async fn prepare_continuation(
             (spec, "instance.create")
         }
     };
+    // cb-seat-profile (D-063, main-agent.md §3.4.2): the next chapter's spec
+    // takes the lineage profile at its current revision; without one the
+    // spec stays the predecessor's (creation-time configuration, OA2).
+    let profile = state
+        .store
+        .seat_profile(lineage.lineage_id.clone())
+        .await?
+        .map(|profile| crate::seat_profile::apply_to_spec(&mut spec, &profile));
     let host = crate::store::Store::with_live_link(host, true);
     // D-047 observed-route resolution, mirroring the D-026 path: the
     // successor inherits the predecessor's *observed* route and gets a fresh
@@ -2804,6 +2841,7 @@ pub(crate) async fn prepare_continuation(
         spec,
         operation,
         driver,
+        profile,
     })
 }
 
@@ -4982,10 +5020,13 @@ pub(crate) async fn forward_if_online(
     object.remove(CREATOR_PERMISSION_MODE_FIELD);
     // ma-skill: likewise the seat's launch facts.
     object.remove("skillContext");
+    // cb-seat-profile r3: and the lineage's revoked skills.
+    object.remove(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD);
     if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("memoryContext");
         spec.remove(CREATOR_PERMISSION_MODE_FIELD);
         spec.remove("skillContext");
+        spec.remove(remuda_protocol::hubnode::REVOKED_SKILLS_FIELD);
     }
     if command.operation == "instance.send"
         && let Some(rev) = state
@@ -5056,6 +5097,23 @@ pub(crate) async fn forward_if_online(
                         .map_err(|error| HubError::Internal(error.to_string()))?,
                 );
             }
+        }
+        // cb-seat-profile r3: the configured skills this lineage installed
+        // in an earlier chapter and this launch no longer names; the Node
+        // removes exactly these (main-agent.md §3.4.2). None for a first
+        // chapter or a non-chapter instance.
+        let configured = crate::seat_profile::configured_names(
+            object.get("spec").unwrap_or(&Value::Null),
+        );
+        let revoked = state
+            .store
+            .revoked_skills(instance_id.clone(), configured)
+            .await?;
+        if !revoked.is_empty() {
+            object.insert(
+                remuda_protocol::hubnode::REVOKED_SKILLS_FIELD.into(),
+                serde_json::json!(revoked),
+            );
         }
         // D-057 OA1: an Agent-origin create carries its creator's mode, as
         // committed on the instance row at the create's commit point — never

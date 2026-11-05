@@ -85,6 +85,9 @@ pub struct AgentLaunch {
     pub native_home_managed: bool,
     /// Settings overlay to pass as `--settings`, when one was written.
     pub settings_overlay: Option<PathBuf>,
+    /// cb-seat-profile: the configured skill trees the Node's launch
+    /// snapshot resolved for this launch.
+    pub configured_skills: Vec<crate::launch::capabilities::ConfiguredSkill>,
 }
 
 /// Build the launch recipe for `spec` running as `kind` in a native PTY.
@@ -142,6 +145,7 @@ pub fn agent_recipe(
         secret_policy: None,
         memory_context,
         skill_context,
+        configured_skills: &launch.configured_skills,
     })
 }
 

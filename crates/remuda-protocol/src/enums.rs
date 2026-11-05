@@ -1361,6 +1361,7 @@ wire_enum!(ObservationKind, "5.1", {
     Permission => "permission",
     RawTty => "raw_tty",
     Opaque => "opaque",
+    LaunchCapabilities => "launch.capabilities",
 });
 
 wire_enum!(ErrorCode, "9.1", {

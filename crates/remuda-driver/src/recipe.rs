@@ -67,6 +67,9 @@ pub enum FileRole {
     /// One file of the embedded `remuda` skill (ma-skill) materialized into a
     /// managed home.
     RemudaSkill,
+    /// One file of a configured skill directory (`spec.skills`,
+    /// cb-seat-profile) materialized into a managed home.
+    ConfiguredSkill,
 }
 
 /// One MCP server a capability grant registered for this launch (D-045 §3.3).

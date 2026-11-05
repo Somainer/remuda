@@ -961,7 +961,8 @@ type ApiViaRefusal = "api-via-unknown-host" | "api-via-host-offline"
 type ObservationKind = "message" | "thought" | "tool_call" | "tool_result"
   | "interaction.requested" | "interaction.answered" | "interaction.expired"
   | "workflow.run" | "workflow.phase" | "workflow.member"
-  | "lifecycle" | "usage" | "artifact" | "raw_tty" | "opaque";
+  | "lifecycle" | "usage" | "artifact" | "raw_tty" | "opaque"
+  | "launch.capabilities";
 type Completeness = "structured" | "partial" | "screen-derived" | "opaque";
 type SourceCursor =
   | {type: "stream"; connectionEpoch: Id; frame: U64}
@@ -1135,6 +1136,7 @@ type InteractionAnswer =
 | `raw_tty`, `direction=input` | `{streamId:Id, streamEpoch:Id, direction:"input", inputId:Id, byteLength:U64, dataRef:RawRef\|null, actor:ActorRef, delivery:written\|unknown}`；交互输入可只记长度/身份，原文是否保存由明确 retention policy 决定 |
 | `raw_tty`, `direction=resize` | `{streamId:Id, streamEpoch:Id, direction:"resize", cols:number, rows:number, resizeRevision:U64}`；正整数，按服务器公布上限校验 |
 | `opaque` | `{nativeType:string, reason:unknown-type\|unknown-version\|malformed\|unsupported-extension\|unmapped-fields\|screen-snapshot, rawRef:RawRef, affects:(presentation\|control\|terminal)[], summary:string\|null}`；不含自行猜出的 outcome |
+| `launch.capabilities`（cb-seat-profile，D-063） | `{launch:create\|resume, harness:claude\|codex\|grok\|agy, driver:DriverKind, profileRevision:U64\|null, configured:[{class:skill\|capability\|mcp-server\|mcp-config\|grant, name, source:embedded\|spec\|hub\|args}], resolved:[{class, name, root:native-home\|launch-dir\|null, path:string\|null, digest:string\|null, via:tree\|flag\|data-block\|conversation\|argv\|codex-config}], skipped:[{class, name, reason:operator-home\|no-skill-reader\|user-owned}], removed:string[], unavailable:[{class, name, reason:unreadable\|missing\|not-a-directory\|not-a-file\|too-large\|invalid-name\|unsupported-by-harness\|not-permitted}], refusal:{reason, next:{action, hint}}\|null}`；Node 在 agent 类（`claude`、`codex`、`grok`、`agy`）的每次 `instance.create` 与 `instance.resume` 里、harness 启动前写恰好一条，`source.channel=runtime`。`path` 相对 `root`，从不是绝对路径；只有名字、相对路径、摘要与类别，从不含 env 值、MCP 的 command/args/env 或文件内容。`removed` 是这次启动之前按 Hub 盖章的 `revokedSkills` 从 native home 里删掉的已配置 skill 树（只删真实目录且带 `.remuda-managed` 常规文件标记的；旧事件没有该字段，按空处理）。`unavailable` 里的 `unreadable` 拒绝启动（`refusal.reason=launch-capability-unreadable`，create 以同一原因 `rejected`）；D-045 闸门拒绝的 `computer-use`（列为 `not-permitted` 或 `unsupported-by-harness`）也拒绝启动，`refusal.reason` 为 `launch-capability-not-permitted` 或 `launch-capability-unsupported`；其余条目（包括 harness 读不了的已配置 skill）与 `skipped` 都不拒绝。机制见 [main-agent.md §3.4.2](./main-agent.md#342-seat-profile-and-the-launch-snapshot-cb-seat-profile-d-063) |
 
 `ObservationPayload` 是 §5.2 的 Message/Thought/ToolCall/ToolResult、§5.3 三种 workflow、§5.4 三种 interaction 和本表 variants 的联合。`InteractionEntity` 即 §2.6 全字段加 EntityMeta。host/workspace lifecycle 使用相同 payload，但 envelope 放在独立 `RegistryEvent`：`{schemaVersion:1,eventId,hostId,journalId,seq,observedAt,kind:"lifecycle",payload}`，不伪造 instanceId。Hub Command 入口事件另有自己的 journal，Node 镜像不能让同一实体出现两个权威 revision。
 
@@ -1584,6 +1586,8 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 | Agent 来源 create 的 `creatorPermissionMode` | Hub→Node | Hub 依据创建者章节上记录的生效档位盖章，绝不取自请求体；Node 物化器据此执行 §Origin 的「子不超父」 |
 | create / resume 的 `memoryContext`（D-060） | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `memoryContext:{rev:U64,text:string}`：血缘记忆的渲染索引加 about-me（§8.4，[main-agent.md §12.3](./main-agent.md#123-reading)）。与 `creatorPermissionMode` 一样由 Hub 盖章，请求体里的同名字段一律剥掉；它绝不是 `InstanceSpec.args` 里的 flag。Node 物化器是它唯一的写入方，每条启动路径的机制见本表下方的穷尽表：只有 `claude` 类实例的 `claude_argv` 与 `materialize_shell_pty_agent` 在调用方参数之后自己发出一次 `--append-system-prompt`；`generic-pty` 上的每种 agent 类与每个非 Claude harness 改为第一条输入之前的数据块；`terminal`、`generic` 两类不注入。flag 在每次 Claude 进程启动时都发出，原生 resume 也不例外：系统提示按进程提供，不属于会话消息。但 Claude Code 2.1.265 起默认把会话第一次请求渲染出的系统提示记录下来，之后每次请求和 `--resume` 都原样复用，后来启动传入的不同 `--append-system-prompt` 文本要到会话压缩后才生效；因此原生 resume 时物化器还在自己那一对之前紧接着发出 `--system-prompt-snapshot off`（recipe 上记为 `fresh_prompt`），让该进程每次请求都重新渲染提示。仅当钉住的二进制报告 Claude Code 2.1.257 或更高版本时发出（该开关自 2.1.257 起存在；版本读不出则不发，未知 flag 会让启动失败）；全新会话保持记录开启。带这个开关的启动：`claude_argv` 的 resume（claude-print、claude-sdk、claude-pty）与 `materialize_shell_pty_agent` 对 `claude` 类的 resume；claude-bg 每章都是全新 `--bg` 会话，从不跨章节原生 resume。`system-prompt-snapshot` 列入 `RESERVED`，调用方不得传入。调用方 `args` 里的 `--system-prompt`、`--append-system-prompt` 照旧被拒：flag 本身（单独或 `=` 连写）在 Hub 回 HTTP 400、code `BAD_REQUEST`（消息为 `native feature disabled: flag --… is prohibited`），Node 以 driver 错误 `NativeFeatureDisabled` 拒绝；两词写法 `--append-system-prompt <值>` 更早被 argv 解析拒绝（禁用 flag 没有取值规则，`<值>` 成了位置参数）：Node 为 `InvalidLaunchSpec`（`positional argv … is not allowed`），Hub 为 HTTP 400 `BAD_REQUEST` 带同一消息。这些错误都保持不变。`InstanceCreateParams` 不拒绝未知字段，老 Node 会静默忽略它，所以 Hub 只给在 hello 中声明 `capabilities.memoryContext` 的 Node 盖这个字段；对其余 Node，Hub 在血缘记录里写明该章节启动时没有注入索引：`GET /v1/lineages/{id}` 里该章节带 `memoryIndex: withheld`（收到字段的为 `stamped`）与起始修订 `memoryStartRev`，章节 journal 里有一条 hub 诊断。Node 只从 params 顶层读取该字段，绝不从 `spec` 读取 |
 | create / resume 的 `skillContext`（ma-skill，D-060 决策 5） | Hub→Node | 对 agent 类（`claude`、`codex`、`grok`、`agy`），`instance.create` 与 `instance.resume` 的 params 增加 `skillContext:{grants:string[],herdr:bool,delegatedDecisions:bool,inbox:bool}`：实例持有的 grant、实例所在 host 是否声明 herdr、项目的 D-051 开关（与回答闸门读法相同）、是否有 inbox（`cb-inbox-*` 之前为 `false`）。全部在转发时由 Hub 从实例、host、项目行读出，绝不取自请求体（请求体顶层与 `spec` 里的同名字段一律剥掉），绝不进 `InstanceSpec.args`；只给声明了 `capabilities.skillContext` 的 Node 盖章，其余 Node 收不到。Node 只从 params 顶层读取。它不授予任何权限：能力段列出的每个动词仍由各自的处理器逐次检查。物化器的用法见 [main-agent.md §3.4.1](./main-agent.md#341-the-skill-and-its-capability-section-ma-skill)：可读 skill 目录的 Claude 启动把 skill 树写进 Remuda 管理的 native home（从不写继承的操作员 home，也不覆盖用户自己的 `skills/remuda`）；能力段在每实例 home 里追加到 `SKILL.md`，否则走该启动路径的 §12.3 机制——Claude 自己 argv 的路径并入物化器自己那一对 `--append-system-prompt`（在记忆索引之后，以 `<remuda-capabilities>` 框起），其余 agent 启动作为第一条输入之前的数据块（在记忆块之后；原生 resume 不重发） |
+| create / resume 的 `skillContext.profile` 与 `spec.skills`（cb-seat-profile，D-063） | Hub→Node | 血缘有座位 profile 时，章节的 `skillContext` 另带 `profile:{revision:U64,displayName:string\|null,role:string\|null,modelCandidates:string[]}`：该章节启动时应用的 profile revision 与内容（取自实例行记下的 `profile_json`，不是转发时 profile 的最新值，所以章节中途的编辑不改它）。能力段把候选模型作为事实列出（第一个是默认）；是否切换由 agent 自己决定，Hub 与 Node 从不自动切换。`spec.skills:string[]` 是 host 绝对路径的 skill 目录列表（至多 16 个），由 Human 或 Bot 在 create 时给出（Agent 创建者带它为 403），或由 profile 在下一章节写入；Node 在 `apply_spec_launch_fields` 里读取。旧 Node 忽略这两项，也不写 `launch.capabilities` |
+| create / resume 的 `revokedSkills`（cb-seat-profile r3） | Hub→Node | 章节启动时 params 顶层的 `revokedSkills:string[]`：血缘较早一章（最新一个有 `launch.capabilities` 的章节）以 `spec` 来源配置、解析并安装到 native home 的 skill 名，减去本次启动配置的名字。首章、以及没有血缘历史的实例（worker、普通会话）不带它。请求体顶层与 `spec` 里的同名字段一律剥掉。Node 只删除这些名字对应的、是真实目录且带 `.remuda-managed` 常规文件标记的树（不跟随链接，从不删 `remuda`、`codex-computer-use`、也不删本次又解析到的名字），并在事件的 `removed` 里列出；从不清扫共享 home 里其他座位的树。旧 Node 忽略它 |
 | 转发命令的 `initiator` | Hub→Node | §2.5 的 `initiator`（不含设备 id）；Node 持久化到它的 Command 记录并写入 journal |
 | `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`）；对放行的操作，在任何副作用之前持久记下 opId、方法与发起者，之后再记结果。只有入口记录、没有结果的操作在 fence 确认里报告 `unknown` |
 | `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
@@ -2277,6 +2281,41 @@ JournalSearchHit = {instanceId, lineageId, seq, observedAt,
 - **保留。** journal 行删除时（删除或清除实例）一个触发器在同一事务里删掉它的索引行，所以索引里永远没有 journal 已经不再持有的文本。`scripts/hub-backup.sh` 整个拷贝 `hub.sqlite`，索引、回填高水位与 journal 一起备份、一起恢复，恢复后不需要重建。
 - **日志** 只记计数与耗时，从不记查询词与片段。
 - CLI：`remuda search <q> [--instance …] [--lineage …] [--since …] [--limit N] [--json]` 与 `remuda search --status`。`--since` 也接受 `30m`、`2h`、`3d` 这样的相对时长。
+
+**座位 profile（`cb-seat-profile`，D-063）。** 机制见 [main-agent.md §3.4.2](./main-agent.md#342-seat-profile-and-the-launch-snapshot-cb-seat-profile-d-063)。血缘级文档，带 revision，编辑从下一章节生效。
+
+~~~text
+GET /v1/lineages/{id}/profile
+  -> 200 {lineageId, profile: SeatProfile|null,
+          liveChapter: {instanceId, generation, appliedRevision: U64|null},
+          pending: bool,                     profile 存在且 revision 比在线章节已应用的新
+          lastLaunch: {instanceId, generation, payload: launch.capabilities}|null}
+                                             血缘最新章节里最后一条 launch.capabilities
+PUT /v1/lineages/{id}/profile
+  body {expectedRevision: U64,               0 = 创建（血缘还没有 profile 时）
+        displayName?, role?, modelCandidates?, effort?, permissionMode?, skills?}
+                                             缺省的字段保留当前值；创建时取在线章节的 spec
+  -> 200 {profile: SeatProfile, pending, changed: [field]}
+  -> 409 PROFILE_REVISION_CONFLICT {currentRevision, reason: stale-revision,
+          next: {action: read-then-decide, hint}}
+  -> 403 FORBIDDEN {reason: profile-human-only, next: {action: ask-owner, hint}}
+
+SeatProfile = {lineageId, revision, displayName: string|null, role: string|null,
+               modelCandidates: [string],     1..=5，第一个是默认
+               effort: {name, ultracode}|null, permissionMode, skills: [string],
+               createdAt, updatedAt, updatedBy}
+
+remuda lineage profile show [<lineage>]      省略时为调用者自己的血缘（/v1/caller）
+remuda lineage profile set <lineage> [--expected-revision <n>] [--display-name <s>]
+    [--role <s>] [--model <m>]... [--add-model <m>] [--effort <e>] [--ultracode]
+    [--permission-mode <p>] [--skill <dir>]... [--clear-skills]
+                                             不给 --expected-revision 时先读当前 revision；409 打印重读提示
+~~~
+
+- 调用方：只有未收窄的 Human 能 PUT；Agent（座位自己也算）、Bot、用 `x-remuda-instance-id` 收窄的 Human 令牌一律 403 `profile-human-only`，所以座位永远不能抬高自己的权限档位（OA1、OA2 不变）。GET：Human 可读任意血缘；Agent 只能读自己的血缘（中间件把 `{id}` 钉在调用者血缘上，处理器再查）；Bot 403。路径里的 `{id}` 必须是血缘 id；没有血缘行（非连续性实例）为 404。
+- 边界：`modelCandidates` 1 到 5 个、互不相同的非空模型名（各至多 128 字符），否则 400 `invalid-profile`；`displayName` 至多 64 字符，`role` 一行至多 160 字符；`effort` 与 create 的 `effort` 同形；`permissionMode` 必须是该血缘 harness 的词表里的档位；`skills` 至多 16 个 host 绝对路径，基名合法（`[A-Za-z0-9._-]{1,64}`，不是 `remuda` 或 `codex-computer-use`，不重复）。秘密 lint 覆盖 `displayName` 与 `role`（422，不回显）。
+- 生效：编辑不碰在线章节（进程、spec、`skillContext` 都在启动时定下）。C1 继任与所有者 Resume 都经 `prepare_continuation` 用 profile 的当前 revision 构建下一章节的 spec：`model` 取第一个候选，`effort`、`permissionMode`、`skills` 取 profile 的；新章节记下已应用的 revision（实例的 `profileRevision`），`skillContext.profile` 与该章节的 `launch.capabilities` 都带它。没有 profile 时什么都不变。Hub 与 Node 从不自动切换模型。
+- 审计：每次编辑写一条 `lineage.profile.set`：设备、新 revision、改动的字段名，不记字段值。
 
 ## 9. 错误码、未知值与兼容性
 

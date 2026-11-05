@@ -19,6 +19,7 @@ mod hub_maintenance;
 pub mod instance;
 mod instance_interaction;
 pub mod journal_diff;
+mod lineage;
 pub mod mcp;
 mod memory;
 mod memory_import;
@@ -74,6 +75,7 @@ commands! {
     Owner(owner::OwnerArgs),
     Wake(wake::WakeArgs),
     Memory(memory::MemoryArgs),
+    Lineage(lineage::LineageArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),
     Gate(gate::GateArgs),

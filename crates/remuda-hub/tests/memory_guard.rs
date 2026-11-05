@@ -378,7 +378,7 @@ async fn text_that_merely_resembles_a_secret_is_stored() -> Result<()> {
 // `scripts/hub-backup.sh`, which copies the SQLite file whole. Outside that
 // module exactly two call sites may touch it, both part of the chapter-start
 // renderer (main-agent.md §12.3): the create/resume forward renders the
-// chapter's memory context and the change line, and `queue_command` decides
+// chapter's memory context and the change line, and `queue_command_by` decides
 // which input carries the change line. Anything else — an enforcement path
 // above all — fails here.
 //
@@ -425,7 +425,7 @@ mod scan {
     pub const ALLOWED: &[(&str, &str, &str)] = &[
         ("http.rs", "forward_if_online", "memory_chapter_start"),
         ("http.rs", "forward_if_online", "memory_change_rev"),
-        ("store.rs", "queue_command", "claim_change_line"),
+        ("store.rs", "queue_command_by", "claim_change_line"),
     ];
 
     const TABLES: &[&str] = &[

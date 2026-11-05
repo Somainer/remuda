@@ -336,8 +336,9 @@ pub mod push_test_support {
         crate::alerts::test_seams::arm_end_evidence_read_failure(instance_id);
     }
 
-    /// While `fail` holds, every `routedTo` read (the interaction page, the
-    /// push badge) that asks about `interaction_id` fails.
+    /// While `fail` holds, a `routedTo` read (the interaction page, the push
+    /// badge, the owner glance) whose result would include `interaction_id`
+    /// fails as a whole, as a store error does; other reads are untouched.
     pub fn set_routed_read_failure(interaction_id: &str, fail: bool) {
         crate::push_route::test_seams::set_routed_read_failure(interaction_id, fail);
     }

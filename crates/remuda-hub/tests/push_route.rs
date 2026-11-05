@@ -1929,7 +1929,15 @@ async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -
     // The owner glance's 需要你 is the same narrowed A.
     assert_eq!(ctx.glance_need_you().await?, 3);
 
-    // A store error reads owner, for the page and for the badge.
+    // A store error reads owner, for the page and for the badge. The seam
+    // fails a read whose result would include the armed row, so arming an
+    // item that is not routed away (the approval) fails nothing: the page
+    // still reads the question as main.
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_approval", true);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_approval", false);
+    // Arming a routed row fails the read, and the failure is the whole
+    // read's, as a real store error is: every item reads owner.
     remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", true);
     let page = ctx.get("/v1/interactions").await?;
     for item in page["items"].as_array().context("items")? {
@@ -1937,7 +1945,8 @@ async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -
     }
     ctx.raise(&human_child, "int_rt_fault", "question")?;
     assert_eq!(ctx.decision("int_rt_fault").await?, "paged");
-    // approval, human, off, fault + the three routed items it could not read.
+    // The badge read fails as a whole too: approval, human, off, fault + the
+    // three routed items it could not read.
     assert_eq!(ctx.badge_of("int_rt_fault", 1).await?, 7);
     remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", false);
     assert_eq!(ctx.routed_to("int_rt_question").await?, "main");

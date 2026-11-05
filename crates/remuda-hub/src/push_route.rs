@@ -367,10 +367,6 @@ pub(crate) fn routed_away(
     conn: &Connection,
     ids: &[String],
 ) -> Result<std::collections::HashMap<String, RoutedTo>, StoreError> {
-    #[cfg(any(test, feature = "test-faults"))]
-    if test_seams::routed_read_fails(ids) {
-        return Err(StoreError::FaultInjected("routed-to read".to_owned()));
-    }
     let mut out = std::collections::HashMap::new();
     if ids.is_empty() || !any_active(conn) {
         return Ok(out);
@@ -418,6 +414,10 @@ pub(crate) fn routed_away(
                 RoutedTo::Agent
             },
         );
+    }
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_seams::routed_read_fails(out.keys()) {
+        return Err(StoreError::FaultInjected("routed-to read".to_owned()));
     }
     Ok(out)
 }
@@ -1222,9 +1222,11 @@ pub(crate) async fn log_push(state: &AppState, entry: LogEntry) {
     }
 }
 
-/// Test seam: fail every `routedTo` read that asks about an armed
-/// interaction, until it is disarmed (keyed by id, so parallel tests cannot
-/// cross).
+/// Test seam: a `routedTo` read whose result would include an armed
+/// interaction (one that is routed away now) fails, until it is disarmed.
+/// The failure is the whole read's, as a real store error is; a read that
+/// would not return the armed row is untouched, so parallel tests (and other
+/// pages) cannot cross.
 #[cfg(any(test, feature = "test-faults"))]
 pub(crate) mod test_seams {
     use std::collections::HashSet;
@@ -1243,11 +1245,11 @@ pub(crate) mod test_seams {
         }
     }
 
-    pub(super) fn routed_read_fails(ids: &[String]) -> bool {
+    pub(super) fn routed_read_fails<'a>(mut ids: impl Iterator<Item = &'a String>) -> bool {
         let armed = ROUTED_READ_FAILURES
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        ids.iter().any(|id| armed.contains(id))
+        ids.any(|id| armed.contains(id))
     }
 }
 

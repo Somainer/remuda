@@ -1649,8 +1649,7 @@ Node 拒绝时错误文本带稳定前缀，Hub 据此映射：`herdr-claim-inva
 | 方法 / 字段 | 方向 | payload / result |
 | --- | --- | --- |
 | `command.withdraw` | Hub→Node | `{commandId,instanceId}` → `{commandId,outcome:withdrawn\|already-delivered}`；对不在投递队列里的命令（已声明、已写出、已结算或从未见过）一律答 `already-delivered`，不做任何事 |
-| `command.edit` | Hub→Node | `{commandId,instanceId,expectedRevision:U64,prompt:string}` → `{commandId,outcome:edited\|already-delivered\|revision-conflict,revision:U64}`；只替换文本（附件已在接纳时登记，不可改）；成功时 `revision = expectedRevision + 1`，队列里的用户消息以新文本追加一次 replace |
-| 转发 `instance.send` 的 `commandRevision` | Hub→Node | Hub 行的 `revision`，大于 0 时才带；Node 以它作为投递队列里这条 prompt 的起始 revision，缺省为 0 |
+| `command.edit` | Hub→Node | `{commandId,instanceId,expectedRevision:U64,prompt:string}` → `{commandId,outcome:edited\|already-delivered\|revision-conflict,revision:U64}`；只替换文本（附件已在接纳时登记，不可改）；Hub 先按自己的行比较 revision，Node 采纳它收到的第一个 `expectedRevision` 作起点，此后按自己记下的 revision 比较；成功时 `revision = expectedRevision + 1`，队列里的用户消息以新文本追加一次 replace |
 | hello `capabilities.heldInput` | Node→Hub | `true` 表示支持上面两个方法；缺失即不支持，Hub 对该 host 上 Node 持有的 prompt 一律答 409 `already-delivered` |
 
 ~~~text
@@ -2295,6 +2294,8 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 | `POST /v1/commands/{id}/withdraw` | `{expectedRevision?: U64}` | `{command}`：`state=settled`，`settlement.outcome=withdrawn`，`settlement.withdrawnBy: {origin, instanceId?}`。对已撤回的命令再撤回一次返回同一行 |
 | `GET /v1/instances/{id}/config` | — | `{instanceId, generation, model, effort, permissionMode, effective: {model, effort}, pending: [...]}`；Agent 对自己拥有的实例可调用 |
 
+`revision`、`generation` 在 Hub HTTP 上是 JSON 整数（与 `configureSeq` 相同）；请求里的 `expectedRevision`、`expectedGeneration` 接受整数或十进制字符串。
+
 同 id 的重放（D-055 outbox）若带的是编辑前的原始 payload，仍视为同一条命令（Hub 只为这一比较保留原始 payload），返回当前行；仍在 Hub 排队的行照 G1 恰好转发一次，发出的是**编辑后**的内容。重放命中已撤回的行时返回该结算行，不再转发。
 
 **运行时配置的 generation。** 每个实例有一个运行时配置 generation，就是实例投影上已有的 `configureSeq`：Hub 每提交一次 configure 的 spec merge 加一；撤回一条已 merge 的排队 configure 时，凡仍保持该 configure 所设值的字段恢复为它之前的值，有字段恢复则也加一。
@@ -2310,12 +2311,12 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 ~~~text
 GET /v1/commands?mine=1&state=queued
 ← {"commands": [{"commandId": "cmd_…", "instanceId": "ins_…", "operation": "instance.send",
-   "state": "queued", "resolution": "clear", "forwarded": false, "revision": "1", "held": "hub",
+   "state": "queued", "resolution": "clear", "forwarded": false, "revision": 1, "held": "hub",
    "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "1"}, "payload": {…}}]}
 
-PATCH /v1/commands/cmd_…  {"expectedRevision": "0", "text": "…"}
+PATCH /v1/commands/cmd_…  {"expectedRevision": 0, "text": "…"}
 HTTP 409
-{"error": "command cmd_… is at revision 1", "code": "COMMAND_REVISION_CONFLICT", "revision": "1",
+{"error": "command cmd_… is at revision 1", "code": "COMMAND_REVISION_CONFLICT", "revision": 1,
  "reason": "revision-conflict", "next": {"action": "read-then-decide", "commandId": "cmd_…", "hint": "…"}}
 
 POST /v1/commands/cmd_…/withdraw
@@ -2323,9 +2324,9 @@ HTTP 409
 {"error": "command cmd_… was already delivered", "code": "COMMAND_NOT_QUEUED",
  "reason": "already-delivered", "next": {"action": "read-then-decide", "commandId": "cmd_…", "hint": "…"}}
 
-POST /v1/instances/ins_…/commands  {"operation": "instance.configure", "payload": {"effort": {…}, "expectedGeneration": "3"}}
+POST /v1/instances/ins_…/commands  {"operation": "instance.configure", "payload": {"effort": {…}, "expectedGeneration": 3}}
 HTTP 409
-{"error": "runtime config is at generation 4", "code": "CONFIG_GENERATION_CONFLICT", "generation": "4",
+{"error": "runtime config is at generation 4", "code": "CONFIG_GENERATION_CONFLICT", "generation": 4,
  "config": {…}, "reason": "generation-conflict", "next": {"action": "read-then-decide", "hint": "…"}}
 
 HTTP 200 (busy PTY worker)

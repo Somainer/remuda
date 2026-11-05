@@ -231,6 +231,10 @@ wire_enum!(SettlementOutcome, "2.5", {
     // operation of a fenced initiator before its frame was written. Hub-only:
     // a Node never settles a command with it.
     Withheld => "withheld",
+    // cb-command-queue (protocol.md §8.5): the caller that queued the command
+    // took it back before it reached the harness. Hub-only: a Node settles a
+    // withdrawn held prompt `cancelled` with reason `withdrawn`.
+    Withdrawn => "withdrawn",
 });
 
 wire_enum!(InteractionKind, "2.6", {

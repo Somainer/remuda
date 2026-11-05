@@ -667,8 +667,9 @@ export type DiffScopeCheck = ({
 
 export type Digest = (string);
 
-/** An `instance.configure` command that has not settled. */
+/** An `instance.configure` command that is not in effect yet. */
 export type DigestConfigure = ({
+  "boundary"?: (string | null);
   "requestId"?: (string | null);
   "state": (string);
   [key: string]: unknown;
@@ -686,6 +687,7 @@ export type DigestModel = ({
   "configure"?: (DigestConfigure | (null));
   "effective"?: (string | null);
   "effort": DigestEffort;
+  "generation": (number);
   "requested"?: (string | null);
   [key: string]: unknown;
 });
@@ -4630,7 +4632,7 @@ export type Settlement = ({
 });
 
 /** SettlementOutcome wire values; `protocol.md` §2.5. */
-export type SettlementOutcome = ("completed" | "rejected" | "cancelled" | "expired" | "withheld");
+export type SettlementOutcome = ("completed" | "rejected" | "cancelled" | "expired" | "withheld" | "withdrawn");
 
 /** Severity wire values; `protocol.md` §5.5. */
 export type Severity = ("info" | "warning" | "error");

@@ -337,12 +337,28 @@
                   "completed",
                   "expired",
                   "rejected",
+                  "withdrawn",
                   "withheld"
                 ],
                 "type": "string"
               },
               "reason": {
                 "type": "string"
+              },
+              "withdrawnBy": {
+                "additionalProperties": true,
+                "type": "object",
+                "properties": {
+                  "origin": {
+                    "type": "string"
+                  },
+                  "instanceId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "origin"
+                ]
               }
             },
             "required": [
@@ -360,6 +376,38 @@
           },
           "updatedAt": {
             "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "description": "cb-command-queue: edit revision, 0 until the first edit"
+          },
+          "held": {
+            "enum": [
+              "hub",
+              "node"
+            ],
+            "type": "string",
+            "description": "Where an undelivered command waits; only on GET /v1/commands"
+          },
+          "deferred": {
+            "additionalProperties": true,
+            "type": "object",
+            "description": "A configure that takes effect only at a boundary",
+            "properties": {
+              "boundary": {
+                "enum": [
+                  "next-chapter",
+                  "next-turn"
+                ],
+                "type": "string"
+              },
+              "resolvedAt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "boundary"
+            ]
           }
         },
         "required": [
@@ -7336,6 +7384,164 @@
           "more"
         ],
         "additionalProperties": true
+      },
+      "QueuedCommands": {
+        "properties": {
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/CommandRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "commands"
+        ],
+        "type": "object"
+      },
+      "CommandEnvelope": {
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/CommandRecord"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "CommandEdit": {
+        "properties": {
+          "expectedRevision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "attachments": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "CommandWithdraw": {
+        "properties": {
+          "expectedRevision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "InstanceConfig": {
+        "additionalProperties": true,
+        "type": "object",
+        "properties": {
+          "instanceId": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "permissionMode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective": {
+            "additionalProperties": true,
+            "type": "object",
+            "properties": {
+              "model": {},
+              "effort": {}
+            }
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "additionalProperties": true,
+              "type": "object",
+              "properties": {
+                "commandId": {
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "deferred",
+                    "queued"
+                  ],
+                  "type": "string"
+                },
+                "boundary": {
+                  "enum": [
+                    "next-chapter",
+                    "next-turn"
+                  ],
+                  "type": "string"
+                },
+                "model": {},
+                "effort": {},
+                "permissionMode": {},
+                "initiator": {},
+                "createdAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "commandId",
+                "state",
+                "createdAt"
+              ]
+            }
+          }
+        },
+        "required": [
+          "instanceId",
+          "generation",
+          "model",
+          "effort",
+          "permissionMode",
+          "effective",
+          "pending"
+        ]
       }
     }
   },
@@ -15259,6 +15465,210 @@
             "description": "Release outcome"
           }
         }
+      }
+    },
+    "/v1/commands": {
+      "get": {
+        "operationId": "queuedCommands",
+        "summary": "The caller's own commands that are provably undelivered (cb-command-queue)",
+        "description": "protocol.md §8.5. Own = the Hub-stamped initiator for an Agent (its instance or its lineage) and the queuing device for a Human or Bot; the unnarrowed owner without mine=1 sees every caller's. Hub-written input (origin hub) is never listed. Lists instance.send and instance.configure rows that are Hub-held (queued, never forwarded) or Node-held (an accepted send a PTY carrier's Node holds, on a host that advertised heldInput), newest first, each with revision and held.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "mine",
+            "schema": {
+              "type": "string"
+            },
+            "description": "1 or true: only the caller's own (implied for Agent and Bot callers)"
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "schema": {
+              "enum": [
+                "queued"
+              ],
+              "type": "string"
+            },
+            "description": "Only queued is accepted; also the default"
+          },
+          {
+            "in": "query",
+            "name": "instanceId",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Default 50, at most 200"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuedCommands"
+                }
+              }
+            },
+            "description": "Queued commands"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/commands/{id}": {
+      "patch": {
+        "operationId": "editQueuedCommand",
+        "summary": "Edit an own queued instance.send (text and attachments) under a revision CAS",
+        "description": "protocol.md §8.5. Keeps the commandId and bumps revision. Only while provably undelivered: a Hub-held row is edited in the Hub's writer; a Node-held prompt through the Node's command.edit. 409 COMMAND_NOT_QUEUED (already-delivered), 409 COMMAND_REVISION_CONFLICT (with the current revision), 400 not-editable for a configure or a Node-held prompt's attachments, 404 for another caller's command.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandEdit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandEnvelope"
+                }
+              }
+            },
+            "description": "The edited command"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/commands/{id}/withdraw": {
+      "post": {
+        "operationId": "withdrawQueuedCommand",
+        "summary": "Withdraw an own undelivered command; it settles withdrawn and is never forwarded",
+        "description": "protocol.md §8.5. Exactly one of withdraw and forward wins. Withdrawing a queued instance.configure restores the values it set that still hold. Withdrawing a withdrawn command returns the same row.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandWithdraw"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandEnvelope"
+                }
+              }
+            },
+            "description": "The withdrawn command"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/instances/{id}/config": {
+      "get": {
+        "operationId": "instanceConfig",
+        "summary": "Runtime config, its generation and the changes not yet in effect",
+        "description": "protocol.md §8.5. generation is the instance's configureSeq; an instance.configure carrying expectedGeneration that no longer matches answers 409 CONFIG_GENERATION_CONFLICT with this document as config. pending lists queued (never forwarded) and deferred (next-turn or next-chapter) configures. An Agent reads owned instances only.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceConfig"
+                }
+              }
+            },
+            "description": "Runtime config"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
       }
     }
   },

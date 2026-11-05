@@ -993,7 +993,8 @@ struct Parts {
     model_eff: Option<String>,
     effort_req: Option<String>,
     effort_eff: Option<String>,
-    configure: Option<(String, Option<String>)>,
+    configure: Option<(String, Option<String>, Option<String>)>,
+    generation: u64,
     supply: Option<SupplyFacts>,
     queued: u32,
     task: Option<String>,
@@ -1158,7 +1159,10 @@ fn shrunk_fields(digest: &WorkerDigest, parts: &Parts) -> Vec<String> {
         );
         note(
             "configure",
-            parts.configure.as_ref().and_then(|(_, id)| id.as_deref()),
+            parts
+                .configure
+                .as_ref()
+                .and_then(|(_, id, _)| id.as_deref()),
             digest
                 .model
                 .configure
@@ -1225,12 +1229,14 @@ fn render(parts: &Parts, caps: &Caps) -> WorkerDigest {
                 requested: opt_clip(parts, caps, Slot::EffortReq),
                 effective: opt_clip(parts, caps, Slot::EffortEff),
             },
+            generation: parts.generation,
             configure: parts
                 .configure
                 .as_ref()
-                .map(|(state, request_id)| DigestConfigure {
+                .map(|(state, request_id, boundary)| DigestConfigure {
                     state: state.clone(),
                     request_id: request_id.clone(),
+                    boundary: boundary.clone(),
                 }),
         },
         supply: parts.supply.as_ref().map(|supply| DigestSupply {
@@ -1274,7 +1280,10 @@ fn skeleton(parts: &Parts) -> WorkerDigest {
             tool: None,
             args_summary: None,
         }),
-        model: DigestModel::default(),
+        model: DigestModel {
+            generation: parts.generation,
+            ..DigestModel::default()
+        },
         supply: None,
         queued: parts.queued,
         since_progress_secs: parts.idle_secs,
@@ -1346,7 +1355,10 @@ fn minimal(parts: &Parts) -> WorkerDigest {
         turn: None,
         last_text: None,
         pending: None,
-        model: DigestModel::default(),
+        model: DigestModel {
+            generation: parts.generation,
+            ..DigestModel::default()
+        },
         supply: None,
         queued: parts.queued,
         since_progress_secs: parts.idle_secs,
@@ -1432,20 +1444,12 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let configure = commands
-        .iter()
-        .find(|command| command.operation == "instance.configure" && command.state != "settled")
-        .map(|command| {
-            let request_id = command
-                .payload
-                .pointer("/effort/requestId")
-                .or_else(|| command.payload.get("requestId"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string);
-            (command.state.clone(), request_id)
-        });
+    // cb-command-queue: the newest configure not in effect yet, including
+    // one a busy carrier deferred to its next turn or chapter.
+    let configure = crate::cmd_queue::pending_configure(commands);
+    let generation = instance
+        .map(|row| u64::try_from(row.configure_seq).unwrap_or(0))
+        .unwrap_or(0);
     let queued = commands
         .iter()
         .filter(|command| command.state == "queued")
@@ -1489,6 +1493,7 @@ fn build_parts(facts: &Facts<'_>) -> Parts {
         effort_req,
         effort_eff,
         configure,
+        generation,
         supply,
         queued,
         task: worker.task_id.as_ref().map(|id| id.as_id().to_string()),

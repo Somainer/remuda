@@ -3247,7 +3247,7 @@ pub async fn post_command(
         crate::agent_scope::initiator_and_device(&state, &device).await?;
     let (command, created) = state
         .store
-        .queue_command(
+        .queue_command_by(
             body.command_id,
             Some(instance_id.clone()),
             instance.host_id.clone(),
@@ -3257,6 +3257,9 @@ pub async fn post_command(
             None,
             initiator,
             initiator_device_id,
+            // cb-command-queue: the queuing device, for a Human or Bot
+            // caller's own queued commands (Hub-only).
+            Some(device.id.clone()),
         )
         .await
         .map_err(map_store)?;
@@ -3300,9 +3303,29 @@ pub async fn post_command(
     if command.operation == "instance.configure"
         && let Err(store_error) = state
             .store
-            .patch_instance_configure(instance_id, command.payload.clone())
+            .patch_instance_configure_for(
+                instance_id.clone(),
+                Some(command.command_id.clone()),
+                command.payload.clone(),
+            )
             .await
     {
+        // cb-command-queue: a stale `expectedGeneration` is an audit row.
+        if let crate::store::StoreError::GenerationConflict { generation, .. } = &store_error {
+            let _ = state
+                .store
+                .append_audit(
+                    device.id.clone(),
+                    "instance.configure.conflict".into(),
+                    Some(instance_id.clone()),
+                    json!({
+                        "commandId": command.command_id,
+                        "expectedGeneration": command.payload.get("expectedGeneration"),
+                        "generation": generation,
+                    }),
+                )
+                .await;
+        }
         let error = map_store(store_error);
         let (http_status, http_body) = error.status_code_and_body();
         // Persist the pre-dispatch rejection WITH the command so a replay
@@ -3318,8 +3341,46 @@ pub async fn post_command(
             .await;
         return Err(error);
     }
+    // cb-command-queue: effort on a carrier that takes it only at launch is a
+    // `next-chapter` change; the merge above already holds it. With nothing
+    // else to switch, the Hub settles it without a Node round trip.
+    if command.operation == "instance.configure"
+        && crate::cmd_queue::LAUNCH_EFFORT_DRIVERS.contains(&instance.driver.as_str())
+        && crate::cmd_queue::changes_effort(&command.payload)
+    {
+        let settle = !crate::cmd_queue::changes_model(&command.payload);
+        let command_id = command.command_id.clone();
+        let deferred = state
+            .store
+            .run_named("defer_configure_next_chapter", move |conn| {
+                crate::cmd_queue::defer_to_next_chapter(conn, &command_id, settle)
+            })
+            .await
+            .map_err(map_store)?;
+        if settle && let Some(command) = deferred {
+            return Ok(Json(json!({ "command": command, "replayed": false })));
+        }
+    }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
-    let command = forward_if_online(&state, command, live).await?;
+    let mut command = forward_if_online(&state, command, live).await?;
+    // cb-command-queue: a busy PTY carrier applies the switch at its next
+    // idle moment; say so instead of implying it is in effect.
+    if command.operation == "instance.configure"
+        && command.forwarded
+        && crate::cmd_queue::waits_for_turn(&instance, &command.payload)
+    {
+        let command_id = command.command_id.clone();
+        if let Some(row) = state
+            .store
+            .run_named("defer_configure_next_turn", move |conn| {
+                crate::cmd_queue::defer_to_next_turn(conn, &command_id)
+            })
+            .await
+            .map_err(map_store)?
+        {
+            command = row;
+        }
+    }
     // D-062: a close on a claimed pane is a release (detach only).
     if command.operation == "instance.close" && crate::herdr_claims::is_claimed(&instance) {
         crate::herdr_claims::audit_release(&state, &device, &instance).await;
@@ -3736,7 +3797,14 @@ fn retry_matches_row(
         return false;
     }
     if operation == "instance.send" {
-        return normalized_send_payload(&row.payload) == normalized_send_payload(payload);
+        let retry = normalized_send_payload(payload);
+        // cb-command-queue: an edited send is still named by the payload it
+        // was first POSTed with (an outbox replays what it holds).
+        return normalized_send_payload(&row.payload) == retry
+            || row
+                .original_payload
+                .as_ref()
+                .is_some_and(|original| normalized_send_payload(original) == retry);
     }
     row.payload == *payload
 }
@@ -4953,6 +5021,14 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound);
         }
     };
+    // cb-command-queue: the row exactly as the intent mark committed it. An
+    // edit lands only while `forwarded = 0`, so this text is final, and the
+    // caller's copy may predate an edit.
+    let command = state
+        .store
+        .get_command(command.command_id.clone())
+        .await?
+        .unwrap_or(command);
     let outcome = async {
     // A forwarded non-create command now has resolution `unknown`. There is
     // deliberately no Hub-side ack deadline that settles it: a forward intent
@@ -4986,6 +5062,18 @@ pub(crate) async fn forward_if_online(
         spec.remove("memoryContext");
         spec.remove(CREATOR_PERMISSION_MODE_FIELD);
         spec.remove("skillContext");
+    }
+    // cb-command-queue: a next-chapter configure carries no effort to a
+    // carrier that cannot switch it.
+    if command.operation == "instance.configure"
+        && command
+            .deferred
+            .as_ref()
+            .and_then(|deferred| deferred.get("boundary"))
+            .and_then(Value::as_str)
+            == Some(crate::cmd_queue::NEXT_CHAPTER)
+    {
+        crate::cmd_queue::strip_effort(object);
     }
     if command.operation == "instance.send"
         && let Some(rev) = state
@@ -5663,6 +5751,14 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
         }
         crate::store::StoreError::Conflict(msg) => HubError::Conflict(msg.clone()),
         crate::store::StoreError::Fenced => HubError::Fenced,
+        crate::store::StoreError::GenerationConflict { generation, config } => {
+            HubError::generation_conflict(*generation, config.clone())
+        }
+        crate::store::StoreError::NotQueued(command_id) => HubError::not_queued(command_id),
+        crate::store::StoreError::RevisionConflict {
+            command_id,
+            revision,
+        } => HubError::revision_conflict(command_id, *revision),
         crate::store::StoreError::CreatorModeChanged { stamped, now } => {
             HubError::Conflict(format!(
                 "the creator's permission mode changed from {stamped} to {now} while this \
@@ -5712,6 +5808,11 @@ mod forward_slot_tests {
             settlement: None,
             initiator: None,
             initiator_device_id: None,
+            revision: 0,
+            held: None,
+            deferred: None,
+            original_payload: None,
+            queued_by_device_id: None,
         }
     }
 

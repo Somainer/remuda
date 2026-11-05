@@ -992,3 +992,149 @@ async fn two_consecutive_steers_each_interrupt_and_keep_order() {
     assert!(folded_with_status(&node, &created, ContentStatus::Queued).is_empty());
     node.shutdown().await.unwrap();
 }
+
+/// cb-command-queue: a prompt the queue holds is withdrawn (dropped, settled
+/// cancelled, never written) or edited (the write and the queued row carry
+/// the new text) through the Hub's held-input methods; once written, both
+/// answer `already-delivered`.
+#[tokio::test]
+async fn held_prompts_are_withdrawn_or_edited_before_delivery_and_never_after() {
+    let (node, driver) = node(DriverKind::ClaudePty, 8);
+    let created = create(&node, DriverKind::ClaudePty).await;
+    let keep = submit(
+        &node,
+        &created,
+        serde_json::json!({"operation": "send", "prompt": "keep me"}),
+    )
+    .await;
+    let dropped = submit(
+        &node,
+        &created,
+        serde_json::json!({"operation": "send", "prompt": "drop me"}),
+    )
+    .await;
+    let edited = submit(
+        &node,
+        &created,
+        serde_json::json!({"operation": "send", "prompt": "old text"}),
+    )
+    .await;
+    wait(|| messages(&node, &created, ContentStatus::Queued).len() == 4).await;
+    let rpc =
+        |method: &str, params: serde_json::Value| node.held_input_rpc(method, &params).unwrap();
+    let id = |command: &Command| command.command_id.as_id().to_string();
+    assert_eq!(
+        rpc(
+            "command.withdraw",
+            serde_json::json!({"commandId": id(&dropped)})
+        )["outcome"],
+        "withdrawn"
+    );
+    let answer = rpc(
+        "command.edit",
+        serde_json::json!({"commandId": id(&edited), "expectedRevision": 0, "prompt": "new text"}),
+    );
+    assert_eq!(answer["outcome"], "edited");
+    assert_eq!(answer["revision"], 1);
+    // Applied while still waiting behind the head, before any delivery.
+    wait(|| node.get_command(&dropped.command_id).unwrap().state == CommandState::Settled).await;
+    let settled = node.get_command(&dropped.command_id).unwrap();
+    assert!(
+        matches!(&settled.settlement, Knowledge::Known { value } if value.outcome == SettlementOutcome::Cancelled),
+        "{:?}",
+        settled.settlement
+    );
+    wait(|| {
+        folded_messages(&node, &created).iter().any(|message| {
+            message.status == ContentStatus::Queued
+                && message.blocks.iter().any(|block| {
+                    matches!(block, remuda_protocol::ContentBlock::Text(text) if text.text == "new text")
+                })
+        })
+    })
+    .await;
+    assert_eq!(driver.attempts.load(Ordering::SeqCst), 0);
+
+    submit(
+        &node,
+        &created,
+        serde_json::json!({"operation": "tty.write", "keys": ["enter"]}),
+    )
+    .await;
+    wait(|| driver.sent.lock().unwrap().len() == 3).await;
+    assert_eq!(
+        *driver.sent.lock().unwrap(),
+        ["first", "keep me", "new text"]
+    );
+    assert_eq!(
+        folded_with_status(&node, &created, ContentStatus::Interrupted).len(),
+        1
+    );
+    for command in [&keep, &edited] {
+        assert_eq!(
+            rpc(
+                "command.withdraw",
+                serde_json::json!({"commandId": id(command)})
+            )["outcome"],
+            "already-delivered"
+        );
+        assert_eq!(
+            rpc(
+                "command.edit",
+                serde_json::json!({"commandId": id(command), "expectedRevision": 1, "prompt": "late"})
+            )["outcome"],
+            "already-delivered"
+        );
+    }
+    node.shutdown().await.unwrap();
+}
+
+/// cb-command-queue: withdrawals racing live deliveries; every prompt ends
+/// exactly one way — withdrawn and never written, or written once with the
+/// withdrawal refused.
+#[tokio::test]
+async fn a_withdrawal_racing_delivery_has_exactly_one_winner() {
+    let (node, driver) = node(DriverKind::ClaudePty, 64);
+    let created = create(&node, DriverKind::ClaudePty).await;
+    let mut commands = Vec::new();
+    for n in 0..24 {
+        commands.push((
+            n,
+            submit(
+                &node,
+                &created,
+                serde_json::json!({"operation": "send", "prompt": format!("race {n}")}),
+            )
+            .await,
+        ));
+    }
+    driver.ready.store(true, Ordering::SeqCst);
+    let mut answers = Vec::new();
+    for (n, command) in &commands {
+        let answer = node
+            .held_input_rpc(
+                "command.withdraw",
+                &serde_json::json!({"commandId": command.command_id.as_id().to_string()}),
+            )
+            .unwrap();
+        answers.push((*n, command.command_id.clone(), answer["outcome"].clone()));
+        tokio::task::yield_now().await;
+    }
+    wait(|| {
+        commands.iter().all(|(_, command)| {
+            node.get_command(&command.command_id).unwrap().state == CommandState::Settled
+        })
+    })
+    .await;
+    let sent = driver.sent.lock().unwrap().clone();
+    for (n, _, outcome) in answers {
+        let text = format!("race {n}");
+        let times = sent.iter().filter(|prompt| **prompt == text).count();
+        match outcome.as_str() {
+            Some("withdrawn") => assert_eq!(times, 0, "{text} withdrawn yet written"),
+            Some("already-delivered") => assert_eq!(times, 1, "{text} written {times} times"),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+    node.shutdown().await.unwrap();
+}

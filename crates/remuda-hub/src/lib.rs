@@ -16,6 +16,7 @@ mod api_relay;
 mod attachments;
 mod auth;
 mod bot;
+mod cmd_queue;
 mod config;
 mod devices;
 mod digest;
@@ -725,6 +726,7 @@ pub mod store_test_support {
             settlement: Some(CommandSettlement {
                 outcome: "rejected".into(),
                 reason: Some("node rejected the send".into()),
+                withdrawn_by: None,
             }),
             payload: json!({ "input": { "type": "prompt" } }),
             idempotency_key: Some("idem_sample".into()),
@@ -743,6 +745,11 @@ pub mod store_test_support {
                 }),
             }),
             initiator_device_id: None,
+            revision: 1,
+            held: Some("hub".into()),
+            deferred: Some(json!({ "boundary": "next-turn" })),
+            original_payload: None,
+            queued_by_device_id: None,
         };
         serde_json::to_value(record).expect("command record serializes")
     }
@@ -761,6 +768,7 @@ pub mod store_test_support {
             SettlementOutcome::Cancelled,
             SettlementOutcome::Expired,
             SettlementOutcome::Withheld,
+            SettlementOutcome::Withdrawn,
         ]
         .into_iter()
         .map(|outcome| {
@@ -2808,6 +2816,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hosts::routes())
         .merge(ssh_hosts::routes(state.clone()))
         .merge(instances::routes())
+        .merge(cmd_queue::routes())
         .merge(interactions::routes())
         .merge(tty::routes())
         .merge(ws::routes())

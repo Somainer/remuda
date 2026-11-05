@@ -336,8 +336,23 @@ fn read_target(path: &str) -> Option<&str> {
     let id = rest
         .strip_suffix("/journal")
         .or_else(|| rest.strip_suffix("/screen"))
+        // cb-command-queue: the runtime config and its generation.
+        .or_else(|| rest.strip_suffix("/config"))
         .unwrap_or(rest);
     (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// `PATCH /v1/commands/{id}` (cb-command-queue).
+fn command_edit_target(path: &str) -> bool {
+    path.strip_prefix("/v1/commands/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// `POST /v1/commands/{id}/withdraw` (cb-command-queue).
+fn command_withdraw_target(path: &str) -> bool {
+    path.strip_prefix("/v1/commands/")
+        .and_then(|rest| rest.strip_suffix("/withdraw"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// The two D-028 attachment reads, which authorize themselves against the
@@ -919,9 +934,29 @@ pub async fn authorize_command(
     if origin(device) == remuda_protocol::InputOrigin::Agent {
         if !matches!(
             operation,
-            "instance.send" | "instance.cancel" | "instance.close" | "tty.write" | "instance.keys"
+            "instance.send"
+                | "instance.cancel"
+                | "instance.close"
+                | "tty.write"
+                | "instance.keys"
+                | "instance.configure"
         ) {
             return Err(HubError::operator_only());
+        }
+        // `ap-configure` (cb-command-queue, main-agent.md §4.2.2): model,
+        // effort and ultracode on owned targets, no approval; a permission
+        // mode change stays operator-only until `ap-configure-mode`.
+        if operation == "instance.configure" {
+            if payload
+                .get("permissionMode")
+                .is_some_and(|mode| !mode.is_null())
+            {
+                return Err(HubError::operator_only());
+            }
+            if !owns(state, device, &instance.instance_id).await? {
+                return Err(HubError::not_owner());
+            }
+            return Ok(());
         }
         // D-031 follow-up (host-search-1): an Agent may message an instance
         // inside its own project scope with no per-message human approval; the
@@ -1252,6 +1287,9 @@ pub async fn restrict_agent_routes(
                     // and the feature switch; admitting the path loosens
                     // nothing by itself.
                     || path == "/v1/interactions"
+                    // cb-command-queue: the caller's own queued commands; the
+                    // handler filters to the Hub-stamped initiator.
+                    || path == "/v1/commands"
                     || match lineage_read_target(path).or_else(|| glance_read_target(path)) {
                         Some(id) => agent_owns_lineage(&state, &device, id).await?,
                         None => false,
@@ -1287,9 +1325,15 @@ pub async fn restrict_agent_routes(
                     // D-060 §11.5: `remuda owner notify`; the handler
                     // requires `address-owner` and the initiator check.
                     || path == "/v1/owner/notify"
+                    // cb-command-queue: withdraw an own queued command; the
+                    // handler admits only the caller's own, undelivered ones.
+                    || command_withdraw_target(path)
                     || task_write_target(request.method(), path))
                 || request.method() == axum::http::Method::PATCH
-                    && (project_write_target(path) || task_write_target(request.method(), path))
+                    && (project_write_target(path)
+                        || task_write_target(request.method(), path)
+                        // cb-command-queue: edit an own queued send.
+                        || command_edit_target(path))
                 || (request.method() == axum::http::Method::DELETE
                     && ((path
                         .strip_prefix("/v1/projects/")

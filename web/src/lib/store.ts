@@ -7773,7 +7773,13 @@ class HubStore {
   }
 
   async close(instanceId: Id) {
-    await api.instanceClose(instanceId);
+    // D-062: closing a claimed herdr pane is a release — Remuda detaches and
+    // the pane keeps running.
+    if (this.state.instances.find((row) => row.id === instanceId)?.driver === "herdr-claimed") {
+      await api.instanceRelease(instanceId);
+    } else {
+      await api.instanceClose(instanceId);
+    }
     await this.refresh();
   }
 

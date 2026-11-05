@@ -133,6 +133,29 @@ describe("RowActions", () => {
     expect(calls.close).toHaveBeenCalledWith("ins_a");
   });
 
+  it("labels a claimed external herdr pane 释放 and says the pane keeps running (D-062)", async () => {
+    calls.close.mockClear();
+    render(
+      <Harness
+        instance={inst({
+          driver: "herdr-claimed",
+          herdrClaim: { session: "work", workspaceId: "w2", tabId: "w2:t19", paneId: "w2:p5K" },
+        })}
+      />,
+    );
+    await userEvent.click(screen.getByTestId("row-actions-more"));
+    expect(items()).toContain("释放…");
+    expect(items()).not.toContain("关闭…");
+    await userEvent.click(screen.getByTestId("row-action-close"));
+    const confirm = screen.getByTestId("row-close-confirm");
+    expect(confirm).toHaveTextContent("释放「title ins_a」");
+    expect(confirm).toHaveTextContent("继续运行");
+    const yes = screen.getByTestId("row-close-confirm-yes");
+    expect(yes).toHaveTextContent("释放");
+    await userEvent.click(yes);
+    expect(calls.close).toHaveBeenCalledWith("ins_a");
+  });
+
   it("refuses the portaled 关闭… confirm once the read is stale", async () => {
     calls.close.mockClear();
     const { rerender } = render(<Harness instance={inst()} />);

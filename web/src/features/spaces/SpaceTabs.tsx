@@ -9,6 +9,7 @@ import type { Instance } from "../../types/instance";
 import { ActionSheet } from "./ActionSheet";
 import { HarnessGlyph } from "./SpacesPanel";
 import { LaunchedByMark } from "../session/LaunchedBy";
+import { isClaimed } from "../session/HerdrClaimBadge";
 import { useTabSet } from "./useSpaceWorkbench";
 import css from "./spaces.module.css";
 
@@ -187,10 +188,12 @@ export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?:
     <Link ref={newRef} className={css.newTab} to={newHref} aria-label="新建 agent" title="新建 agent">＋</Link>
     <span className={css.tabHint}>{prefs.selectedSpaceId === space?.id ? space?.name : "Agents"}</span>
     {sheet ? <ActionSheet testId="tab-close-sheet" title={`关闭「${hubStore.titleOf(sheet.id)}」`}
-      detail="会话仍在运行。仅关闭标签不会停止它；它在需要你处理时会重新出现。"
+      detail={isClaimed(sheet)
+        ? "这是认领的外部 herdr pane。释放只是让 Remuda 不再接管，pane 和进程会继续运行；仅关闭标签则保持认领。"
+        : "会话仍在运行。仅关闭标签不会停止它；它在需要你处理时会重新出现。"}
       busy={closing.includes(sheet.id)} onClose={() => setSheet(undefined)}
       actions={[
-        { id: "tab-close-stop", label: "停止并关闭", tone: "danger", onSelect: () => void dismiss(sheet, true) },
+        { id: "tab-close-stop", label: isClaimed(sheet) ? "释放并关闭" : "停止并关闭", tone: "danger", onSelect: () => void dismiss(sheet, true) },
         { id: "tab-close-keep", label: "仅关闭标签", tone: "primary", onSelect: () => void dismiss(sheet, false) },
       ]} /> : null}
   </div>;

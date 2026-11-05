@@ -42,8 +42,8 @@ pub use fake_gateway::{
     RecordedRequest, SSE_CONTENT_TYPE, Script, parse_listen, parse_script, run_fake_gateway,
 };
 pub use fake_herdr::{
-    FakeHerdrError, FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, fake_herdr_bin,
-    herdr_frames_path, herdr_session_ok_path, run_fake_herdr, write_observe_frames,
+    FakeHerdrError, FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, calls_neighbor,
+    fake_herdr_bin, herdr_frames_path, herdr_session_ok_path, run_fake_herdr, write_observe_frames,
 };
 pub use flags::ClaudeFlags;
 pub use paths::{

@@ -103,6 +103,35 @@ pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
 /// `workspace_roots`, never following symlinks. Human-origin callers only;
 /// the Hub refuses Bot/Agent origins before proxying.
 pub const METHOD_HOST_DIRS_LIST: &str = "host.dirs.list";
+/// Hub→Node (D-062): list this host's reachable herdr sessions → workspaces →
+/// tabs → panes, metadata only. Never reads pane content and never lists the
+/// Node's own carrier session. Human-origin callers only.
+pub const METHOD_HERDR_DISCOVER: &str = "herdr.discover";
+/// Hub→Node (D-062): read-only validation of one claim target — the id chain
+/// (pane in tab, tab in workspace), the single-pane rule, uniqueness — and the
+/// resolved [`crate::HerdrClaim`] it would record.
+pub const METHOD_HERDR_RESOLVE: &str = "herdr.resolve";
+/// Hub→Node (D-062): claim an external herdr pane as `instanceId`
+/// (`driver = herdr-claimed`). Idempotent per instance id.
+pub const METHOD_INSTANCE_CLAIM: &str = "instance.claim";
+/// Stable prefix of a Node refusal for a claim target whose ids do not exist
+/// or do not belong together (Hub: 400).
+pub const HERDR_CLAIM_INVALID: &str = "herdr-claim-invalid";
+/// Stable prefix of a Node refusal for a multi-pane tab claimed without a
+/// pane id; the text lists the tab's pane ids (Hub: 400).
+pub const HERDR_CLAIM_AMBIGUOUS: &str = "herdr-claim-ambiguous";
+/// Stable prefix of a Node refusal for an agent claim whose pane has no
+/// foreground agent process yet (herdr reports only the shell) (Hub: 409).
+pub const HERDR_CLAIM_NOT_READY: &str = "herdr-claim-not-ready";
+/// Stable prefix of a Node refusal for the Node's own carrier session
+/// (Hub: 400).
+pub const HERDR_CLAIM_OWN_SESSION: &str = "herdr-claim-own-session";
+/// Stable prefix of a Node refusal for a pane that already has a live claim;
+/// the text names the claiming instance (Hub: 409).
+pub const HERDR_CLAIM_CONFLICT: &str = "herdr-claim-conflict";
+/// Stable prefix of a Node refusal because the named herdr server did not
+/// answer (Hub: 400).
+pub const HERDR_UNREACHABLE: &str = "herdr-unreachable";
 
 /// Hello `capabilities` key (D-060, cb-memory-inject): `true` when this Node
 /// carries a create/resume [`MemoryContext`] to its launch materializer.
@@ -676,6 +705,133 @@ pub struct HostDirsListResult {
     pub dirs: Vec<HostDirEntry>,
     /// True when entries were dropped at the result-size cap.
     pub truncated: bool,
+}
+
+/// `herdr.discover` params (D-062).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrDiscoverParams {
+    /// Restrict to one session (name or absolute socket path). Absent lists
+    /// every session under the Node user's herdr config dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// `herdr.discover` result (D-062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrDiscoverResult {
+    /// Sessions found, sorted by name.
+    pub sessions: Vec<HerdrSessionListing>,
+}
+
+/// One herdr session in a [`HerdrDiscoverResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrSessionListing {
+    /// Session name (`default` for the user's default socket) or the socket
+    /// path the caller named.
+    pub session: String,
+    /// API socket path.
+    pub socket_path: String,
+    /// Whether the server answered `session.snapshot`.
+    pub reachable: bool,
+    /// Why it did not, when `reachable` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Workspaces, in herdr's order.
+    pub workspaces: Vec<HerdrWorkspaceListing>,
+}
+
+/// One workspace in a [`HerdrSessionListing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrWorkspaceListing {
+    /// Workspace id (`w2`).
+    pub workspace_id: String,
+    /// Sidebar label.
+    pub label: String,
+    /// Tabs in this workspace.
+    pub tabs: Vec<HerdrTabListing>,
+}
+
+/// One tab in a [`HerdrWorkspaceListing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrTabListing {
+    /// Tab id (`w2:t19`).
+    pub tab_id: String,
+    /// Tab label.
+    pub label: String,
+    /// Panes in this tab.
+    pub panes: Vec<HerdrPaneListing>,
+}
+
+/// One pane in a [`HerdrTabListing`]. Metadata only, never content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrPaneListing {
+    /// Pane id (`w2:p5K`).
+    pub pane_id: String,
+    /// Agent kind herdr detected in the pane, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// herdr agent status (`idle`, `working`, `blocked`, `done`, `unknown`).
+    pub agent_status: String,
+    /// Foreground process (pid and executable base name), when herdr says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<crate::HerdrClaimProcess>,
+    /// Live Instance that already claims this pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+}
+
+/// `herdr.resolve` params; also the target part of `instance.claim` (D-062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrClaimTarget {
+    /// Session name or absolute API socket path.
+    pub session: String,
+    /// Workspace id.
+    pub workspace_id: String,
+    /// Tab id; must be in `workspace_id`.
+    pub tab_id: String,
+    /// Pane id; must be in `tab_id`. Absent requires a single-pane tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// `claude|codex|grok|agy|shell`; absent takes herdr's agent kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// `herdr.resolve` result (D-062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrClaimResolution {
+    /// What the claim would record.
+    pub claim: crate::HerdrClaim,
+    /// Resolved agent kind (`claude`, …, `generic`, `terminal`).
+    pub kind: crate::AgentKind,
+    /// herdr agent status of the pane right now.
+    pub agent_status: String,
+    /// Pane cwd herdr reports, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The registered Remuda workspace containing `cwd`, which the claimed
+    /// instance files under (D-062 r2 item 6); absent when none contains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remuda_workspace_id: Option<String>,
+}
+
+/// `instance.claim` params (D-062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceClaimParams {
+    /// Hub-allocated instance id; the claim is idempotent per id.
+    pub instance_id: String,
+    /// The pane to claim.
+    #[serde(flatten)]
+    pub target: HerdrClaimTarget,
 }
 
 /// `node.auth` params (stdio first frame).

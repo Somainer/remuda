@@ -42,7 +42,7 @@ export type ActorRef = ({
 export type ActorType = ("human" | "bot" | "agent" | "system");
 
 /** AdapterTransport wire values; `protocol.md` §3.2. */
-export type AdapterTransport = ("native-rust-wire" | "claude-sdk-sidecar" | "claude-pty-herdr" | "claude-bg-herdr-attach" | "codex-appserver-spawn" | "codex-embedded" | "grok-acp" | "agy-native" | "generic-herdr" | "shell-pty");
+export type AdapterTransport = ("native-rust-wire" | "claude-sdk-sidecar" | "claude-pty-herdr" | "claude-bg-herdr-attach" | "codex-appserver-spawn" | "codex-embedded" | "grok-acp" | "agy-native" | "generic-herdr" | "shell-pty" | "herdr-claimed");
 
 /** AgentKind wire values; `protocol.md` §1.3. */
 export type AgentKind = ("claude" | "codex" | "grok" | "agy" | "generic" | "terminal");
@@ -764,7 +764,7 @@ export type DriverInput = (PromptInput & ({
 }));
 
 /** DriverKind wire values; `protocol.md` §3.1. */
-export type DriverKind = ("claude-print" | "claude-sdk" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
+export type DriverKind = ("claude-print" | "claude-sdk" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty" | "herdr-claimed");
 
 /** The effective-model half of a [`ModelPayload`]: the resolved id plus what established it. */
 export type EffectiveModel = ({
@@ -1455,6 +1455,69 @@ export type HelloResult = ({
   [key: string]: unknown;
 });
 
+/** An external herdr pane claimed as an Instance (D-062, `herdr-claim.md`).  Present only on `driver = herdr-claimed`. A claim is not ownership: the Node detaches on release and never closes the pane, signals its process or stops the server that hosts it. */
+export type HerdrClaim = ({
+  "agent"?: (string | null);
+  "contact"?: (string | null);
+  "paneId": (string);
+  "process"?: (HerdrClaimProcess | (null));
+  "session": (string);
+  "socketPath": (string);
+  "tabId": (string);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
+/** The process a claim watches for process-end evidence (D-062). */
+export type HerdrClaimProcess = ({
+  "command": (string);
+  "pid": (number);
+  "startTicks"?: (U64 | (null));
+  [key: string]: unknown;
+});
+
+/** `herdr.resolve` result (D-062). */
+export type HerdrClaimResolution = ({
+  "agentStatus": (string);
+  "claim": HerdrClaim;
+  "cwd"?: (string | null);
+  "kind": AgentKind;
+  "remudaWorkspaceId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** `herdr.resolve` params; also the target part of `instance.claim` (D-062). */
+export type HerdrClaimTarget = ({
+  "kind"?: (string | null);
+  "paneId"?: (string | null);
+  "session": (string);
+  "tabId": (string);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
+/** `herdr.discover` params (D-062). */
+export type HerdrDiscoverParams = ({
+  "session"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** `herdr.discover` result (D-062). */
+export type HerdrDiscoverResult = ({
+  "sessions": ((HerdrSessionListing)[]);
+  [key: string]: unknown;
+});
+
+/** One pane in a [`HerdrTabListing`]. Metadata only, never content. */
+export type HerdrPaneListing = ({
+  "agent"?: (string | null);
+  "agentStatus": (string);
+  "claimedBy"?: (string | null);
+  "paneId": (string);
+  "process"?: (HerdrClaimProcess | (null));
+  [key: string]: unknown;
+});
+
 /** Herdr pane identity within a named server session; `protocol.md` §1.3. */
 export type HerdrRef = ({
   "binaryPath": (string);
@@ -1481,6 +1544,32 @@ export type HerdrServer = ({
   "serverEpoch": Id;
   "serverIdentity": Id;
   "version": (string);
+  [key: string]: unknown;
+});
+
+/** One herdr session in a [`HerdrDiscoverResult`]. */
+export type HerdrSessionListing = ({
+  "error"?: (string | null);
+  "reachable": (boolean);
+  "session": (string);
+  "socketPath": (string);
+  "workspaces": ((HerdrWorkspaceListing)[]);
+  [key: string]: unknown;
+});
+
+/** One tab in a [`HerdrWorkspaceListing`]. */
+export type HerdrTabListing = ({
+  "label": (string);
+  "panes": ((HerdrPaneListing)[]);
+  "tabId": (string);
+  [key: string]: unknown;
+});
+
+/** One workspace in a [`HerdrSessionListing`]. */
+export type HerdrWorkspaceListing = ({
+  "label": (string);
+  "tabs": ((HerdrTabListing)[]);
+  "workspaceId": (string);
   [key: string]: unknown;
 });
 
@@ -1782,6 +1871,7 @@ export type Instance = ({
   "driver": DriverKind;
   "durableSeq": U64;
   "exit": Knowledge19;
+  "herdrClaim"?: (HerdrClaim | (null));
   "hostId": HostId;
   "id": InstanceId;
   "journalId": Id;
@@ -1815,6 +1905,17 @@ export type InstanceAttachParams = ({
 export type InstanceCancelParams = ({
   "instanceId": InstanceId;
   "runId": RunId;
+  [key: string]: unknown;
+});
+
+/** `instance.claim` params (D-062). */
+export type InstanceClaimParams = ({
+  "instanceId": (string);
+  "kind"?: (string | null);
+  "paneId"?: (string | null);
+  "session": (string);
+  "tabId": (string);
+  "workspaceId": (string);
   [key: string]: unknown;
 });
 

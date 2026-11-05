@@ -99,6 +99,8 @@ pub(crate) struct DevNodeInner {
     pub(crate) stopping: std::sync::atomic::AtomicBool,
     pub(crate) mutations: RwLock<()>,
     pub(crate) herdr_config: Option<crate::NativeDriverConfig>,
+    /// D-062 claimed external herdr panes: settings and live watchers.
+    pub(crate) herdr_claims: crate::herdr_claim::ClaimRegistry,
     /// Where staged attachment bytes are pulled from (D-027). `None` on a Node
     /// with no Hub link, where a send carrying attachments is refused rather
     /// than silently downgraded to text.
@@ -340,6 +342,7 @@ impl DevNode {
                 stopping: Default::default(),
                 mutations: Default::default(),
                 herdr_config: None,
+                herdr_claims: Default::default(),
                 objects: std::sync::RwLock::new(None),
                 host_file_stager: std::sync::RwLock::new(None),
                 tool_media_stager: std::sync::RwLock::new(Arc::new(std::sync::RwLock::new(None))),
@@ -2645,13 +2648,13 @@ fn finish_instance_operation(
                     value: Activity::Idle,
                 }),
             )?;
-            append_instance_lifecycle(
-                store,
-                instance_id,
-                Some("ready"),
-                "exited",
-                "explicit-close",
-            )?;
+            // D-062: closing a claimed herdr pane only detaches from it.
+            let reason = if kind == remuda_protocol::DriverKind::HerdrClaimed {
+                crate::herdr_claim::REASON_RELEASED
+            } else {
+                "explicit-close"
+            };
+            append_instance_lifecycle(store, instance_id, Some("ready"), "exited", reason)?;
         }
         DriverRequest::Send { .. }
         | DriverRequest::Cancel
@@ -3462,10 +3465,15 @@ fn validate_tty_key(key: &str) -> Result<String, NodeError> {
     ))
 }
 
-fn validate_kind_driver(
+pub(crate) fn validate_kind_driver(
     kind: AgentKind,
     driver: remuda_protocol::DriverKind,
 ) -> Result<(), NodeError> {
+    if driver == remuda_protocol::DriverKind::HerdrClaimed {
+        return Err(NodeError::InvalidRequest(
+            "herdr-claimed instances are created only by instance.claim (D-062)".to_owned(),
+        ));
+    }
     let valid = matches!(
         (kind, driver),
         (AgentKind::Claude, remuda_protocol::DriverKind::ClaudePrint)
@@ -3926,6 +3934,7 @@ pub(crate) fn fixture_instance_with_session(
         // Remuda ran the launch command. Promotion flips this to `user`
         // (D-028 §1.0 rule 4); it records provenance, never capability.
         launched_by: Some(remuda_protocol::LaunchedBy::Remuda),
+        herdr_claim: None,
     })
 }
 

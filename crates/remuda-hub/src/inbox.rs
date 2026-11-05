@@ -542,6 +542,19 @@ async fn patch_inbox(
     if patch.opt_in.is_some() && caller != InputOrigin::Human {
         return Err(HubError::Forbidden);
     }
+    if patch.opt_in == Some(true) {
+        let lineage = lineage_id.clone();
+        let claimed = state
+            .store
+            .read("inbox_opt_in_claimed", move |conn| {
+                Ok(crate::herdr_claims::claimed_lineage(conn, &lineage)?)
+            })
+            .await
+            .map_err(map_store)?;
+        if claimed {
+            return Err(crate::herdr_claims::takes_no_hub_input("an inbox"));
+        }
+    }
     Ok(Json(
         state
             .store
@@ -618,6 +631,12 @@ fn receives_with(
     lineage_id: &str,
     settings: &InboxSettings,
 ) -> Result<bool, StoreError> {
+    // D-062 r3 item 5: a claimed herdr pane is never a subscriber, whatever
+    // its settings say: a batch would be Hub voice typed into a process
+    // Remuda did not start.
+    if crate::herdr_claims::claimed_lineage(conn, lineage_id)? {
+        return Ok(false);
+    }
     if settings.opt_in {
         return Ok(true);
     }

@@ -85,7 +85,9 @@ export type DriverKind =
   | "grok-acp"
   | "agy-print"
   | "generic-pty"
-  | "shell-pty";
+  | "shell-pty"
+  /** D-062: an external herdr pane a human started, claimed (not owned). */
+  | "herdr-claimed";
 
 export type CapabilitySnapshot = {
   id: Id;

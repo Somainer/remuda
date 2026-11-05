@@ -1152,6 +1152,8 @@ pub(crate) enum Added {
     Limit,
     NotReceived,
     NoLineage,
+    /// D-062 r3 item 5: the lineage is a claimed herdr pane.
+    ClaimedPane,
     /// The check's host left the lineage's scope.
     OutOfScope,
     /// A check reached the writer unadmitted: only an exact repeat may, and
@@ -1175,6 +1177,11 @@ pub(crate) fn add(
     let lineage = caller.lineage_id.as_str();
     if !lineage_exists(&tx, lineage)? {
         return Ok(Added::NoLineage);
+    }
+    // D-062 r3 item 5: neither a persistent run (an inbox batch) nor a fresh
+    // child on the chapter's behalf may come from a claimed pane's wake-up.
+    if crate::herdr_claims::claimed_lineage(&tx, lineage)? {
+        return Ok(Added::ClaimedPane);
     }
     if let Some(name) = &checked.name {
         let existing: Option<(String, String)> = tx
@@ -1633,6 +1640,9 @@ async fn add_route(
             });
         }
         Added::NoLineage => return Err(HubError::NotFound.into()),
+        Added::ClaimedPane => {
+            return Err(crate::herdr_claims::takes_no_hub_input("wake-ups").into());
+        }
         Added::OutOfScope => return Err(HubError::out_of_scope().into()),
         Added::NeedsAdmission => {
             return Err(WakeError::Conflict {
@@ -3672,6 +3682,10 @@ fn claim_fresh(
         Some((current, _)) => current,
         None => lineage_id.clone(),
     };
+    // D-062 r3 item 5: never a child on a claimed pane's behalf.
+    if crate::herdr_claims::claimed_row(&tx, &chapter_id)? {
+        return Ok(Err("claimed-pane"));
+    }
     #[allow(clippy::type_complexity)]
     let chapter: Option<(
         String,

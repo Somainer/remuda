@@ -897,6 +897,15 @@ pub struct InstanceRecord {
         rename = "launchedBy"
     )]
     pub launched_by: Option<String>,
+    /// D-062: the external herdr pane this instance claims (`driver =
+    /// herdr-claimed`): session, socket, workspace, tab and pane ids, the
+    /// process recorded at claim time and `contact` (`ok` / `lost`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "herdrClaim"
+    )]
+    pub herdr_claim: Option<Value>,
     /// Delegation preset name applied at create (`worker` /
     /// `project-coordinator` / `top-coordinator`); design §2.5.
     ///
@@ -1696,6 +1705,30 @@ pub struct ContinuationResumeRequest {
 
 /// `chapterCause` of a chapter an owner Resume opened.
 pub const OWNER_RESUME_CAUSE: &str = "owner-resume";
+
+/// Result of [`Store::claim_detach_state`] (D-062 r3 item 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimDetach {
+    /// The Node accepted or settled a detach (not refused).
+    Delivered,
+    /// A detach is queued and not yet forwarded; the sweeps deliver it.
+    Pending,
+    /// A detach was forwarded but the Node never answered: its frame may
+    /// have died with the link (`node rpc dropped`) or its reply was lost.
+    /// Nothing journals a frame the Node never saw, so it is sent again.
+    Unconfirmed,
+    /// No detach was queued, or every one was refused before the Node ran it.
+    Missing,
+}
+
+/// SQL predicate over `commands` (columns prefixed with `alias`, e.g. `o.`)
+/// for a close the Node accepted or settled without refusing it.
+fn detach_delivered_sql(alias: &str) -> String {
+    format!(
+        "{alias}forwarded = 1 AND {alias}state <> 'queued'
+         AND COALESCE({alias}settlement_outcome, '') NOT IN ('rejected', 'withheld', 'cancelled')"
+    )
+}
 
 /// Result of [`Store::mark_forward_intent_gated`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5417,6 +5450,14 @@ impl Store {
             // one that holds any grant or carries a restart policy. Plain
             // instances need none.
             let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
+            // D-062 r3 item 5: a claimed herdr pane is never a restart target
+            // (nor a grant holder): it gets no lineage row.
+            if continuity && driver == crate::herdr_claims::DRIVER {
+                return Err(StoreError::Conflict(
+                    "a claimed herdr pane has no continuity: no grants, no restart policy (D-062)"
+                        .into(),
+                ));
+            }
             if continuity {
                 let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
                 let mut origin_spec_ref = json!({
@@ -5516,6 +5557,167 @@ impl Store {
             )?;
             load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("ensure instance missing".into()))
+        })
+        .await
+    }
+
+    /// D-062: the live instance that already claims `(host, socket, pane)`.
+    pub async fn live_herdr_claim(
+        &self,
+        host_id: String,
+        socket_path: String,
+        pane_id: String,
+    ) -> Result<Option<String>, StoreError> {
+        self.run_named("live_herdr_claim", move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id FROM instances
+                     WHERE host_id = ?1 AND driver = 'herdr-claimed'
+                       AND json_extract(spec_json, '$.herdrClaim.socketPath') = ?2
+                       AND json_extract(spec_json, '$.herdrClaim.paneId') = ?3
+                       AND (lifecycle NOT IN ('exited', 'failed', 'closed')
+                            OR (lifecycle = 'exited' AND ended_at IS NULL
+                                AND COALESCE(last_error, '') = ?4))
+                     ORDER BY created_at LIMIT 1",
+                    params![host_id, socket_path, pane_id, HOST_LOST_MARKER],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// D-062 r3 item 1: claim detaches (`instance.close` on a `herdr-claimed`
+    /// row) still queued and never forwarded — queued while the host was away,
+    /// or rolled back by a send that never left the Hub — oldest first,
+    /// optionally for one host. The hello and tick sweeps forward them.
+    pub(crate) async fn undelivered_claim_detaches(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        self.read("undelivered_claim_detaches", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.instance_id, c.host_id, c.operation, c.state, c.resolution,
+                        c.forwarded, c.payload_json, c.idempotency_key, c.created_at,
+                        c.updated_at, c.settlement_outcome, c.settlement_reason,
+                        c.settlement_http_status, c.settlement_http_body,
+                        c.initiator_instance_id, c.initiator_lineage_id,
+                        c.initiator_generation, c.initiator_device_id,
+                        c.initiator_root_turn_json
+                 FROM instances i
+                 JOIN commands c ON c.instance_id = i.id
+                 WHERE i.driver = 'herdr-claimed'
+                   AND c.operation = 'instance.close'
+                   AND c.state = 'queued' AND c.forwarded = 0
+                   AND (?1 IS NULL OR c.host_id = ?1)
+                 ORDER BY c.created_at ASC, c.id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![host_id], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// D-062 r4 item 1: the newest detach of each claimed instance that is
+    /// Unconfirmed (forwarded, never answered) over a link OLDER than the
+    /// host's current one — its frame may have died with that link, and the
+    /// Node never answers a frame it never saw. Only when no close of the
+    /// instance was delivered or is newer. The sweeps re-send these.
+    pub(crate) async fn unconfirmed_claim_detaches(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        self.read("unconfirmed_claim_detaches", move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT c.id, c.instance_id, c.host_id, c.operation, c.state, c.resolution,
+                        c.forwarded, c.payload_json, c.idempotency_key, c.created_at,
+                        c.updated_at, c.settlement_outcome, c.settlement_reason,
+                        c.settlement_http_status, c.settlement_http_body,
+                        c.initiator_instance_id, c.initiator_lineage_id,
+                        c.initiator_generation, c.initiator_device_id,
+                        c.initiator_root_turn_json
+                 FROM instances i
+                 JOIN commands c ON c.instance_id = i.id
+                 JOIN hosts h ON h.id = c.host_id
+                 WHERE i.driver = 'herdr-claimed'
+                   AND c.operation = 'instance.close'
+                   AND c.state = 'queued' AND c.forwarded = 1
+                   AND c.resolution IN ('unknown', 'reconciling')
+                   AND (c.link_generation IS NULL OR c.link_generation < h.link_generation)
+                   AND (?1 IS NULL OR c.host_id = ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM commands o
+                        WHERE o.instance_id = c.instance_id AND o.operation = 'instance.close'
+                          AND o.id <> c.id
+                          AND ((o.created_at, o.id) > (c.created_at, c.id)
+                               OR ({delivered})))
+                 ORDER BY c.created_at ASC, c.id ASC",
+                delivered = detach_delivered_sql("o."),
+            ))?;
+            let rows = stmt
+                .query_map(params![host_id], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// D-062 r3 item 1: where a claim's Node detach stands, read from its
+    /// `instance.close` commands rather than from the release audit (which
+    /// records the human's request, not its delivery).
+    pub(crate) async fn claim_detach_state(
+        &self,
+        instance_id: String,
+    ) -> Result<ClaimDetach, StoreError> {
+        self.read("claim_detach_state", move |conn| {
+            let count = |predicate: &str| -> Result<bool, StoreError> {
+                Ok(conn.query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM commands
+                                         WHERE instance_id = ?1 AND operation = 'instance.close'
+                                           AND {predicate})"
+                    ),
+                    params![instance_id],
+                    |row| row.get(0),
+                )?)
+            };
+            // Only an answer from the Node (accepted, settled) is delivery. A
+            // forwarded close the Node never answered may never have reached
+            // it, and then nothing journals it: it is Unconfirmed, not done.
+            if count(&detach_delivered_sql(""))? {
+                return Ok(ClaimDetach::Delivered);
+            }
+            if count("state = 'queued' AND forwarded = 0")? {
+                return Ok(ClaimDetach::Pending);
+            }
+            if count(
+                "state = 'queued' AND forwarded = 1 AND resolution IN ('unknown', 'reconciling')",
+            )? {
+                return Ok(ClaimDetach::Unconfirmed);
+            }
+            Ok(ClaimDetach::Missing)
+        })
+        .await
+    }
+
+    /// D-062: the Node accepted a claim — the row is live, launched by a user.
+    pub async fn mark_claimed(
+        &self,
+        instance_id: String,
+        activity: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("mark_claimed", move |conn| {
+            conn.execute(
+                "UPDATE instances SET lifecycle = CASE WHEN lifecycle = 'requested'
+                        THEN 'ready' ELSE lifecycle END,
+                    activity = CASE WHEN lifecycle = 'requested' THEN ?2 ELSE activity END,
+                    launched_by = 'user', updated_at = ?3
+                 WHERE id = ?1",
+                params![instance_id, activity, now_rfc3339()],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -9012,6 +9214,18 @@ fn apply_instance_projection(
                     params![promoted_kind, mode, promoted_at, now, instance_id, name],
                 )?;
             }
+        }
+        // D-062: a claimed pane's herdr server stopped (or resumed) answering.
+        // Contact loss is never process end; it is shown on the claim badge.
+        if name == "herdr_claim_contact"
+            && let Some(contact) = payload.pointer("/status/value").and_then(Value::as_str)
+            && matches!(contact, "lost" | "ok")
+        {
+            conn.execute(
+                "UPDATE instances SET spec_json = json_set(spec_json, '$.herdrClaim.contact', ?1)
+                 WHERE id = ?2 AND json_type(spec_json, '$.herdrClaim') = 'object'",
+                params![contact, instance_id],
+            )?;
         }
         let native_name = name.to_ascii_lowercase();
         // ma-lineage r4 item 1+2 / c-cardsettle r5 addendum (OA6): terminal
@@ -16369,6 +16583,10 @@ pub(crate) fn load_instance(
                 mode,
                 promoted_at,
                 launched_by,
+                herdr_claim: spec
+                    .get("herdrClaim")
+                    .filter(|claim| claim.is_object())
+                    .cloned(),
                 role,
                 scope,
                 project_id,

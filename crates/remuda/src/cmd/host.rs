@@ -1,4 +1,5 @@
-//! `remuda host files ls|get` — read-only workstation file access.
+//! `remuda host files ls|get` — read-only workstation file access, and
+//! `remuda host herdr ls` — read-only discovery of external herdr panes (D-062).
 //!
 //! Thin operator CLI over the Hub host-file routes. The Hub proxies to the
 //! addressed Node, which confines every path to a registered workspace root
@@ -15,7 +16,7 @@ use super::hub_client::{HubClient, HubOpts, block_on};
 
 /// `remuda host` subcommands.
 #[derive(clap::Args)]
-#[command(about = "Inspect files on an enrolled host (read-only).")]
+#[command(about = "Inspect files and external herdr panes on an enrolled host (read-only).")]
 pub(crate) struct Args {
     #[command(flatten)]
     hub: HubOpts,
@@ -35,6 +36,30 @@ enum HostCommand {
     Files {
         #[command(subcommand)]
         command: FilesCommand,
+    },
+    /// External herdr sessions on a host (D-062; read-only discovery).
+    Herdr {
+        #[command(subcommand)]
+        command: HerdrCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HerdrCommand {
+    /// List reachable herdr sessions, workspaces, tabs and panes with herdr's
+    /// agent kind, status and foreground command. Never reads pane content.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Host id (`hst_…`) or registered label.
+        #[arg(long)]
+        host: String,
+        /// One session only: a name (`default` is the user's default socket)
+        /// or an absolute API socket path.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the Hub's JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -135,12 +160,99 @@ fn run(hub: HubOpts, command: HostCommand) -> Result<()> {
                     .await
                 }
             },
+            HostCommand::Herdr {
+                command:
+                    HerdrCommand::List {
+                        host,
+                        session,
+                        json,
+                    },
+            } => herdr_list(&client, &host, session.as_deref(), json).await,
         }
     })
 }
 
+async fn herdr_list(
+    client: &HubClient,
+    host: &str,
+    session: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
+    let host_id = resolve_host(client, host).await?;
+    let mut path = format!("/v1/hosts/{host_id}/herdr");
+    if let Some(session) = session.filter(|value| !value.trim().is_empty()) {
+        path.push_str("?session=");
+        path.push_str(&urlencode(session));
+    }
+    let value = client
+        .get(&path)
+        .await
+        .map_err(super::hub_client::hub_http_error)?;
+    if as_json {
+        return super::hub_client::print_json(&value);
+    }
+    let Some(sessions) = value.get("sessions").and_then(Value::as_array) else {
+        bail!("unexpected herdr discovery response: {value}");
+    };
+    print!("{}", herdr_rows(sessions));
+    Ok(())
+}
+
+/// One table row per pane; an unreachable session is one row with its error.
+fn herdr_rows(sessions: &[Value]) -> String {
+    let text = |value: &Value| value.as_str().unwrap_or("").to_owned();
+    let mut rows = Vec::new();
+    for session in sessions {
+        let name = text(&session["session"]);
+        if session["reachable"] != Value::Bool(true) {
+            rows.push(vec![
+                name,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "unreachable".to_owned(),
+                String::new(),
+                // The widest column: the reason is what the operator acts on.
+                text(&session["error"]),
+            ]);
+            continue;
+        }
+        for workspace in session["workspaces"].as_array().into_iter().flatten() {
+            for tab in workspace["tabs"].as_array().into_iter().flatten() {
+                for pane in tab["panes"].as_array().into_iter().flatten() {
+                    rows.push(vec![
+                        name.clone(),
+                        text(&workspace["workspaceId"]),
+                        text(&tab["tabId"]),
+                        text(&pane["paneId"]),
+                        text(&pane["agent"]),
+                        text(&pane["agentStatus"]),
+                        text(&pane["process"]["command"]),
+                        text(&pane["claimedBy"]),
+                    ]);
+                }
+            }
+        }
+    }
+    super::table::render(
+        &[
+            "SESSION",
+            "WORKSPACE",
+            "TAB",
+            "PANE",
+            "AGENT",
+            "STATUS",
+            "COMMAND",
+            "CLAIMED BY",
+        ],
+        &[16, 10, 12, 12, 8, 11, 16, 40],
+        &rows,
+    )
+}
+
 /// Resolve a host id or label to the `hst_…` id used in routes.
-async fn resolve_host(client: &HubClient, host: &str) -> Result<String> {
+pub(crate) async fn resolve_host(client: &HubClient, host: &str) -> Result<String> {
     if host.starts_with("hst_") {
         return Ok(host.to_owned());
     }
@@ -373,4 +485,32 @@ async fn search(client: &HubClient, args: SearchArgs<'_>) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod herdr_tests {
+    use super::herdr_rows;
+    use serde_json::json;
+
+    #[test]
+    fn herdr_ls_prints_one_row_per_pane_and_the_unreachable_sessions() {
+        let table = herdr_rows(&[
+            json!({"session": "work", "reachable": true, "workspaces": [{
+                "workspaceId": "w2", "tabs": [{"tabId": "w2:t19", "panes": [
+                    {"paneId": "w2:p5K", "agent": "claude", "agentStatus": "idle",
+                     "process": {"pid": 7, "command": "claude"}, "claimedBy": "ins_1"},
+                    {"paneId": "w2:p6", "agentStatus": "unknown"}]}]}]}),
+            json!({"session": "old", "reachable": false, "error": "connection refused",
+                   "workspaces": []}),
+        ]);
+        assert!(
+            table.contains("w2:p5K") && table.contains("claude") && table.contains("ins_1"),
+            "{table}"
+        );
+        assert!(table.contains("w2:p6"), "{table}");
+        assert!(
+            table.contains("unreachable") && table.contains("connection refused"),
+            "{table}"
+        );
+    }
 }

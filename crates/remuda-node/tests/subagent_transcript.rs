@@ -88,6 +88,7 @@ fn instance_with_transcript(instance_id: InstanceId, transcript_path: &str) -> I
         mode: Some(InstanceMode::Native),
         promoted_at: None,
         launched_by: Some(LaunchedBy::Remuda),
+        herdr_claim: None,
     }
 }
 

@@ -234,6 +234,8 @@ pub fn stamp(payload: &mut Value, device: &Device) {
     // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
     // cb-requested-by: likewise never from a body.
     if let Some(object) = payload.as_object_mut() {
+        // D-062 r2: only `herdr_claims::authorize_pane_write` stamps this.
+        object.remove(crate::herdr_claims::CLAIM_WRITE_MARK);
         object.remove("agentCredential");
         object.remove("actor");
         object.remove("initiator");

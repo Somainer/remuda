@@ -536,6 +536,7 @@ fn seeded_instance(
         mode: Some(InstanceMode::Native),
         promoted_at: None,
         launched_by: Some(LaunchedBy::Remuda),
+        herdr_claim: None,
     }
 }
 

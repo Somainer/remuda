@@ -80,6 +80,53 @@ pub struct HerdrRef {
     pub pane_id: String,
 }
 
+/// An external herdr pane claimed as an Instance (D-062, `herdr-claim.md`).
+///
+/// Present only on `driver = herdr-claimed`. A claim is not ownership: the
+/// Node detaches on release and never closes the pane, signals its process or
+/// stops the server that hosts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrClaim {
+    /// Herdr session as the operator named it: a session name (`default` is
+    /// the user's default socket) or an absolute API socket path.
+    pub session: String,
+    /// Resolved API socket every call for this claim goes to.
+    pub socket_path: String,
+    /// Herdr workspace id (`w2`).
+    pub workspace_id: String,
+    /// Herdr tab id (`w2:t19`), inside `workspace_id`.
+    pub tab_id: String,
+    /// Herdr pane id (`w2:p5K`), inside `tab_id`.
+    pub pane_id: String,
+    /// Agent kind herdr detected in the pane at claim time, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The pane's foreground process at claim time (`pane.process_info`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<HerdrClaimProcess>,
+    /// `ok` while the herdr server answers, `lost` while it does not. Contact
+    /// loss is never process end: the Instance stays live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<String>,
+}
+
+/// The process a claim watches for process-end evidence (D-062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrClaimProcess {
+    /// Process id on the claiming host.
+    pub pid: u32,
+    /// Executable base name only; full argv is never collected (it may carry
+    /// secrets).
+    pub command: String,
+    /// Kernel start time of `pid` (Linux `/proc/<pid>/stat` field 22), so a
+    /// recycled pid is never taken for the claimed process. Absent where the
+    /// platform has no such reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ticks: Option<U64>,
+}
+
 /// A Claude daemon job that may exist before its native session is known; §1.3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

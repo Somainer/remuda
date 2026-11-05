@@ -1246,6 +1246,8 @@ impl Store {
                   WHERE l.state IN ('starting', 'running')
                     AND i.generation = l.generation AND i.fenced_at IS NULL
                     AND i.lifecycle IN ('exited', 'failed', 'closed')
+                    -- D-062 r3 item 5: a claimed herdr pane is never restarted.
+                    AND i.driver <> 'herdr-claimed'
                     AND NOT EXISTS (SELECT 1 FROM lineage_restart_decisions d
                                      WHERE d.failed_instance_id = i.id)
                   ORDER BY l.lineage_id",

@@ -175,6 +175,7 @@ async fn dispatch_hub(
         Some(controller) => Some(controller.dispatch_guard().await?),
         None => None,
     };
+    crate::herdr_claim::refuse_non_human_write(&runtime.node, method, &params)?;
     if method == "host.doctor" {
         return runtime.node.doctor().await;
     }
@@ -193,6 +194,19 @@ async fn dispatch_hub(
             for instance in page.items {
                 let _ = catch_up(runtime, &instance.meta.id).await;
             }
+        }
+        return Ok(result);
+    }
+    if method == remuda_protocol::hubnode::METHOD_INSTANCE_CLAIM {
+        // D-062: like create, the claimed instance's journal flows through a
+        // per-instance pump started with the reply.
+        let result = runtime.node.herdr_claim_rpc(method, params).await?;
+        if let Some(id) = result
+            .pointer("/instance/id")
+            .and_then(Value::as_str)
+            .and_then(|id| InstanceId::try_from(id.to_owned()).ok())
+        {
+            ensure_pump(runtime, &id);
         }
         return Ok(result);
     }

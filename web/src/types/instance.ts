@@ -24,6 +24,18 @@ export type UiMode = "structured-only" | "tty-attachable";
 export type InstanceMode = "native" | "promoted";
 export type TuiMode = "fullscreen" | "default";
 
+/** D-062: where a claimed external herdr pane lives (ids only, never content). */
+export type HerdrClaim = {
+  session: string;
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  /** Agent kind herdr detected at claim time. */
+  agent?: string | null;
+  /** `lost` while the external herdr server does not answer (never an end). */
+  contact?: "ok" | "lost" | null;
+};
+
 export type Instance = EntityMeta & {
   hostId: Id;
   workspaceId: Id;
@@ -162,6 +174,11 @@ export type Instance = EntityMeta & {
   promotedAt?: string | null;
   /** Who ran the launch command (D-028 §1.0 rule 4). Provenance only — never a capability level. */
   launchedBy?: "remuda" | "user" | null;
+  /**
+   * D-062: the external herdr pane a `herdr-claimed` instance claims. Remuda
+   * does not own it: release only detaches, the pane keeps running.
+   */
+  herdrClaim?: HerdrClaim | null;
   /** context-usage-1: additive per-session token/context rollup from the Hub; absent until the harness reports usage. */
   usageRollup?: UsageRollup | null;
   /**

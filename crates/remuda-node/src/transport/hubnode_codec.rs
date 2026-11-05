@@ -217,6 +217,7 @@ pub async fn dispatch_frame(
     params: Value,
     frame: MethodFrame,
 ) -> Result<Value, NodeError> {
+    crate::herdr_claim::refuse_non_human_write(node, method, &params)?;
     if method == remuda_protocol::METHOD_LINEAGE_FENCE {
         return node.apply_lineage_fence(&params).await;
     }
@@ -228,6 +229,9 @@ pub async fn dispatch_frame(
     }
     if crate::dir_browser::is_host_dirs_method(method) {
         return node.host_dirs_rpc(method, params).await;
+    }
+    if crate::herdr_claim::is_herdr_claim_method(method) {
+        return node.herdr_claim_rpc(method, params).await;
     }
     if method == "host.doctor" {
         return node.doctor().await;

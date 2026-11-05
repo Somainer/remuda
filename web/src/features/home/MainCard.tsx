@@ -13,7 +13,7 @@ import { mainStatusFor, useCompactLayout, useLineageSync, useMainAside } from ".
 import { useHomeFreshness } from "./freshness";
 import { WakeSheet } from "./WakeSheet";
 import { useMainWakes, wakeLine } from "./wakes";
-import { glanceCounts, type GlanceSource } from "./glance";
+import { glanceCounts, routedToMainCount, routedToMainLine, type GlanceSource } from "./glance";
 import { useInboxClockNow } from "../mobile/useInboxPendingCount";
 import { thisDeviceId } from "../../lib/interactionStatus";
 import { useTaskLedger } from "../tasks/taskLedger";
@@ -69,6 +69,21 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
   const [retrying, setRetrying] = useState(false);
   const retryingRef = useRef(false);
   const desktop = placement === "desktop";
+  const deviceId = useMemo(() => thisDeviceId(), []);
+  const clockMs = useInboxClockNow();
+  const routed = useMemo(
+    () =>
+      routedToMainCount({
+        interactions: hub.interactions,
+        instances: hub.instances,
+        hosts: hub.hosts,
+        answering: hub.answering,
+        deviceId,
+        nowMs: clockMs,
+        hydrated: hub.interactionsHydrated,
+      }),
+    [hub.interactions, hub.instances, hub.hosts, hub.answering, hub.interactionsHydrated, deviceId, clockMs],
+  );
   const modelWord = instance.modelEffective?.id ?? instance.model ?? null;
   const effortWord = instance.effortEffective?.name ?? instance.effortName ?? null;
 
@@ -117,6 +132,19 @@ function MainCardBody({ entry, placement }: { entry: MainEntry; placement: "phon
           }
         }}
       />
+      {routed !== null && routed > 0 ? (
+        // §10: the worker questions routed here instead of to the owner — the
+        // ones 「需要你」 no longer shows. Only a known count above zero; grey
+        // while the page is stale (§8).
+        <p
+          className={css.routed}
+          data-testid="main-card-routed"
+          data-count={routed}
+          data-stale={freshness.state === "stale" ? "1" : undefined}
+        >
+          {routedToMainLine(routed)}
+        </p>
+      ) : null}
       {!aside && wakeText ? (
         <button
           type="button"

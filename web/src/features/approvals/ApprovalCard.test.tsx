@@ -178,6 +178,30 @@ function renderCard(view: DecisionView, mode: "desktop" | "compact" = "desktop",
   );
 }
 
+describe("DecisionCard routed items (D-061)", () => {
+  it("labels an item routed to Main or another agent, and the owner may still answer it", async () => {
+    const onRespond = vi.fn();
+    const { unmount } = renderCard(viewFor(cnItem({ routedTo: "main" })), "desktop", onRespond);
+    const tag = screen.getByTestId("approval-routed");
+    expect(tag.textContent).toBe("已转给 Main");
+    expect(tag.getAttribute("data-routed-to")).toBe("main");
+    // First answer wins, as today: the owner's buttons stay live.
+    await userEvent.click(screen.getByRole("button", { name: "允许一次" }));
+    expect(onRespond).toHaveBeenCalledOnce();
+    unmount();
+    renderCard(viewFor(cnItem({ routedTo: "agent" })));
+    expect(screen.getByTestId("approval-routed").textContent).toBe("已转给 agent");
+  });
+
+  it("has no label while the item waits on the owner (missing or unknown reads owner)", () => {
+    for (const routedTo of [undefined, "owner", "elsewhere"] as const) {
+      const { unmount } = renderCard(viewFor(cnItem({ routedTo: routedTo as never })));
+      expect(screen.queryByTestId("approval-routed")).toBeNull();
+      unmount();
+    }
+  });
+});
+
 describe("DecisionCard unified across desktop and compact", () => {
   it("renders the same approval-row with raw option labels in both modes", () => {
     for (const mode of ["desktop", "compact"] as const) {

@@ -4,7 +4,7 @@ import {
   type InteractionUiState,
 } from "../../lib/interactionStatus";
 import { formatClock } from "../../lib/format";
-import { deriveInboxQueue, deriveRecentInstances, type InboxInstanceRow } from "../mobile/inboxRows";
+import { deriveActiveInteractions, deriveRecentInstances, type InboxInstanceRow } from "../mobile/inboxRows";
 import type { UsageRollup } from "../session/contextUsage";
 import type { Host, Instance, UiStatus } from "../../types/instance";
 import type { Id } from "../../types/wire";
@@ -106,6 +106,7 @@ function rowSignature(
       item.answer,
       item.resolution,
       item.request,
+      item.routedTo ?? null,
     ],
     n: instance
       ? [
@@ -133,10 +134,12 @@ export function deriveApprovalRows(
   const hostById = new Map(source.hosts.map((host) => [host.id, host]));
 
   // c-ghostbadge round 2: the queue tier is the SAME projection the compact
-  // inbox and every badge read (deriveInboxQueue) — one pending/answering/
-  // paused membership, no second QUEUE_STATES loop. Desktop's host/workspace
-  // query chips are applied only while turning queue membership into rows.
-  const queueMembers = deriveInboxQueue({
+  // inbox and every badge read — one pending/answering/paused membership, no
+  // second QUEUE_STATES loop. Desktop's host/workspace query chips are
+  // applied only while turning queue membership into rows. /approvals keeps
+  // the items routed to Main or another agent (D-061; the card labels them),
+  // so it reads the projection before the routedTo filter.
+  const queueMembers = deriveActiveInteractions({
     interactions: source.interactions,
     instances: source.instances,
     hosts: source.hosts,

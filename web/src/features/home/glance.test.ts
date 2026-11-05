@@ -12,6 +12,8 @@ import {
   glancePieces,
   glanceText,
   greetingForHour,
+  routedToMainCount,
+  routedToMainLine,
   type GlanceSource,
 } from "./glance";
 
@@ -137,6 +139,43 @@ function sourceOf(overrides: Partial<GlanceSource> = {}): GlanceSource {
     ...overrides,
   };
 }
+
+describe("routedTo (D-061): N counts only what waits on the owner", () => {
+  const routed = () =>
+    source({
+      instances: [inst({ id: "ins_w", taskId: "tsk_w" as Id }), inst({ id: "ins_o" })],
+      interactions: [
+        interaction({ id: "int_owner", instanceId: "ins_o" }),
+        interaction({ id: "int_main", instanceId: "ins_w", routedTo: "main" }),
+        interaction({ id: "int_main2", instanceId: "ins_w", routedTo: "main" }),
+        interaction({ id: "int_agent", instanceId: "ins_o", routedTo: "agent" }),
+      ],
+      tasks: [task({ id: "tsk_w", blockedReason: "等 Main" })],
+    });
+
+  it("A drops routed items, and a routed item does not cover its task (B)", () => {
+    // A = int_owner; B = tsk_w, whose only interactions went to Main — the
+    // queue shows its 任务待你 card, exactly as the Hub badge counts it.
+    expect(glanceCounts(routed()).needYou).toBe(2);
+  });
+
+  it("the Main card counts live items routed to Main; unknown before the first page", () => {
+    const base = { ...routed(), hydrated: true };
+    expect(routedToMainCount(base)).toBe(2);
+    expect(routedToMainCount({ ...base, hydrated: false })).toBeNull();
+    // A settled item is no longer being handled.
+    expect(
+      routedToMainCount({
+        ...base,
+        interactions: base.interactions.map((row) =>
+          row.id === "int_main2" ? { ...row, state: "resolved" as const } : row,
+        ),
+      }),
+    ).toBe(1);
+    expect(routedToMainLine(1)).toBe("正在处理 1 个 worker 提问");
+    expect(routedToMainLine(120)).toBe("正在处理 99+ 个 worker 提问");
+  });
+});
 
 describe("glanceCounts: §5.1 N = A + B", () => {
   it("counts the interactions really waiting on the owner and drops settled, expired and superseded rows", () => {

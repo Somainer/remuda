@@ -5,6 +5,7 @@ import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import type { InboxSource } from "./inboxRows";
 import {
   contextRingLabel,
+  deriveActiveInteractions,
   deriveInboxQueue,
   deriveInboxRows,
   deriveRecentInstances,
@@ -13,6 +14,7 @@ import {
   interactionRequestText,
   latestEventText,
   parseKindParam,
+  routedAway,
 } from "./inboxRows";
 import type { PushStatus } from "../../lib/push";
 
@@ -696,5 +698,55 @@ describe("derivePushBanner", () => {
     expect(
       derivePushBanner(status({ permission: "granted", needsHomeScreen: true })),
     ).toEqual({ show: false });
+  });
+});
+
+describe("routedTo (D-061): the queue holds only what waits on the owner", () => {
+  const routedSource = () =>
+    source({
+      interactions: [
+        interaction({ id: "int_owner", instanceId: "ins_1", routedTo: "owner" }),
+        interaction({ id: "int_missing", instanceId: "ins_1" }),
+        interaction({ id: "int_null", instanceId: "ins_1", routedTo: null }),
+        // A value this client does not know (a newer Hub) reads owner.
+        interaction({ id: "int_unknown", instanceId: "ins_1", routedTo: "elsewhere" as never }),
+        interaction({ id: "int_main", instanceId: "ins_2", kind: "question", routedTo: "main" }),
+        interaction({ id: "int_agent", instanceId: "ins_3", kind: "question", routedTo: "agent" }),
+      ],
+      instances: [inst({ id: "ins_1" }), inst({ id: "ins_2" }), inst({ id: "ins_3" })],
+    });
+
+  it("drops items routed to Main or another agent; missing or unknown means owner", () => {
+    const queue = deriveInboxQueue(routedSource());
+    expect(queue.map((q) => q.item.id)).toEqual(["int_owner", "int_missing", "int_null", "int_unknown"]);
+  });
+
+  it("the compact 待你处理 tier follows the queue", () => {
+    const rows = deriveInboxRows(routedSource(), { kind: "all", focus: null });
+    expect(rows.pending.map((row) => row.interactionId).sort()).toEqual([
+      "int_missing",
+      "int_null",
+      "int_owner",
+      "int_unknown",
+    ]);
+  });
+
+  it("the live projection keeps every item, whoever it waits on", () => {
+    expect(deriveActiveInteractions(routedSource()).map((q) => q.item.id)).toEqual([
+      "int_owner",
+      "int_missing",
+      "int_null",
+      "int_unknown",
+      "int_main",
+      "int_agent",
+    ]);
+  });
+
+  it("routedAway names only main and agent", () => {
+    expect(routedAway({ routedTo: "main" })).toBe("main");
+    expect(routedAway({ routedTo: "agent" })).toBe("agent");
+    expect(routedAway({ routedTo: "owner" })).toBeNull();
+    expect(routedAway({})).toBeNull();
+    expect(routedAway({ routedTo: "Main" as never })).toBeNull();
   });
 });

@@ -105,6 +105,22 @@
   white-space: nowrap;
 }
 
+/* §10: 「正在处理 N 个 worker 提问」, under line 2 at the same inset. */
+.routed {
+  margin: 0;
+  padding-left: var(--space-5);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.routed[data-stale="1"] {
+  color: var(--fg-faint);
+}
+
 .line2[data-kind="reply"] {
   color: var(--fg-body);
 }

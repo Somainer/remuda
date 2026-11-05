@@ -127,6 +127,28 @@ function source(interactions: Interaction[], instances: Instance[] = []): Approv
   };
 }
 
+describe("deriveApprovalRows keeps routed items (D-061)", () => {
+  it("an item routed to Main or another agent stays in the queue tier, never departed", () => {
+    const owner = approval({ id: "itx_o", instanceId: "ins_1" });
+    const main = approval({ id: "itx_m", instanceId: "ins_1", routedTo: "main" });
+    const agent = approval({ id: "itx_g", instanceId: "ins_1", routedTo: "agent" });
+    const s = source([owner, main, agent], [inst({ id: "ins_1" })]);
+    const { queue, departed } = deriveApprovalRows(s, FILTERS);
+    expect(queue.map((r) => r.item.id).sort()).toEqual(["itx_g", "itx_m", "itx_o"]);
+    expect(departed).toEqual([]);
+    // The owner's 「需要你」 queue holds only the owner's item.
+    expect(deriveInboxQueue(s).map((q) => q.item.id)).toEqual(["itx_o"]);
+  });
+
+  it("the card signature changes when the routing does (the lift relabels it)", () => {
+    const routed = approval({ id: "itx_m", instanceId: "ins_1", routedTo: "main" });
+    const lifted = { ...routed, routedTo: "owner" as const };
+    const sig = (item: Interaction) =>
+      deriveApprovalRows(source([item], [inst({ id: "ins_1" })]), FILTERS).queue[0].sig;
+    expect(sig(routed)).not.toBe(sig(lifted));
+  });
+});
+
 describe("deriveApprovalRows tiering", () => {
   it("queue tier is exactly the shared deriveInboxQueue membership, unfiltered", () => {
     // c-ghostbadge round 2: no second QUEUE_STATES loop — desktop and the

@@ -1861,6 +1861,13 @@ impl Ctx {
             .to_owned())
     }
 
+    /// `counts.needYou` of the owner glance (home.md §5.3), which counts the
+    /// same A the badge does.
+    async fn glance_need_you(&self) -> Result<Value> {
+        let glance = self.get("/v1/owner/glance").await?;
+        Ok(glance["counts"]["needYou"].clone())
+    }
+
     /// The badge of the newest push tagged `interaction:<id>`.
     async fn badge_of(&self, interaction: &str, count: usize) -> Result<Value> {
         let pushes = self
@@ -1919,6 +1926,8 @@ async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -
     set_d051(true);
     assert_eq!(ctx.routed_to("int_rt_off").await?, "owner");
     assert_eq!(ctx.badge_of("int_rt_off", 1).await?, 3);
+    // The owner glance's 需要你 is the same narrowed A.
+    assert_eq!(ctx.glance_need_you().await?, 3);
 
     // A store error reads owner, for the page and for the badge.
     remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", true);
@@ -1944,6 +1953,7 @@ async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -
     assert_eq!(ctx.routed_to("int_rt_plan").await?, "owner");
     // Another parent's routing is untouched.
     assert_eq!(ctx.routed_to("int_rt_agent").await?, "agent");
+    assert_eq!(ctx.glance_need_you().await?, 6);
 
     // Main not effectively running at fire time: the question pages.
     ctx.raise(&worker, "int_rt_paused", "question")?;

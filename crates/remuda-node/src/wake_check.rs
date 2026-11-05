@@ -904,15 +904,37 @@ mod tests {
     async fn exit_codes_and_stdout_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         let passed = run(dir.path(), "printf 'queue: 3 jobs\\n'; exit 0", 30).await;
-        // r3: the run names the containment that applied.
-        // (A host without a delegated cgroup: the subreaper on Linux.)
-        let expected = if CgroupFs::system().and_then(|fs| fs.leaf_parent()).is_some() {
-            passed.containment
+        // r4: the label is checked against evidence the containment code does
+        // not produce: the cgroup the kernel says the check's own shell was
+        // in, and the filesystem mounted at /sys/fs/cgroup.
+        let observed = run(dir.path(), "cat /proc/self/cgroup", 30).await;
+        let in_check_leaf = observed.stdout.lines().any(|line| {
+            line.strip_prefix("0::")
+                .is_some_and(|path| path.contains("/remuda-wake-") && path.ends_with("/check"))
+        });
+        let expected = if in_check_leaf {
+            Label::Cgroup
+        } else if cfg!(target_os = "linux") {
+            Label::Subreaper
         } else {
-            Some(Label::without_leaf())
+            Label::ProcessGroup
         };
-        assert!(passed.containment.is_some());
-        assert_eq!(passed.containment, expected);
+        assert_eq!(observed.containment, Some(expected), "{}", observed.stdout);
+        assert_eq!(passed.containment, Some(expected));
+        let cgroup2 = std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.split(' ').nth(4) == Some("/sys/fs/cgroup")
+                    && line
+                        .split(" - ")
+                        .nth(1)
+                        .is_some_and(|rest| rest.starts_with("cgroup2 "))
+            });
+        if !cgroup2 {
+            assert!(!in_check_leaf, "no cgroup2 mount, no leaf");
+            assert_eq!(passed.containment, Some(Label::Subreaper));
+        }
         assert_eq!(passed.outcome, WakeCheckOutcome::Exited);
         assert_eq!(passed.exit_code, Some(0));
         assert_eq!(passed.stdout, "queue: 3 jobs\n");

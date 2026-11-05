@@ -365,6 +365,24 @@ pub mod wake_test_support {
         crate::wake::test_seams::arm_result_failure(run_id, times);
     }
 
+    /// cb-wake-check r2: make the next `times` Node calls of `run_id`'s check
+    /// answer NODE_BUSY (refused before the frame was queued); 0 disarms.
+    pub fn arm_check_node_busy(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_node_busy(run_id, times);
+    }
+
+    /// cb-wake-check r2: make the next `times` applies of the check report of
+    /// `run_id` fail (the drain retries them); 0 disarms.
+    pub fn arm_check_settle_failure(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_settle_failure(run_id, times);
+    }
+
+    /// cb-wake-check r2: make the next `times` writes queueing the check
+    /// report of `run_id` fail (the check's task retries them); 0 disarms.
+    pub fn arm_check_report_failure(run_id: &str, times: u32) {
+        crate::wake::test_seams::arm_check_report_failure(run_id, times);
+    }
+
     /// Seconds without a completed tick after which `/healthz` answers 503.
     pub fn stale_after_secs() -> u64 {
         crate::wake::stale_after_secs()
@@ -1535,16 +1553,41 @@ impl RunningHub {
         crate::inbox_deliver::retry_tick(&self.state).await;
     }
 
-    /// Test-only: one wake evaluation as of `now` (RFC3339), then one
-    /// fresh-mode drive, awaited. Returns how many runs it recorded.
+    /// Test-only: one wake evaluation as of `now` (RFC3339), then one check
+    /// drive (each claimed check asks its Node on its own task; see
+    /// [`Self::test_settle_wake_checks`]) and one fresh-mode drive, awaited.
+    /// Returns how many runs it recorded.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_wake_tick(&self, now: &str) -> anyhow::Result<usize> {
         let now = time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)?;
         let outcome = self.state.store.wake_tick(now).await?;
         self.state.wake.note_tick(outcome.oldest_waiting);
+        crate::wake::drive_checks(&self.state).await;
         crate::wake::drive_fresh(&self.state).await;
         Ok(outcome.fired)
+    }
+
+    /// Test-only (cb-wake-check): while set, every wake check's answer is
+    /// dropped unwritten, as if the Hub stopped between the claim and the
+    /// answer; the boot rule (interrupted, never replayed) is then the only
+    /// thing that ends the run.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_drop_wake_check_answers(&self, dropped: bool) {
+        self.state
+            .wake
+            .drop_check_answers
+            .store(dropped, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only (cb-wake-check): wait until no wake check is waiting for
+    /// its Node's answer, then for the writer to settle what they wrote.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_settle_wake_checks(&self) -> anyhow::Result<()> {
+        self.state.wake.checks_settled().await;
+        self.test_settle_inbox().await
     }
 
     /// Test-only: hold (or release) the scheduler's wake ticks, so a test

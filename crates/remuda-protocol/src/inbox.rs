@@ -39,11 +39,12 @@ wire_enum!(InboxFactKind, "8.4", {
     BudgetExpired => "budget-expired",
     WakeDue => "wake-due",
     ContextThreshold => "context-threshold",
+    WakeFailed => "wake-failed",
 });
 
 impl InboxFactKind {
     /// Every kind, in declaration order.
-    pub const ALL: [InboxFactKind; 15] = [
+    pub const ALL: [InboxFactKind; 16] = [
         Self::Started,
         Self::Exited,
         Self::Waiting,
@@ -59,6 +60,7 @@ impl InboxFactKind {
         Self::BudgetExpired,
         Self::WakeDue,
         Self::ContextThreshold,
+        Self::WakeFailed,
     ];
 
     /// Wire spelling; also the first segment of every dedupe key.
@@ -80,6 +82,7 @@ impl InboxFactKind {
             Self::BudgetExpired => "budget-expired",
             Self::WakeDue => "wake-due",
             Self::ContextThreshold => "context-threshold",
+            Self::WakeFailed => "wake-failed",
         }
     }
 

@@ -145,7 +145,9 @@ test.describe("cb-command-queue", () => {
         response.url().endsWith(`/v1/instances/${instanceId}/commands`) &&
         response.request().postDataJSON()?.operation === "instance.configure",
     );
-    await pickTier(page, "high");
+    // The session starts at its default tier; pick a different one so the
+    // click is a change.
+    await pickTier(page, "medium");
     const configured = await (await answer).json();
     expect(configured.command.deferred).toEqual({ boundary: "next-turn" });
     const tag = page.getByTestId("model-effort-pending");

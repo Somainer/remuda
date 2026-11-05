@@ -45,8 +45,8 @@ pub const ALLOWLIST_SECTIONS: [&str; 2] = [
 
 /// Rows whose Today cell begins `Agent route` but cannot carry one verdict,
 /// because the cell explains several paths and only some are admitted. Keyed
-/// by the row's first cell, exactly as written. Every entry is checked: an
-/// exemption that no longer matches an `Agent route` row fails the drift check.
+/// by the row's first cell, exactly as written. A row not listed here must
+/// yield a claim for every route it names (see `drift`).
 ///
 /// - `Follow the session live`: the follow socket is refused; the journal is
 ///   the admitted path.

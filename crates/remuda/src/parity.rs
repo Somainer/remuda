@@ -43,6 +43,39 @@ pub const ALLOWLIST_SECTIONS: [&str; 2] = [
     "## Not agent actions",
 ];
 
+/// Rows whose Today cell begins `Agent route` but cannot carry one verdict,
+/// because the cell explains several paths and only some are admitted. Keyed
+/// by the row's first cell, exactly as written. Every entry is checked: an
+/// exemption that no longer matches an `Agent route` row fails the drift check.
+///
+/// - `Follow the session live`: the follow socket is refused; the journal is
+///   the admitted path.
+/// - `Create a worktree for it`: the raw worktree routes are operator-only; a
+///   task binding or a dispatch leases the worktree.
+/// - `List pending items`: the list is admitted, the settlement frames ride
+///   the refused follow socket.
+/// - `` `instance create` ``: the create is admitted, the host inventory it
+///   falls back to is not.
+/// - `` `instance send` ``: the send is admitted, its follow-up command read is
+///   refused.
+/// - `` `gate <branch>` (verify) ``: enqueue and wait are admitted, the failure
+///   log is not.
+/// - `` `gate list` ``: with `--project` it is admitted, without it
+///   `GET /v1/gate/jobs` is not.
+/// - `` `watch` `` and `` `report` ``: the worker read is admitted, the
+///   cross-project gate read is not.
+const AGENT_ROUTE_EXEMPTIONS: [&str; 9] = [
+    "Follow the session live",
+    "Create a worktree for it",
+    "List pending items",
+    "`instance create`",
+    "`instance send`",
+    "`gate <branch>` (verify)",
+    "`gate list`",
+    "`watch`",
+    "`report`",
+];
+
 const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
 
 /// One Hub route, as the machine half records it.
@@ -271,6 +304,29 @@ pub fn drift(model: &ParityModel, human: &str) -> Vec<String> {
                     row.line, row.action, mention.method, mention.path
                 )),
                 _ => {}
+            }
+        }
+    }
+
+    // 4. Every row that begins "Agent route" must carry a readable claim for
+    //    each route it names, or sit on the exemption list: a prefix the check
+    //    cannot read would let the middleware start refusing a promised verb
+    //    with the ledger still green.
+    for row in &documented.rows {
+        if !row.today.starts_with("Agent route")
+            || AGENT_ROUTE_EXEMPTIONS.contains(&row.action.as_str())
+        {
+            continue;
+        }
+        for mention in &row.routes {
+            if row.claim(mention).is_none() {
+                failures.push(format!(
+                    "{HUMAN_FILE}:{} row \"{}\" begins \"Agent route\" but the check cannot read \
+                     a claim for `{} {}`; start the Today cell with exactly \"Agent route.\" \
+                     (or add the row to AGENT_ROUTE_EXEMPTIONS in crates/remuda/src/parity.rs, \
+                     with a comment saying which paths it mixes)",
+                    row.line, row.action, mention.method, mention.path
+                ));
             }
         }
     }

@@ -25,7 +25,7 @@ The drift check (in the `remuda` test suite, so the gate runs it) fails, naming 
 - the generated file is stale;
 - a Hub route or a clap leaf appears in neither this file nor a commented "no human row" entry;
 - a row names a route no Hub route registers;
-- a row's class contradicts the machine half. A Today cell that begins exactly `Agent route.` claims its Hub routes are middleware-admitted. A `Gap.` or `Safety.` cell that names a middleware refusal ("not admitted", "restrict_agent_routes", "`read_target`", "the middleware") claims the opposite for its routes, unless the cell also names a segment where the route is admitted. Rows that explain several paths with qualifiers ("Agent route by another path", "Gap without `--project`") make no claim, and the check skips them.
+- a row's class contradicts the machine half. A Today cell that begins exactly `Agent route.` claims its Hub routes are middleware-admitted, and **every** Today cell that begins `Agent route` must carry that claim for each route it names: a prefix the check cannot read fails it. A `Gap.` or `Safety.` cell that names a middleware refusal ("not admitted", "restrict_agent_routes", "`read_target`", "the middleware") claims the opposite for its routes, unless the cell also names a segment where the route is admitted. A row that mixes admitted and refused paths ("Agent route by another path", "Gap without `--project`") is listed by name with its reason in `AGENT_ROUTE_EXEMPTIONS` (`crates/remuda/src/parity.rs`); an exemption that no longer matches a row fails too.
 
 The check does not decide the class for you: a handler-level refusal (`require_operator`, a missing grant) is a `Safety`/`Gap` row with no middleware claim, exactly as the columns below describe.
 
@@ -89,7 +89,7 @@ Two limits recur below:
 | See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
-| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
+| Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
 | Answer an approval inline | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans (D-017, D-051(a)) | — |
 | Change the model | commands, `instance.configure` | Gap. `authorize_command` admits only send, cancel, close, `tty.write` and keys for Agent origin | `ap-configure` |
 | Change the effort | commands, `instance.configure` | Gap. As above | `ap-configure` |
@@ -135,7 +135,7 @@ D-060 landed these on the Hub; the PWA surfaces are `cb-memory-ui` (memory), `ho
 | Human action | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | List pending items | `GET /v1/interactions`; settlement frames on `GET /v1/follow` (`settlementSubscribe`) | Agent route under the D-051 limits for the list. The settlement frames ride the follow socket, which is not admitted for Agent origin; an agent re-reads the list instead | — |
-| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits | — |
+| Answer a question or a plan review | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
 | Answer an approval | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans | — |
 | Resolve an unknown Landing, or attach a gate job's evidence | `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve`, `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve-evidence` | Safety. Approvals and records are the owner's: the handler calls `require_operator`, so an Agent caller is stopped even holding `land`, and the outcome is recorded against the device | — |
 
@@ -209,7 +209,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
 | `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
-| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route under the D-051 limits for questions and plan reviews; approvals: Safety | — |
+| `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
@@ -259,14 +259,14 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route for the worker part: `observe` is scope-wide under `dispatch`. Gap for the cross-project gate read, which is not admitted | `ap-gate-reads` |
 | `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route for `GET /v1/workers` (scope-wide under `dispatch`). Gap without `--project`: the gate read is refused | `ap-gate-reads` |
 | `retire` | `POST /v1/workers/{id}/retire` | Agent route. `dispatch`, project scope, and the worker in the caller's lineage subtree (main-agent.md §4.2 item 1) | — |
-| `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route, as `retire` | — |
-| `worker answer` | `POST /v1/workers/{id}/answer` | Agent route, as `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
-| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Agent route, as `retire` | — |
-| `worker resume` | `POST /v1/workers/{id}/resume` | Agent route, as `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
-| `worker replace` | `POST /v1/workers/{id}/replace` | Agent route, as `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
-| `worker stop` | `POST /v1/workers/{id}/stop` | Agent route, as `retire` | — |
+| `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route. As `retire` | — |
+| `worker answer` | `POST /v1/workers/{id}/answer` | Agent route. As `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
+| `worker switch-model` | `POST /v1/workers/{id}/switch-model` | Agent route. As `retire` | — |
+| `worker resume` | `POST /v1/workers/{id}/resume` | Agent route. As `retire`, through the scoped respawn helper: carrier and modes kept, the new instance's parent is the chapter that dispatched the worker, the creator rule and the D-017 approval for a shell-driver carrier apply (main-agent.md §4.2 item 5) | — |
+| `worker replace` | `POST /v1/workers/{id}/replace` | Agent route. As `retire`; the replacement is a dispatch, its approval decided before the old worker is retired | — |
+| `worker stop` | `POST /v1/workers/{id}/stop` | Agent route. As `retire` | — |
 | `worker digest` | `GET /v1/workers/{id}/digest` | Agent route. `dispatch` and project scope, like the other scope-wide worker reads (main-agent.md §10.2); a fact batch's footer points at it | — |
-| `brief send` | `POST /v1/workers/{id}/brief` | Agent route, as `retire` | — |
+| `brief send` | `POST /v1/workers/{id}/brief` | Agent route. As `retire` | — |
 | `hostcap` | `GET /v1/hosts/{id}/hostcap` | Agent route. `dispatch` and host scope (D-045) | — |
 
 ### Fleet, host files and diagnostics
@@ -274,7 +274,7 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `fleet run` | `POST /v1/fleet/instances` | Agent route. `dispatch`, checked as each child is inserted (`validate_child_delegation`); the D-017 approval when any chosen host is not the caller's host or the driver is a shell driver (`create_fleet`); the permission mode follows "never beyond the creator" (OA1) | — |
-| `fleet send` | `POST /v1/fleet/broadcast`, `instance.send` | Agent route, as "Broadcast a prompt"; `--all` is refused | — |
+| `fleet send` | `POST /v1/fleet/broadcast`, `instance.send` | Agent route. As "Broadcast a prompt"; `--all` is refused | — |
 | `fleet keys` | `POST /v1/fleet/broadcast`, `tty.write` | Safety. Keystrokes | — |
 | `host files list` | `GET /v1/hosts/{id}/files` | Safety. Cross-host, as for workspace changes (`host_files.rs`) | — |
 | `host files get` | `POST /v1/hosts/{id}/files/read`, `GET /v1/objects/{id}` | Safety. Cross-host, as above | — |

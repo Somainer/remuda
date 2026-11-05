@@ -144,6 +144,23 @@ fn an_owner_scoped_route_satisfies_an_agent_route_row() {
 }
 
 #[test]
+fn an_agent_route_prefix_without_a_readable_claim_fails() {
+    // `Agent route, as …` was the spelling that made 11 single-route rows
+    // invisible to the class check. A refused route under that prefix must
+    // fail, not pass because the prefix is not the exact one.
+    let model = model(vec![route("POST", "/v1/x", "refused")], Vec::new());
+    let human =
+        format!("{HEADER}| `worker nudge` | `POST /v1/x` | Agent route, as `retire` | — |\n");
+    let failures = drift(&model, &human);
+    assert!(
+        failures.iter().any(|failure| failure
+            .contains("row \"`worker nudge`\" begins \"Agent route\"")
+            && failure.contains("cannot read a claim for `POST /v1/x`")),
+        "{failures:#?}"
+    );
+}
+
+#[test]
 fn a_stale_generated_file_fails() {
     let model = model(vec![route("GET", "/v1/a", "admitted")], Vec::new());
     let error = check_generated(&model, "{\"routes\":[]}\n").expect_err("a stale file must fail");

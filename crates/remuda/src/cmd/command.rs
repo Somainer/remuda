@@ -46,6 +46,10 @@ enum CmdCommand {
         /// The revision you read (`cmd ls`); defaults to the current one.
         #[arg(long)]
         revision: Option<u64>,
+        /// Retry with the interaction id of the owner's approval (new text to
+        /// a shell-driver target asks once, as a send does).
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
     },
     /// Take back a queued command; it is never delivered.
     Withdraw {
@@ -60,6 +64,9 @@ enum CmdCommand {
     Deliver {
         /// `cmd_…`.
         command_id: String,
+        /// Retry with the interaction id of the owner's approval, when asked.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
     },
 }
 
@@ -82,7 +89,9 @@ impl Entrypoint for CmdArgs {
                     command_id,
                     text,
                     revision,
+                    approval_id,
                 } => {
+                    let client = client.clone().with_approval(approval_id, false);
                     let revision = match revision {
                         Some(revision) => revision,
                         None => queued(&client, &command_id)
@@ -110,7 +119,13 @@ impl Entrypoint for CmdArgs {
                         .post(&format!("/v1/commands/{command_id}/withdraw"), &body)
                         .await?
                 }
-                CmdCommand::Deliver { command_id } => deliver(&client, &command_id).await?,
+                CmdCommand::Deliver {
+                    command_id,
+                    approval_id,
+                } => {
+                    let client = client.clone().with_approval(approval_id, false);
+                    deliver(&client, &command_id).await?
+                }
             };
             print_json(&value)?;
             Ok(0)

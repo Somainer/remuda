@@ -70,6 +70,10 @@ pub(crate) enum InstanceCommand {
         /// `native-turn` or `task`.
         #[arg(long, default_value = "native-turn")]
         completion_scope: String,
+        /// Retry a send the owner approved (D-017: a shell-driver target asks
+        /// once per send) with the approval's interaction id.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
         /// Prompt words after the instance id.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -162,6 +166,9 @@ pub(crate) enum InstanceCommand {
         /// The generation you read; a stale one is a conflict, not an overwrite.
         #[arg(long)]
         expected_generation: Option<u64>,
+        /// Retry with the interaction id of the owner's approval, when asked.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
     },
     /// Show the runtime config: the requested and effective values, the
     /// generation and the changes not yet in effect.
@@ -503,10 +510,12 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 file,
                 command_id,
                 completion_scope,
+                approval_id,
                 prompt,
             } => {
                 let text = load_send_text(text, file, prompt)?;
                 let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let client = client.clone().with_approval(approval_id, false);
                 let value = send(
                     &client,
                     &instance_id,
@@ -604,8 +613,10 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 ultracode,
                 permission_mode,
                 expected_generation,
+                approval_id,
             } => {
                 let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let client = client.clone().with_approval(approval_id, false);
                 let value = configure(
                     &client,
                     &instance_id,

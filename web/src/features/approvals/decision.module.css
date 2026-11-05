@@ -53,6 +53,17 @@
   color: var(--fg-body);
 }
 
+/* D-061: an item routed to Main / another agent — a neutral pill, the same
+   shape as the root-turn tag beside it. */
+.routedTag {
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  white-space: nowrap;
+  flex: none;
+}
+
 /* 2. Status line — dot + state sentence; colour carries the state and the
    dot supplies the shape, so it never relies on colour alone. */
 .status {

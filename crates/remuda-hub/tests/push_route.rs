@@ -1842,3 +1842,243 @@ async fn a_fallback_page_honours_the_routing_and_the_lift_pages_once() -> Result
     );
     Ok(())
 }
+
+// ─── D-061 `routedTo` and the owner badge ──────────────────────────────────
+
+impl Ctx {
+    /// `routedTo` of `interaction` on the owner's `GET /v1/interactions`.
+    async fn routed_to(&self, interaction: &str) -> Result<String> {
+        let page = self.get("/v1/interactions").await?;
+        let item = page["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["interactionId"] == interaction || item["id"] == interaction)
+            .with_context(|| format!("{interaction} on the page: {page}"))?;
+        Ok(item["routedTo"]
+            .as_str()
+            .with_context(|| format!("routedTo on {item}"))?
+            .to_owned())
+    }
+
+    /// `counts.needYou` of the owner glance (home.md §5.3), which counts the
+    /// same A the badge does.
+    async fn glance_need_you(&self) -> Result<Value> {
+        let glance = self.get("/v1/owner/glance").await?;
+        Ok(glance["counts"]["needYou"].clone())
+    }
+
+    /// The badge of the newest push tagged `interaction:<id>`.
+    async fn badge_of(&self, interaction: &str, count: usize) -> Result<Value> {
+        let pushes = self
+            .wait_pushes(&self.phone, &format!("interaction:{interaction}"), count)
+            .await?;
+        Ok(pushes[count - 1]["badge"].clone())
+    }
+}
+
+/// `routedTo` is the push decision, read back: approval → owner; a question
+/// or plan review routed to a running Main → main; the D-051 switch off →
+/// owner; a Human parent → owner; a non-Main Agent parent → agent; Main not
+/// effectively running at fire time → owner; Main paused after the
+/// suppression → owner from the lift on, and still owner once Main runs
+/// again (no re-suppression), while a new question is routed again; a store
+/// error → owner. Every push's badge is the owner-routed pending count (B is
+/// empty here: no tasks), and the lift push's badge already counts the items
+/// it lifts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_to_is_the_push_decision_and_the_badge_counts_only_the_owners() -> Result<()> {
+    let _flag = d051(true).await;
+    let ctx = Ctx::boot().await?;
+    let main = seat(&ctx).await?;
+    // A native session to continue, so Main can be resumed below.
+    ctx.node_p().append(&main, session("idle"))?;
+    ctx.wait_activity(&main, "idle").await?;
+    let worker = ctx.child(Some(&main)).await?;
+    let human_child = ctx.child(None).await?;
+    let coordinator = ctx.parent(true).await?;
+    let coordinated = ctx.child(Some(&coordinator)).await?;
+
+    ctx.raise(&worker, "int_rt_approval", "approval")?;
+    assert_eq!(ctx.decision("int_rt_approval").await?, "paged");
+    // Only the approval waits on the owner.
+    assert_eq!(ctx.badge_of("int_rt_approval", 1).await?, 1);
+    assert_eq!(ctx.routed_to("int_rt_approval").await?, "owner");
+
+    suppressed_question(&ctx, &worker, "int_rt_question").await?;
+    ctx.raise(&worker, "int_rt_plan", "plan-review")?;
+    assert_eq!(ctx.decision("int_rt_plan").await?, "suppressed");
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+    assert_eq!(ctx.routed_to("int_rt_plan").await?, "main");
+
+    suppressed_question(&ctx, &coordinated, "int_rt_agent").await?;
+    assert_eq!(ctx.routed_to("int_rt_agent").await?, "agent");
+
+    ctx.raise(&human_child, "int_rt_human", "question")?;
+    assert_eq!(ctx.decision("int_rt_human").await?, "paged");
+    assert_eq!(ctx.routed_to("int_rt_human").await?, "owner");
+    // approval + human: the three routed items do not count.
+    assert_eq!(ctx.badge_of("int_rt_human", 1).await?, 2);
+
+    set_d051(false);
+    ctx.raise(&worker, "int_rt_off", "question")?;
+    assert_eq!(ctx.decision("int_rt_off").await?, "paged");
+    set_d051(true);
+    assert_eq!(ctx.routed_to("int_rt_off").await?, "owner");
+    assert_eq!(ctx.badge_of("int_rt_off", 1).await?, 3);
+    // The owner glance's 需要你 is the same narrowed A.
+    assert_eq!(ctx.glance_need_you().await?, 3);
+
+    // A store error reads owner, for the page and for the badge. The seam
+    // fails a read whose result would include the armed row, so arming an
+    // item that is not routed away (the approval) fails nothing: the page
+    // still reads the question as main.
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_approval", true);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_approval", false);
+    // Arming a routed row fails the read, and the failure is the whole
+    // read's, as a real store error is: every item reads owner.
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", true);
+    let page = ctx.get("/v1/interactions").await?;
+    for item in page["items"].as_array().context("items")? {
+        assert_eq!(item["routedTo"], "owner", "{item}");
+    }
+    ctx.raise(&human_child, "int_rt_fault", "question")?;
+    assert_eq!(ctx.decision("int_rt_fault").await?, "paged");
+    // The badge read fails as a whole too: approval, human, off, fault + the
+    // three routed items it could not read.
+    assert_eq!(ctx.badge_of("int_rt_fault", 1).await?, 7);
+    remuda_hub::push_test_support::set_routed_read_failure("int_rt_question", false);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "main");
+
+    // Pause Main: the lift pages both of Main's items, and that push's badge
+    // already counts them (approval, human, off, fault + question, plan).
+    ctx.close(&main).await?;
+    ctx.wait_lineage(&main, "paused").await?;
+    assert_eq!(ctx.wait_lifted("int_rt_question").await?, "fence");
+    assert_eq!(ctx.badge_of("int_rt_question", 1).await?, 6);
+    assert_eq!(ctx.badge_of("int_rt_plan", 1).await?, 6);
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "owner");
+    assert_eq!(ctx.routed_to("int_rt_plan").await?, "owner");
+    // Another parent's routing is untouched.
+    assert_eq!(ctx.routed_to("int_rt_agent").await?, "agent");
+    assert_eq!(ctx.glance_need_you().await?, 6);
+
+    // Main not effectively running at fire time: the question pages.
+    ctx.raise(&worker, "int_rt_paused", "question")?;
+    assert_eq!(ctx.decision("int_rt_paused").await?, "paged");
+    assert_eq!(ctx.routed_to("int_rt_paused").await?, "owner");
+
+    // Main runs again: the lifted items stay the owner's; a new question is
+    // evaluated normally and routed.
+    let resumed = ctx
+        .post(&format!("/v1/instances/{main}/resume"), json!({}))
+        .await?;
+    let successor = resumed["instance"]["instanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    ctx.report_running(ctx.node_p(), &successor).await?;
+    ctx.wait_lineage(&main, "running").await?;
+    assert_eq!(ctx.routed_to("int_rt_question").await?, "owner");
+    assert_eq!(ctx.routed_to("int_rt_paused").await?, "owner");
+    suppressed_question(&ctx, &worker, "int_rt_again").await?;
+    assert_eq!(ctx.routed_to("int_rt_again").await?, "main");
+    ctx.raise(&human_child, "int_rt_last", "question")?;
+    assert_eq!(ctx.decision("int_rt_last").await?, "paged");
+    // approval, human, off, fault, question, plan, paused, last.
+    assert_eq!(ctx.badge_of("int_rt_last", 1).await?, 8);
+    Ok(())
+}
+
+/// Clears the D-051 force-off project override on drop.
+struct ForceOff;
+
+impl ForceOff {
+    fn set(projects: &[&str]) -> Self {
+        remuda_hub::delegated_decisions_test_support::set_force_off_override(Some(
+            projects.iter().map(|id| (*id).to_owned()).collect(),
+        ));
+        Self
+    }
+}
+
+impl Drop for ForceOff {
+    fn drop(&mut self) {
+        remuda_hub::delegated_decisions_test_support::set_force_off_override(None);
+    }
+}
+
+/// r2 item 1: a suppression does not outlive its D-051 admission. Suppressed
+/// with the switch on, the Hub restarts with it off (globally, or with the
+/// child's project forced off): boot lifts the row although Main still runs
+/// by state, with its own cause; the owner is paged once with a badge that
+/// counts the item, and it reads `routedTo: owner` from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_revokes_the_admission_lifts_at_boot() -> Result<()> {
+    let _flag = d051(true).await;
+    for how in ["global-off", "project-force-off"] {
+        let mut ctx = Ctx::boot().await?;
+        let main = seat(&ctx).await?;
+        let worker = ctx.child(Some(&main)).await?;
+        let project = remuda_protocol::ProjectId::new()
+            .as_id()
+            .as_str()
+            .to_owned();
+        ctx.db()?.execute(
+            "UPDATE instances SET scope_json = ?2 WHERE id = ?1",
+            rusqlite::params![worker, json!({ "projectIds": [project] }).to_string()],
+        )?;
+        let id = format!("int_revoked_{}", how.replace('-', "_"));
+        suppressed_question(&ctx, &worker, &id).await?;
+        assert_eq!(ctx.routed_to(&id).await?, "main", "{how}");
+        let _off = match how {
+            "global-off" => {
+                set_d051(false);
+                None
+            }
+            _ => Some(ForceOff::set(&[&project])),
+        };
+        ctx.crash_restart(|_| {}, as_if_crashed).await?;
+        assert_eq!(ctx.wait_lifted(&id).await?, "admission-revoked", "{how}");
+        ctx.hub.test_handle().test_drive_outbox().await;
+        // The one item now waits on the owner, and the page says so.
+        assert_eq!(ctx.badge_of(&id, 1).await?, 1, "{how}");
+        assert_eq!(ctx.routed_to(&id).await?, "owner", "{how}");
+        assert_eq!(ctx.outbox_rows(&id)?, 1, "{how}");
+        set_d051(true);
+        ctx.hub.shutdown().await;
+    }
+    Ok(())
+}
+
+/// r2 item 1, the hello cause: a row boot kept (the switch still on, Main
+/// running by state) is lifted by the parent host's same-epoch hello once the
+/// admission no longer holds, although that hello keeps Main running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hello_lifts_a_suppression_whose_admission_is_gone() -> Result<()> {
+    let _flag = d051(true).await;
+    let mut ctx = Ctx::boot().await?;
+    let main = seat(&ctx).await?;
+    let worker = ctx.child(Some(&main)).await?;
+    suppressed_question(&ctx, &worker, "int_revoked_hello").await?;
+    ctx.crash_restart(|_| {}, as_if_crashed).await?;
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(ctx.suppression("int_revoked_hello")?, (None, None));
+    set_d051(false);
+    let _node = FakeNode::connect_with(
+        &ctx.hub,
+        &ctx.host_p,
+        &ctx.p_node_token,
+        hello_extra(EPOCH, &[&main]),
+    )
+    .await?;
+    assert_eq!(
+        ctx.wait_lifted("int_revoked_hello").await?,
+        "admission-revoked"
+    );
+    ctx.hub.test_handle().test_drive_outbox().await;
+    assert_eq!(ctx.badge_of("int_revoked_hello", 1).await?, 1);
+    assert_eq!(ctx.routed_to("int_revoked_hello").await?, "owner");
+    Ok(())
+}

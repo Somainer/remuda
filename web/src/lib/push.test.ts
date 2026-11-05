@@ -258,6 +258,25 @@ describe("startAppBadgeSync follows the store pending count", () => {
     expect(clearAppBadge).toHaveBeenCalledTimes(2);
   });
 
+  it("is N: an item routed to Main or another agent is not on the badge (D-061)", () => {
+    startAppBadgeSync();
+    const row = (routedTo?: string) => ({
+      state: "pending",
+      deadline: { state: "unknown" },
+      answer: { state: "unknown" },
+      ...(routedTo === undefined ? {} : { routedTo }),
+    });
+    storeMock.interactions.push(row(), row("owner"), row("main"), row("agent"));
+    storeMock.emit();
+    expect(setAppBadge).toHaveBeenLastCalledWith(2);
+    expect(pendingInteractionCount()).toBe(2);
+    // The lift: Main paused, the Hub reads owner again and the badge goes up.
+    storeMock.interactions.splice(2, 1, row("owner"));
+    storeMock.emit();
+    expect(setAppBadge).toHaveBeenLastCalledWith(3);
+    expect(pendingInteractionCount()).toBe(3);
+  });
+
   it("adds owner-blocked tasks with no waiting interaction (home.md §5.1 N)", () => {
     startAppBadgeSync();
     ledgerMock.tasks = [

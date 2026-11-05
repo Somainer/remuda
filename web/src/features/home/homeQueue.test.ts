@@ -179,6 +179,23 @@ describe("deriveHomeQueue (§4.1 order, §4.6 dedupe, §5.1 count)", () => {
     });
   }
 
+  it("④ holds no item routed to Main or another agent; its task card shows instead (D-061)", () => {
+    const src = fixture();
+    src.interactions = src.interactions.map((row) =>
+      row.id === "int_task" ? { ...row, routedTo: "main" as const } : row.id === "int_old" ? { ...row, routedTo: "agent" as const } : row,
+    );
+    const queue = deriveHomeQueue(src);
+    expect(queue.cards.map((card) => `${card.type}:${card.id}`)).toEqual([
+      "interaction:int_new",
+      "task:tsk_b",
+      "task:tsk_d",
+      "failed:ins_fail",
+    ]);
+    // The header and the badge read the same N.
+    expect(queue.counted).toBe(glanceCounts(src).needYou);
+    expect(queue.counted).toBe(3);
+  });
+
   it("orders interactions like the inbox (newest first), then 任务待你, then 回合失败", () => {
     const queue = deriveHomeQueue(fixture());
     expect(queue.cards.map((card) => `${card.type}:${card.id}`)).toEqual([

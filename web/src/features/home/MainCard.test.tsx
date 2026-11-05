@@ -14,12 +14,15 @@ const hub = {
   instances: [] as Instance[],
   hosts: [{ id: "host-a", label: "devbox", online: true, state: "online" }],
   interactions: [] as unknown[],
+  answering: {} as Record<string, true>,
+  interactionsHydrated: true,
   bubbles: [] as LocalBubble[],
   summaries: {} as Record<string, string>,
   lineages: {} as Record<string, LineageRecord>,
   connection: "live",
 };
 let main: MainEntry | null = null;
+const refreshHealth = vi.hoisted(() => ({ lastOkAt: 1 as number | null, failingSince: null }));
 const send = vi.fn();
 const resume = vi.fn();
 const reconcileSend = vi.fn();
@@ -37,7 +40,7 @@ vi.mock("../../lib/store", () => ({
     resume: (...args: unknown[]) => resume(...args),
     reconcileSend: (...args: unknown[]) => reconcileSend(...args),
     refreshLineage: vi.fn().mockResolvedValue(null),
-    getRefreshHealth: () => ({ lastOkAt: 1, failingSince: null }),
+    getRefreshHealth: () => refreshHealth,
     subscribeRefreshHealth: () => () => undefined,
     subscribe: () => () => undefined,
     getSnapshot: () => hub,
@@ -110,6 +113,9 @@ beforeEach(() => {
   hub.bubbles = [];
   hub.lineages = {};
   hub.instances = [];
+  hub.interactions = [];
+  hub.interactionsHydrated = true;
+  refreshHealth.lastOkAt = 1;
   resetMainRepliesForTest();
   hub.connection = "live";
   wakesFake.walks = [];
@@ -135,6 +141,52 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+});
+
+/** A pending worker question as the Hub routed it (D-061 `routedTo`). */
+function question(id: string, routedTo?: string) {
+  return {
+    id,
+    instanceId: "ins_worker",
+    hostId: "host-a",
+    kind: "question",
+    state: "pending",
+    blocking: true,
+    answerable: true,
+    deadline: { state: "unknown" },
+    answer: { state: "unknown" },
+    ...(routedTo ? { routedTo } : {}),
+  };
+}
+
+describe("MainCard 正在处理 N 个 worker 提问 (home.md §10)", () => {
+  it("shows the count of items routed to Main while it is known and above zero", () => {
+    refreshHealth.lastOkAt = Date.now();
+    hub.interactions = [question("int_1", "main"), question("int_2", "main"), question("int_3"), question("int_4", "agent")];
+    renderCard();
+    const line = screen.getByTestId("main-card-routed");
+    expect(line.textContent).toBe("正在处理 2 个 worker 提问");
+    expect(line.getAttribute("data-stale")).toBeNull();
+  });
+
+  it("is hidden at zero and while the count is unknown", () => {
+    hub.interactions = [question("int_3"), question("int_4", "agent")];
+    const { unmount } = renderCard("phone");
+    expect(screen.queryByTestId("main-card-routed")).toBeNull();
+    unmount();
+    hub.interactions = [question("int_1", "main")];
+    hub.interactionsHydrated = false;
+    renderCard("phone");
+    expect(screen.queryByTestId("main-card-routed")).toBeNull();
+  });
+
+  it("greys out while the page is stale (§8)", () => {
+    // The last successful refresh is long past: stale.
+    refreshHealth.lastOkAt = 1;
+    hub.interactions = [question("int_1", "main")];
+    renderCard("phone");
+    expect(screen.getByTestId("main-card-routed").getAttribute("data-stale")).toBe("1");
+  });
 });
 
 describe("MainCard", () => {

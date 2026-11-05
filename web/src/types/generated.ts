@@ -4234,6 +4234,9 @@ export type RootTurn = ({
 /** RootTurnContinuation wire values; `protocol.md` §8.4. */
 export type RootTurnContinuation = ("none" | "native" | "hub" | "unknown");
 
+/** Who a pending interaction waits on, as the Hub stamps it on every `GET /v1/interactions` item (D-061 `routedTo`, home.md §5.1). `main` and `agent` mean the owner push was withheld because the item was routed to a running Agent parent (D-057 §8.1): Main's lineage, or another one. A client reads a missing or unknown value as `owner`. */
+export type RoutedTo = ("owner" | "main" | "agent");
+
 /** RpcError; `protocol.md` §9.1. */
 export type RpcError = ({
   "code": (number);

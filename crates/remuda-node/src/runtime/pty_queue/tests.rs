@@ -307,6 +307,32 @@ async fn control_unavailable_after_readiness_does_not_reject_or_duplicate_input(
     node.shutdown().await.unwrap();
 }
 
+/// cb-command-queue: a prompt claimed for a write the driver then refused
+/// (`ControlUnavailable`) was never delivered, so it can still be withdrawn,
+/// and a withdrawn one is never written.
+#[tokio::test]
+async fn a_claimed_prompt_whose_write_failed_stays_withdrawable() {
+    let (node, driver) = node(DriverKind::ClaudePty, 4);
+    driver.ready.store(true, Ordering::SeqCst);
+    driver.race_unavailable.store(true, Ordering::SeqCst);
+    let created = create(&node, DriverKind::ClaudePty).await;
+    wait(|| driver.attempts.load(Ordering::SeqCst) == 1).await;
+    let answer = node
+        .held_input_rpc(
+            "command.withdraw",
+            &serde_json::json!({"commandId": created.command.command_id.as_id().to_string()}),
+        )
+        .unwrap();
+    assert_eq!(answer["outcome"], "withdrawn");
+    driver.ready.store(true, Ordering::SeqCst);
+    // The create's own prompt: the withdrawal interrupts its queued row.
+    wait(|| folded_with_status(&node, &created, ContentStatus::Interrupted).len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(driver.sent.lock().unwrap().is_empty());
+    assert_eq!(driver.attempts.load(Ordering::SeqCst), 1);
+    node.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn queued_prompt_keeps_native_interaction_pending_until_user_response() {
     let (node, driver) = node(DriverKind::ClaudePty, 4);

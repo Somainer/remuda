@@ -105,6 +105,19 @@ impl HeldInputs {
         }
     }
 
+    /// The claimed write did not happen (control went away between the
+    /// claim and the driver write): the prompt is undelivered and waits
+    /// again, so it can still be withdrawn or edited. An edit the claim
+    /// handed over is already in the queued prompt, so nothing is restored
+    /// to the entry.
+    pub(crate) fn unclaim(&self, command_id: &CommandId) {
+        if let Some(entry) = self.lock().get_mut(command_id)
+            && entry.state == State::Delivering
+        {
+            entry.state = State::Waiting;
+        }
+    }
+
     /// The queue is done with `command_id` (written, failed or interrupted).
     pub(crate) fn release(&self, command_id: &CommandId) {
         self.lock().remove(command_id);
@@ -255,6 +268,32 @@ mod tests {
         assert_eq!(held.claim(&id), Claim::Deliver(Some("three".into())));
         held.release(&id);
         assert_eq!(held.withdraw(&id), "already-delivered");
+    }
+
+    #[test]
+    fn an_unclaimed_prompt_can_be_withdrawn_or_edited_again() {
+        let held = HeldInputs::default();
+        let id = CommandId::new();
+        held.hold(&id);
+        assert_eq!(held.edit(&id, 0, "one"), ("edited", 1));
+        assert_eq!(held.claim(&id), Claim::Deliver(Some("one".into())));
+        assert_eq!(held.edit(&id, 1, "late").0, "already-delivered");
+        held.unclaim(&id);
+        assert_eq!(
+            held.edit(&id, 1, "two"),
+            ("edited", 2),
+            "the revision stays"
+        );
+        assert_eq!(held.claim(&id), Claim::Deliver(Some("two".into())));
+        held.unclaim(&id);
+        assert_eq!(held.withdraw(&id), "withdrawn");
+        held.unclaim(&id);
+        assert_eq!(
+            held.claim(&id),
+            Claim::Withdrawn,
+            "unclaim never revives it"
+        );
+        held.unclaim(&CommandId::new());
     }
 
     #[test]

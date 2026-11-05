@@ -517,6 +517,9 @@ async fn deliver(
     let mut command = store.get_command(&prompt.command_id)?;
     match execution {
         Err(DriverError::ControlUnavailable) => {
+            // Nothing was written: the prompt waits again and stays
+            // withdrawable and editable (cb-command-queue).
+            fences.held.unclaim(&prompt.command_id);
             remark_after_enqueue(store, instance_id, Some(prompt.mode))?;
             return Ok(false);
         }

@@ -2147,7 +2147,8 @@ mod tests {
                 "web-install",
                 "web-build",
                 "web-test",
-                "web-hub-e2e"
+                "web-hub-e2e",
+                "web-hub-e2e-main"
             ]
         );
         assert!(plan[8..].iter().all(|step| step.status == "skipped"));
@@ -2165,7 +2166,8 @@ mod tests {
         let web_only: Vec<Step> = serde_json::from_slice(&output.stdout).unwrap();
         assert!(web_only[..8].iter().all(|step| step.status == "skipped"));
         assert!(web_only[8..11].iter().all(|step| step.status == "planned"));
-        assert_eq!(web_only[11].status, "skipped");
+        // Both Hub e2e passes run only with --web-e2e.
+        assert!(web_only[11..].iter().all(|step| step.status == "skipped"));
     }
 
     // ── r16 item 3: merge-base exit tri-state + shallow history ────────────

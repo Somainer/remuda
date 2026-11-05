@@ -176,6 +176,37 @@ fn default_kind() -> String {
     "claude".into()
 }
 
+/// D-045 Q4, harness-agnostic: the refusal for `computer-use` together with
+/// unattended (skipped) tool approvals on one launch of `kind`, or `None`.
+/// The message names the kind AND the exact refused spellings. Shared by the
+/// create gate and a seat-profile edit (cb-seat-profile r2), so a profile can
+/// never set a mode the lineage's next chapter could not launch with.
+pub(crate) fn computer_use_unattended(kind: &str, permission_mode: Option<&str>) -> Option<String> {
+    let (unattended, refused_spellings): (bool, &[&str]) = match kind {
+        "claude" => (
+            matches!(permission_mode, Some("bypassPermissions" | "bypass")),
+            &["bypassPermissions", "bypass"],
+        ),
+        // Codex auto-approves every action with `never` (CLI
+        // `--ask-for-approval never`; legacy `no-request`).
+        "codex" => (
+            matches!(permission_mode, Some("never" | "no-request")),
+            &["never", "no-request"],
+        ),
+        _ => (false, &[]),
+    };
+    unattended.then(|| {
+        format!(
+            "refusing \"computer-use\" together with unattended/skipped tool approvals \
+             on the same {kind:?} launch (permissionMode {:?}; refused {kind} spellings: {}): \
+             desktop control plus auto-approved actions has no recovery path; \
+             remove one of the two",
+            permission_mode.unwrap_or("-"),
+            refused_spellings.join(", ")
+        )
+    })
+}
+
 /// Parse the D-047 `apiVia`/`apiRoute` pair from a create/dispatch body.
 ///
 /// Kept outside the serde derive because an unknown `apiVia` spelling must be
@@ -1909,39 +1940,12 @@ async fn create_instance_as(
             .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
         {
             // D-045 Q4, harness-agnostic: refuse unattended desktop control.
-            // The message names the kind AND the exact refused spellings.
             // (Gate 1 origin refusal is hoisted to right after device binding,
             // before placement/approval.)
-            let (unattended, refused_spellings): (bool, &[&str]) = match body.kind.as_str() {
-                "claude" => (
-                    matches!(
-                        body.permission_mode.as_deref(),
-                        Some("bypassPermissions" | "bypass")
-                    ),
-                    &["bypassPermissions", "bypass"],
-                ),
-                "codex" => (
-                    matches!(
-                        body.permission_mode.as_deref(),
-                        // Codex auto-approves every action with `never` (CLI
-                        // `--ask-for-approval never`; legacy `no-request`).
-                        Some("never" | "no-request")
-                    ),
-                    &["never", "no-request"],
-                ),
-                _ => (false, &[]),
-            };
-            if unattended {
-                return Err(HubError::BadRequest(format!(
-                    "refusing \"computer-use\" together with unattended/skipped tool approvals \
-                     on the same {:?} launch (permissionMode {:?}; refused {} spellings: {}): \
-                     desktop control plus auto-approved actions has no recovery path; \
-                     remove one of the two",
-                    body.kind,
-                    body.permission_mode.as_deref().unwrap_or("-"),
-                    body.kind,
-                    refused_spellings.join(", ")
-                )));
+            if let Some(message) =
+                computer_use_unattended(&body.kind, body.permission_mode.as_deref())
+            {
+                return Err(HubError::BadRequest(message));
             }
             if !matches!(body.kind.as_str(), "claude" | "codex") {
                 return Err(HubError::BadRequest(format!(

@@ -53,7 +53,8 @@ impl FakeNode {
         let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
         let mut inventory = json!({
             "hostname": "profile-node", "workspaces": [], "workspaceRevision": 0,
-            "cli": [{"kind": "claude", "path": "/usr/bin/claude", "auth": "logged_in"}]
+            "cli": [{"kind": "claude", "path": "/usr/bin/claude", "auth": "logged_in"},
+                    {"kind": "computer-use", "installed": true}]
         });
         if herdr {
             inventory["herdr"] = json!({"path": "/usr/bin/herdr"});
@@ -837,5 +838,42 @@ async fn a_refused_launch_resumes_as_a_fresh_create_not_a_bogus_session() -> Res
         params.1["spec"]["skills"],
         json!(["/srv/skills/locked-kit"])
     );
+    Ok(())
+}
+
+/// r2 item 3: a profile edit is checked against the D-045 combination rule
+/// the create gate applies: a seat launched with `computer-use` cannot be
+/// moved to a control-off mode its next chapter could not launch with.
+#[tokio::test]
+async fn a_control_off_mode_is_refused_for_a_computer_use_seat() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, false, capable()).await?;
+    let (lineage, _) = seat(&ctx, &mut node, json!({"capabilities": ["computer-use"]})).await?;
+    let (status, refused) = put(
+        &ctx,
+        &lineage,
+        &ctx.human,
+        json!({"expectedRevision": 0, "permissionMode": "bypassPermissions"}),
+    )
+    .await?;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(refused["reason"], json!("invalid-profile"), "{refused}");
+    let text = refused.to_string();
+    assert!(
+        text.contains("computer-use") && text.contains("bypassPermissions"),
+        "{text}"
+    );
+    assert_eq!(refused["next"]["action"], json!("fix-request"));
+    let view = ctx.get(&format!("/v1/lineages/{lineage}/profile")).await?;
+    assert_eq!(view["profile"], Value::Null, "nothing stored: {view}");
+    // A mode that keeps control on is fine.
+    let (status, body) = put(
+        &ctx,
+        &lineage,
+        &ctx.human,
+        json!({"expectedRevision": 0, "permissionMode": "acceptEdits"}),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
     Ok(())
 }

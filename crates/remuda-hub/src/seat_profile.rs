@@ -488,6 +488,22 @@ fn edit_tx(conn: &Connection, edit: ProfileEdit) -> Result<EditOutcome, StoreErr
     if let Err(message) = validate(&kind, &next) {
         return Ok(EditOutcome::Invalid(message));
     }
+    // r2 item 3: the D-045 combination rule, as the create gate applies it,
+    // against every capability list the next chapter can launch with: the
+    // live chapter's spec and the lineage's origin spec (a fresh relaunch).
+    // A mode the next chapter could not launch with is refused here, not
+    // left to burn the restart cap.
+    if next.permission_mode != base.permission_mode
+        && launches_computer_use(conn, &edit.lineage_id, &spec_raw)?
+        && let Some(message) =
+            crate::http::computer_use_unattended(&kind, Some(next.permission_mode.as_str()))
+    {
+        return Ok(EditOutcome::Invalid(format!(
+            "permissionMode {:?} cannot go with this lineage's \"computer-use\" capability: \
+             {message}",
+            next.permission_mode
+        )));
+    }
     let mut changed = Vec::new();
     for (name, differs) in [
         ("displayName", next.display_name != base.display_name),
@@ -554,6 +570,39 @@ fn edit_tx(conn: &Connection, edit: ProfileEdit) -> Result<EditOutcome, StoreErr
         profile: Box::new(profile),
         changed,
     })
+}
+
+/// Whether the lineage's next chapter can launch with `computer-use`: the
+/// live chapter's spec or the lineage's origin spec names it.
+fn launches_computer_use(
+    conn: &Connection,
+    lineage_id: &str,
+    live_spec: &str,
+) -> Result<bool, StoreError> {
+    let names = |spec: &Value| {
+        spec.get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(crate::inventory::CAPABILITY_COMPUTER_USE))
+            })
+    };
+    let live: Value = serde_json::from_str(live_spec).unwrap_or_else(|_| json!({}));
+    if names(&live) {
+        return Ok(true);
+    }
+    let origin: Option<String> = conn
+        .query_row(
+            "SELECT origin_spec_ref FROM lineages WHERE lineage_id = ?1",
+            params![lineage_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(origin
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|reference| reference.get("spec").is_some_and(names)))
 }
 
 /// The bounds of protocol.md §8.4.

@@ -15,17 +15,21 @@ import { login } from "./hub-auth";
  *  - Main is paused: the lift reads `owner` again, the card joins ④ and the
  *    badge goes up by one.
  *
- * It seats the Hub's one address-owner Main and needs the D-051 switch on in
- * the Hub's environment (the fake Hub inherits Playwright's), so it runs only
- * on request: HUB_E2E_MAIN_UI=1 REMUDA_DELEGATED_DECISIONS=1. No millisecond
- * thresholds; every wait is Playwright's eventual condition.
+ * It seats the Hub's one address-owner Main, needs the D-051 switch on in the
+ * Hub's environment (the fake Hub inherits Playwright's) and a fake node that
+ * advertises lineage fences (Main dispatches its worker as an Agent), so it
+ * runs only on request: HUB_E2E_MAIN_UI=1 REMUDA_DELEGATED_DECISIONS=1
+ * HUB_E2E_LINEAGE_FENCE=1. No millisecond thresholds; every wait is
+ * Playwright's eventual condition.
  */
 
 test.describe.configure({ mode: "serial" });
 
 test.skip(
-  process.env.HUB_E2E_MAIN_UI !== "1" || process.env.REMUDA_DELEGATED_DECISIONS !== "1",
-  "set HUB_E2E_MAIN_UI=1 and REMUDA_DELEGATED_DECISIONS=1: seats the Hub's one Main and routes to it",
+  process.env.HUB_E2E_MAIN_UI !== "1" ||
+    process.env.REMUDA_DELEGATED_DECISIONS !== "1" ||
+    process.env.HUB_E2E_LINEAGE_FENCE !== "1",
+  "set HUB_E2E_MAIN_UI=1, REMUDA_DELEGATED_DECISIONS=1 and HUB_E2E_LINEAGE_FENCE=1: seats the Hub's one Main, which dispatches and routes",
 );
 
 const seats: string[] = [];

@@ -888,9 +888,18 @@ fn node_hello_frame(
                 // every non-route spec then hits api-via-unsupported exactly
                 // as a pre-D-048 Node would.
                 "apiRelay": std::env::var("HUB_E2E_API_ROUTE").as_deref() == Ok("1"),
+                // c-routedto: D-057 lineage fences, so a continuity seat may
+                // dispatch a child here (an Agent-origin create on a Node
+                // without them is 409 node-lacks-fence). Absent by default —
+                // every other spec keeps today's fence-less Node.
+                "lineageFence": lineage_fence_enabled(),
             }
         }
     })
+}
+
+fn lineage_fence_enabled() -> bool {
+    std::env::var("HUB_E2E_LINEAGE_FENCE").as_deref() == Ok("1")
 }
 
 /// Methods whose replies park while the e2e gate file exists. They are the
@@ -3502,6 +3511,21 @@ async fn fake_node(
                             "worktreeRemoved": true,
                             "targetRemoved": true,
                             "reclaimedBytes": "2048",
+                        }),
+                    )
+                    .await?;
+                }
+                // c-routedto: acknowledge a lineage fence the way a Node that
+                // holds nothing for it does (no PTY writes, no direct ops in
+                // flight), so a pause or close of the seat completes.
+                "lineage.fence" if lineage_fence_enabled() => {
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "fenceId": params.get("fenceId").cloned().unwrap_or(Value::Null),
+                            "closedInstanceIds": [],
+                            "outcomes": [],
                         }),
                     )
                     .await?;

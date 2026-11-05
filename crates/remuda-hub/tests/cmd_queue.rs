@@ -1220,7 +1220,7 @@ async fn a_deferred_model_or_permission_switch_resolves_on_its_own_edges() -> Re
 /// one instead of forwarding a change the carrier must refuse.
 #[tokio::test]
 async fn launch_only_effort_is_deferred_to_the_next_chapter() -> Result<()> {
-    let ctx = Ctx::spawn().await?;
+    let mut ctx = Ctx::spawn().await?;
     let created = ctx
         .ok(
             &ctx.human,
@@ -1274,5 +1274,23 @@ async fn launch_only_effort_is_deferred_to_the_next_chapter() -> Result<()> {
     assert_eq!(frames.len(), 1, "{frames:?}");
     assert_eq!(frames[0]["params"]["model"], "claude-opus-5-5");
     assert!(frames[0]["params"].get("effort").is_none(), "{frames:?}");
+
+    // With the host offline the mixed configure queues, and its answer still
+    // names the boundary the row records.
+    ctx.offline().await;
+    let offline = ctx
+        .ok(
+            &ctx.human,
+            &path,
+            json!({ "operation": "instance.configure",
+                    "payload": { "model": "claude-sonnet-5-5", "effort": { "name": "max" } } }),
+        )
+        .await?;
+    assert_eq!(offline["command"]["state"], "queued", "{offline}");
+    assert_eq!(
+        offline["command"]["deferred"],
+        json!({ "boundary": "next-chapter" }),
+        "{offline}"
+    );
     Ok(())
 }

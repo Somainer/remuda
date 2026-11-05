@@ -3283,7 +3283,7 @@ pub async fn post_command(
     // D-057 §7.1: Hub-stamped from the authenticated device, never the body.
     let (initiator, initiator_device_id) =
         crate::agent_scope::initiator_and_device(&state, &device).await?;
-    let (command, created) = state
+    let (mut command, created) = state
         .store
         .queue_command_by(
             body.command_id,
@@ -3387,10 +3387,15 @@ pub async fn post_command(
             })
             .await
             .map_err(map_store)?;
-        if settle && let Some(command) = deferred {
-            return Ok(Json(
-                json!({ "command": command, "replayed": false, "generation": generation }),
-            ));
+        match deferred {
+            Some(command) if settle => {
+                return Ok(Json(
+                    json!({ "command": command, "replayed": false, "generation": generation }),
+                ));
+            }
+            // The row now carries `deferred`; an offline host answers with it.
+            Some(row) => command = row,
+            None => {}
         }
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();

@@ -618,15 +618,20 @@ async fn a_restart_successor_takes_the_lineage_profile_and_records_its_revision(
         .http
         .put(format!("{}/v1/lineages/{seat}/profile", ctx.base()))
         .bearer_auth(&ctx.human)
-        .json(&json!({"expectedRevision": 0, "modelCandidates": ["model-x", "model-y"],
-                      "effort": {"name": "high"}, "permissionMode": "manual"}))
+        .json(
+            &json!({"expectedRevision": 0, "modelCandidates": ["model-x", "model-y"],
+                      "effort": {"name": "high"}, "permissionMode": "manual"}),
+        )
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
     assert_eq!(edited["profile"]["revision"], json!(1));
-    assert_eq!(ctx.instance(&seat).await?["model"], json!("claude-test-model"));
+    assert_eq!(
+        ctx.instance(&seat).await?["model"],
+        json!("claude-test-model")
+    );
 
     ctx.report_killed(&node, &seat).await?;
     let decided = ctx.supervise().await;
@@ -638,7 +643,11 @@ async fn a_restart_successor_takes_the_lineage_profile_and_records_its_revision(
     let (method, create) = node.next_launch().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(create["spec"]["model"], json!("model-x"), "{create}");
-    assert_eq!(create["spec"]["permissionMode"], json!("manual"), "{create}");
+    assert_eq!(
+        create["spec"]["permissionMode"],
+        json!("manual"),
+        "{create}"
+    );
     assert_eq!(
         create["spec"]["effort"],
         json!({"name": "high", "ultracode": false}),

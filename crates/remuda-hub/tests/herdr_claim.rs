@@ -1941,3 +1941,57 @@ async fn a_release_of_an_unanswered_detach_sends_it_again() -> Result<()> {
     fixture.hub.shutdown().await;
     Ok(())
 }
+
+// ---- D-062 r4 item 5: a host-lost row is released once ----
+
+#[tokio::test]
+async fn a_double_release_of_a_host_lost_row_queues_one_detach() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed_unique(&fixture).await?;
+    // The host goes away and its row is marked host-lost.
+    fixture
+        .hub
+        .test_handle()
+        .test_disconnect_node(&fixture.host)
+        .await;
+    fixture.db()?.execute(
+        "UPDATE instances SET lifecycle = 'exited', last_error = 'host-contact-lost',
+                ended_at = NULL WHERE id = ?1",
+        [&id],
+    )?;
+    let first = release_call(&fixture, &id).await?;
+    assert_eq!(first["released"], true, "{first}");
+    let second = release_call(&fixture, &id).await?;
+    assert_eq!(
+        second["released"], false,
+        "a detach is already queued: {second}"
+    );
+    assert_eq!(closes_of(&fixture, &id)?.len(), 1, "one detach queued");
+    let releases = fixture
+        .audit(&id)
+        .await?
+        .into_iter()
+        .filter(|row| row["action"] == "instance.release")
+        .count();
+    assert_eq!(releases, 1, "one release audited");
+    // The host comes back: the one detach is delivered once.
+    fixture
+        .hub
+        .test_set_node_transport(&fixture.host, fixture.node.clone())
+        .await;
+    fixture
+        .hub
+        .test_handle()
+        .test_run_post_hello(&fixture.host)
+        .await;
+    let node = fixture.node.clone();
+    eventually("the detach reaches the Node", || {
+        node.params_of("instance.close").len() == 1
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fixture.node.params_of("instance.close").len(), 1);
+    assert!(fixture.node.held.lock().unwrap().is_empty());
+    fixture.hub.shutdown().await;
+    Ok(())
+}

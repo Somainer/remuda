@@ -546,53 +546,62 @@ async fn release(
     // Node detaches when it reconnects.
     let host_lost = instance.lifecycle == "exited"
         && instance.last_error.as_deref() == Some(crate::store::HOST_LOST_MARKER);
-    if matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") && !host_lost {
-        // An ended or failed claim row may still be live on its Node (a
-        // claim whose commit reply was lost, a release whose close never
-        // arrived). What decides is the detach's delivery, never the release
-        // audit (D-062 r3 item 1, r4 item 1):
-        // - delivered: a no-op;
-        // - queued, not yet sent: driven now, nothing new queued;
-        // - sent but never answered: sent again (a fresh idempotent close);
-        // - none, or only refused ones: one is queued.
-        let detach = if instance.herdr_claim.is_some() {
-            state
+    let ended = matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
+    if !ended {
+        queue_detach(&state, &device, &instance, "released").await?;
+        settle_released(&state, &instance_id).await?;
+        return released_body(&state, instance_id, true).await;
+    }
+    // An ended, failed or host-lost claim row may still be live on its Node
+    // (a claim whose commit reply was lost, a release whose close never
+    // arrived, a host that went away). What decides is the detach's
+    // delivery, never the release audit (D-062 r3 item 1, r4 items 1 and 5):
+    // - delivered: a no-op;
+    // - queued, not yet sent: driven now, nothing new queued;
+    // - sent but never answered: sent again (a fresh idempotent close);
+    // - none, or only refused ones: one is queued.
+    let detach = if instance.herdr_claim.is_some() {
+        state
+            .store
+            .claim_detach_state(instance_id.clone())
+            .await
+            .map_err(map_store)?
+    } else {
+        ClaimDetach::Delivered
+    };
+    let released = match detach {
+        ClaimDetach::Missing => {
+            let reason = if host_lost {
+                "released"
+            } else {
+                "ended-without-release"
+            };
+            queue_detach(&state, &device, &instance, reason).await?;
+            true
+        }
+        ClaimDetach::Unconfirmed => {
+            // Serialized with the sweeps, which re-send the same detach.
+            let _pass = state.herdr_detaches.lock().await;
+            let again = state
                 .store
                 .claim_detach_state(instance_id.clone())
                 .await
-                .map_err(map_store)?
-        } else {
-            ClaimDetach::Delivered
-        };
-        let released = match detach {
-            ClaimDetach::Missing => {
-                queue_detach(&state, &device, &instance, "ended-without-release").await?;
-                true
+                .map_err(map_store)?;
+            if again == ClaimDetach::Unconfirmed {
+                queue_detach(&state, &device, &instance, "unconfirmed-detach-resent").await?;
             }
-            ClaimDetach::Unconfirmed => {
-                // Serialized with the sweeps, which re-send the same detach.
-                let _pass = state.herdr_detaches.lock().await;
-                let again = state
-                    .store
-                    .claim_detach_state(instance_id.clone())
-                    .await
-                    .map_err(map_store)?;
-                if again == ClaimDetach::Unconfirmed {
-                    queue_detach(&state, &device, &instance, "unconfirmed-detach-resent").await?;
-                }
-                again == ClaimDetach::Unconfirmed
-            }
-            ClaimDetach::Pending => {
-                deliver_detaches(&state, &instance.host_id).await;
-                false
-            }
-            ClaimDetach::Delivered => false,
-        };
-        return released_body(&state, instance_id, released).await;
+            again == ClaimDetach::Unconfirmed
+        }
+        ClaimDetach::Pending => {
+            deliver_detaches(&state, &instance.host_id).await;
+            false
+        }
+        ClaimDetach::Delivered => false,
+    };
+    if host_lost {
+        settle_released(&state, &instance_id).await?;
     }
-    queue_detach(&state, &device, &instance, "released").await?;
-    settle_released(&state, &instance_id).await?;
-    released_body(&state, instance_id, true).await
+    released_body(&state, instance_id, released).await
 }
 
 async fn settle_released(state: &AppState, instance_id: &str) -> Result<(), HubError> {

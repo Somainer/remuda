@@ -5,10 +5,11 @@
 ## The two halves
 
 This file is the **human half**: a person reads a row, its class, and what is planned. `docs/design/agent-parity.generated.json` beside it is the **machine half**, generated — never edited — from three live sources:
-
 - every Hub route registration under `crates/remuda-hub/src` (recursively, so nested modules count), unioned with the documented OpenAPI paths (which alone carry the nest-mounted `/push` carrier);
 - the middleware's own predicate, `agent_route_admission` in `crates/remuda-hub/src/agent_scope.rs` — the function `restrict_agent_routes` calls for every Agent-origin request — so the `middleware` column is the enforcement path itself, not a reading of it;
 - the `remuda` clap tree from `Command::get_subcommands`.
+
+It is JSON and not a second markdown table because it is the machine's copy: the check compares its bytes for staleness, and JSON has one canonical serialization — no escaping or column-width ambiguity — for a reader as much as for the code.
 
 Each route records `middleware` (`admitted`, `owner-scoped` with the ownership it is pinned to, `refused`, or `skipped` when the middleware resolves no caller and the handler decides) and `handler`, the closest gate the source scan can read reliably (`operator-only`, `grant: <verb>`, `scope`, or `handler-checked` when it cannot). A command records its clap path and whether it is a group; its `hubRoutes` is empty because the clap registry holds an argv shape, not the REST calls a command makes — the Hub route column above is that record.
 

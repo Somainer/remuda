@@ -3,7 +3,7 @@
   "notes": [
     "routes: every `.route(..)` registration under crates/remuda-hub/src (recursively), unioned with the documented OpenAPI paths; the latter alone carries the nest-mounted /push carrier.",
     "middleware: the verdict of remuda_hub::agent_route_admission, the predicate restrict_agent_routes calls for every Agent-origin request. `admitted` means the middleware passes it to the handler; `owner-scoped` adds the named ownership check; `refused` is the middleware's 403; `skipped` means the middleware resolves no caller (a login, Node-link or health path, the Node object pull, or the Node host-file staging endpoint) and the handler decides.",
-    "handler: the gate the source scan reads reliably from the handler and at most two same-module helper hops. `handler-checked` means the scan could not read one; it is not a claim that the handler admits the route.",
+    "handler: a gate the handler calls unconditionally at its top level, or one a same-module helper it calls unconditionally does (at most two hops). A gate inside a branch, or one the scan cannot follow, is `handler-checked`: the scan reports only what the source states, and `handler-checked` is not a claim that the handler admits the route.",
     "commands: the clap tree from Command::get_subcommands. hubRoutes is empty because the clap registry records an argv shape, not the REST calls a command makes; the human half's Hub route column is that record."
   ],
   "routes": [

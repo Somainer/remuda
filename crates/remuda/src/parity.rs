@@ -156,9 +156,11 @@ pub fn build_model(
              resolves no caller (a login, Node-link or health path, the Node object pull, or \
              the Node host-file staging endpoint) and the handler decides."
                 .to_owned(),
-            "handler: the gate the source scan reads reliably from the handler and at most two \
-             same-module helper hops. `handler-checked` means the scan could not read one; it \
-             is not a claim that the handler admits the route."
+            "handler: a gate the handler calls unconditionally at its top level, or one a \
+             same-module helper it calls unconditionally does (at most two hops). A gate inside \
+             a branch, or one the scan cannot follow, is `handler-checked`: the scan reports \
+             only what the source states, and `handler-checked` is not a claim that the handler \
+             admits the route."
                 .to_owned(),
             "commands: the clap tree from Command::get_subcommands. hubRoutes is empty because \
              the clap registry records an argv shape, not the REST calls a command makes; the \
@@ -209,9 +211,10 @@ pub fn drift(model: &ParityModel, human: &str) -> Vec<String> {
     let documented = parse_human(human);
 
     // 1. A row that names a route the router no longer registers.
+    let mut missing: BTreeSet<(String, String)> = BTreeSet::new();
     for mention in &documented.mentions {
         let key = (mention.method.clone(), mention.path.clone());
-        if !machine.contains(&key) {
+        if !machine.contains(&key) && missing.insert(key) {
             failures.push(format!(
                 "{HUMAN_FILE}:{} names `{} {}`, which no Hub route registers; \
                  fix that row (or remove the route)",
@@ -290,8 +293,8 @@ pub struct RouteTarget {
 }
 
 /// Scan `.route(...)` registrations out of Rust sources (module, source). The
-/// scan stops at the first `#[cfg(test)]`, and recurses through nested modules
-/// because the walk that feeds it does.
+/// scan stops at the test module, and recurses through nested modules because
+/// the walk that feeds it does.
 #[must_use]
 pub fn scan_route_registrations(
     sources: &[(String, String)],
@@ -1147,6 +1150,7 @@ fn find_template(text: &str, path: &str, from: usize) -> Option<(usize, usize)> 
             .is_none_or(|c| c == '`' || c.is_whitespace() || matches!(c, '(' | '"' | '\'' | ','));
         let ends_clean = after.is_none_or(|c| {
             c == '`'
+                || c == '{'
                 || c.is_whitespace()
                 || matches!(c, '?' | '"' | '\'' | ',' | '.' | ')' | ';' | ':')
         });

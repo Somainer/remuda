@@ -1269,6 +1269,7 @@ pub(crate) fn resolve_delegation(
         restart: None,
         seated_by: None,
         auto_continue: false,
+        creator_origin: None,
     })
 }
 
@@ -1564,6 +1565,9 @@ async fn create_instance_as(
         parent_scope.as_ref(),
         placement_project_id.as_deref(),
     )?;
+    // home-glance-d060 (home.md §5.3): the Hub stamps who created the row from
+    // its authenticated device, never from the request body.
+    delegation.creator_origin = Some(crate::agent_scope::origin_wire(&device).to_string());
     // D-057 §6.1: Hub-side only; never stamped into the Node-facing spec.
     // The seating Human device is recorded with it (OA5 standing grant).
     if restart_policy.is_some() {
@@ -2090,7 +2094,7 @@ pub async fn resume_instance(
     // Resuming spends host capacity and starts a native process, so it stays a
     // human/bot action; an Agent asking to resume its own parent would escape
     // the scope its instance credential was issued for (D-017).
-    crate::agent_scope::require_operator(&state, &headers).await?;
+    let device = crate::agent_scope::require_operator(&state, &headers).await?;
     // Read on the reader pool: a continuation resume racing another one may
     // hold the writer thread open inside its fence transaction, and the
     // lineage branch must keep observing committed state meanwhile.
@@ -2118,7 +2122,6 @@ pub async fn resume_instance(
     // resume (fence + successor in one generation-CAS transaction), not the
     // D-026 child insert. Plain sessions keep the byte-identical path below.
     if let Some(lineage) = state.store.get_lineage(parent.lineage_id.clone()).await? {
-        let device = crate::agent_scope::caller(&state, &headers).await?;
         return resume_lineage(&state, &device, &body, parent, lineage, mode).await;
     }
     let session_id = parent.native_session_id.clone().ok_or_else(|| {
@@ -2273,7 +2276,20 @@ pub async fn resume_instance(
             spec,
             operation: "instance.resume",
             idempotency_key: Some(idempotency_key),
-            delegation: crate::store::InstanceDelegation::default(),
+            delegation: crate::store::InstanceDelegation {
+                // home-glance-d060 (home.md §5.3): a resume is a successor in
+                // the resumed session's chain, so it inherits the chain ROOT's
+                // creator stamp (the predecessor carries it) — never the
+                // operator's who pressed Resume. That keeps "dispatched by an
+                // Agent" true for a resumed worker and false for a resumed
+                // conversation. A predecessor with no stamp (an unclassified
+                // pre-upgrade row) falls back to the caller's.
+                creator_origin: parent
+                    .creator_origin
+                    .clone()
+                    .or_else(|| Some(crate::agent_scope::origin_wire(&device).to_string())),
+                ..Default::default()
+            },
             // Operator-only resume route (D-026); worker respawn uses the
             // internal helper, not this path.
             initiator: None,

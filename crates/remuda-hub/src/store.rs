@@ -978,6 +978,20 @@ pub struct InstanceRecord {
     /// turned it on.
     #[serde(default)]
     pub auto_continue: bool,
+    /// home-glance-d060 (home.md §5.3): the Hub-stamped origin of the device
+    /// that created the chain ROOT (`human` / `bot` / `agent` / `hub`), or the
+    /// upgrade backfill's `legacy` for a pre-column true root. A first launch
+    /// stamps its caller; every successor (D-026 resume, continuation, worker
+    /// respawn) and a worker relaunch copy the previous instance's stamp, so
+    /// `agent` means "dispatched by an Agent" whoever pressed resume. `None`
+    /// only on rows written before the stamp that no backfill rule could
+    /// classify.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "creatorOrigin"
+    )]
+    pub creator_origin: Option<String>,
     /// cb-seat-profile (D-063): the newest `launch.capabilities` payload the
     /// Node journaled for this chapter; absent before its first launch event.
     #[serde(
@@ -1197,6 +1211,13 @@ pub struct InstanceDelegation {
     /// cb-usage-resume (§11.6): continue once after a subscription usage
     /// limit resets.
     pub auto_continue: bool,
+    /// home-glance-d060 (home.md §5.3): the authenticated origin of the device
+    /// that CREATED this row — the wire `InputOrigin` (`human` / `bot` /
+    /// `agent` / `hub`). The owner glance's "hand-opened" rule reads it; rows
+    /// written without it (pre-upgrade rows, `ensure_instance` phantoms,
+    /// lineage successors) hold `None` and are never hand-opened on their own
+    /// (a successor still joins through its lineage's first chapter).
+    pub creator_origin: Option<String>,
 }
 
 /// Who seated a continuity lineage (D-057 §6.3.1, OA5): the authenticating
@@ -1223,6 +1244,7 @@ impl Default for InstanceDelegation {
             restart: None,
             seated_by: None,
             auto_continue: false,
+            creator_origin: None,
         }
     }
 }
@@ -1908,6 +1930,7 @@ fn continuation_resume_tx(
             .and_then(|value| serde_json::from_value(value).ok()),
         seated_by: None,
         auto_continue: current.auto_continue,
+        creator_origin: None,
     };
     // The predecessor is fenced inside this same transaction, so the copied
     // seat grants do not collide with it.
@@ -1917,11 +1940,12 @@ fn continuation_resume_tx(
             (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
              title, journal_id, durable_seq, spec_json, created_at, updated_at,
              role, scope_json, grants_json, task_id,
-             lineage_id, generation, chapter_cause, fenced_at, restart_json, auto_continue)
+             lineage_id, generation, chapter_cause, fenced_at, restart_json, auto_continue,
+             creator_origin)
          VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                  ?7, ?8, 0, ?9, ?10, ?10,
                  ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?18, NULL, ?17, ?19)",
+                 ?15, ?16, ?18, NULL, ?17, ?19, ?20)",
         params![
             successor_id,
             current.host_id,
@@ -1942,6 +1966,10 @@ fn continuation_resume_tx(
             restart_json,
             request.chapter_cause,
             successor_delegation.auto_continue,
+            // home-glance-d060 §5.3 (r3 item 2): a continuation chapter
+            // inherits the chain ROOT's creator stamp, so a hand-opened
+            // lineage's second successor is still the owner's.
+            current.creator_origin,
         ],
     )?;
     // cb-seat-profile: the profile revision and document the successor's
@@ -5360,11 +5388,11 @@ impl Store {
                      title, journal_id, durable_seq, spec_json, created_at, updated_at,
                      role, scope_json, grants_json, task_id,
                      lineage_id, generation, chapter_cause, fenced_at, restart_json,
-                     auto_continue)
+                     auto_continue, creator_origin)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                          ?7, ?8, 0, ?9, ?10, ?10,
                          ?11, ?12, ?13, ?14,
-                         ?1, 1, NULL, NULL, ?15, ?16)",
+                         ?1, 1, NULL, NULL, ?15, ?16, ?17)",
                 params![
                     instance_id,
                     host_id,
@@ -5382,6 +5410,7 @@ impl Store {
                     delegation.task_id,
                     restart_json,
                     delegation.auto_continue,
+                    delegation.creator_origin,
                 ],
             )?;
             // D-057 §5: a lineage row exists for every continuity instance —
@@ -8344,6 +8373,15 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
+    // home-glance-d060: `turn_end_at` (the local-day 今日完成 stamp, written in
+    // the same transaction as `turn_end_seq`) and `creator_origin` (the
+    // Hub-stamped origin of the device that created the instance, home.md
+    // §5.3's hand-opened rule) are added UNCONDITIONALLY, like `ended_at`.
+    // Both first appeared after the seen rung (5) was already at the top of an
+    // existing database: a rung-only migration would never run there, and
+    // every settled-turn append would fail with "no such column".
+    ensure_column(&conn, "instances", "turn_end_at", "TEXT")?;
+    ensure_column(&conn, "instances", "creator_origin", "TEXT")?;
     // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
     // backfills run ONCE per schema PRAGMA marker, not on every Store::open
     // for every evidence-less terminal row (that set only grows). This is the
@@ -8445,6 +8483,62 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
     )?;
+    // home-glance-d060 §5.3: backfill the creator stamp for rows written
+    // before the column existed (or before a create route stamped it), from
+    // durable evidence only. The stamp is the origin of the chain ROOT's
+    // creator (a successor inherits it), so the rules split roots from
+    // successors. Every rule fills only NULLs, in this order:
+    //   1. a ROOT (no `resumedFrom`) with an Agent creator — a recorded
+    //      dispatch audit row, or a non-null spec `parentInstanceId` (the Hub
+    //      stamps the creator instance at every Agent create) — is `agent`.
+    //      A successor never matches: a D-026 resume's parentInstanceId is the
+    //      session it resumed, not a dispatching Agent;
+    //   2. a Human seat — the lineage's origin_spec_ref named a Human
+    //      `seatedOrigin` (D-057 OA5; only a Human may set the restart policy
+    //      that makes one), so every chapter of it is the owner's: `human`;
+    //   3. a remaining TRUE root (no parent, no `resumedFrom`) predates the
+    //      stamp: `legacy`, accepted as hand-opened by the seed;
+    //   4. a SUCCESSOR (`resumedFrom` set: a D-026 resume, a continuation
+    //      chapter, a worker respawn) inherits its predecessor's stamp, chain
+    //      by chain until no row changes — each pass fills at least one row,
+    //      so the loop ends.
+    // Idempotent: once a row is stamped no rule touches it again.
+    conn.execute_batch(
+        "UPDATE instances SET creator_origin = 'agent'
+           WHERE creator_origin IS NULL
+             AND json_extract(spec_json, '$.resumedFrom') IS NULL
+             AND (json_extract(spec_json, '$.parentInstanceId') IS NOT NULL
+                  OR EXISTS (SELECT 1 FROM audit_log a
+                              WHERE a.action = 'instance.dispatch'
+                                AND a.subject = instances.id));
+         UPDATE instances SET creator_origin = 'human'
+           WHERE creator_origin IS NULL
+             AND EXISTS (SELECT 1 FROM lineages l
+                          WHERE l.lineage_id = instances.lineage_id
+                            AND json_extract(l.origin_spec_ref,
+                                 '$.seatedOrigin') = 'human');
+         UPDATE instances SET creator_origin = 'legacy'
+           WHERE creator_origin IS NULL
+             AND json_extract(spec_json, '$.parentInstanceId') IS NULL
+             AND json_extract(spec_json, '$.resumedFrom') IS NULL;",
+    )?;
+    loop {
+        let inherited = conn.execute(
+            "UPDATE instances
+                SET creator_origin = (
+                    SELECT p.creator_origin FROM instances p
+                     WHERE p.id = json_extract(instances.spec_json, '$.resumedFrom'))
+              WHERE creator_origin IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM instances p
+                     WHERE p.id = json_extract(instances.spec_json, '$.resumedFrom')
+                       AND p.creator_origin IS NOT NULL)",
+            [],
+        )?;
+        if inherited == 0 {
+            break;
+        }
+    }
     // D-060 (cb-memory-inject): the lineage memory revision, the chapter's
     // start record and the per-command change line.
     crate::memory::ensure_inject_columns(&conn)?;
@@ -16049,7 +16143,8 @@ pub(crate) fn load_instance(
                 turn_error_json, turn_end_seq,
                 (SELECT seen_seq FROM instance_views
                   WHERE instance_id = instances.id AND scope = ?2),
-                auto_continue, launch_capabilities_json, profile_revision, profile_json
+                auto_continue, creator_origin, launch_capabilities_json, profile_revision,
+                profile_json
          FROM instances WHERE id = ?1",
         params![id, crate::seen::OWNER_SCOPE],
         |row| {
@@ -16298,12 +16393,13 @@ pub(crate) fn load_instance(
                 seen_seq: seen_marks.seen_seq.map(|seq| seq.to_string()),
                 turn_end_seq: seen_marks.turn_end_seq.map(|seq| seq.to_string()),
                 auto_continue: row.get(32)?,
+                creator_origin: row.get(33)?,
                 launch_capabilities: row
-                    .get::<_, Option<String>>(33)?
+                    .get::<_, Option<String>>(34)?
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
-                profile_revision: row.get(34)?,
+                profile_revision: row.get(35)?,
                 profile_json: row
-                    .get::<_, Option<String>>(35)?
+                    .get::<_, Option<String>>(36)?
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },

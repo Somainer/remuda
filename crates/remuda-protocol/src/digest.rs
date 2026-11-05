@@ -227,6 +227,87 @@ pub struct GlanceMore {
     pub working: u32,
 }
 
+/// Most sessions `GET /v1/owner/glance` returns in each of `waiting` and
+/// `working`; the `more` counters carry the overflow.
+pub const OWNER_GLANCE_ROW_CAP: usize = 50;
+
+/// The ① count segments of the owner home (home.md §5.1–§5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerGlanceCounts {
+    /// §5.1 N = the interactions really waiting on the owner plus owner-blocked
+    /// tasks with no such interaction.
+    pub need_you: u32,
+    /// §5.2 ◉: owner-scope sessions ranked done-unseen.
+    pub done_unseen: u32,
+    /// §5.2 ●: owner-scope sessions ranked working.
+    pub working: u32,
+    /// §5.2 今日完成: owner-scope sessions whose latest settled root turn ended
+    /// inside the owner's local day (the caller's `tzOffsetMinutes`).
+    pub done_today: u32,
+}
+
+/// One session row of an [`OwnerGlance`].
+///
+/// Every string that came from a worker, a tool or a session is untrusted
+/// data; `headline` is already redacted the way the worker digest redacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerGlanceRow {
+    /// Instance (`ins_…`) of the session.
+    pub instance_id: String,
+    /// Display title (the session's title, redacted and clipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Seconds since the row's evidence last moved (the pending interaction's
+    /// creation for a waiting row, the session's update for a working row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    /// What the session is doing: a pending interaction kind
+    /// (`approval`/`question`/`plan-review`/`elicitation`) or `working`.
+    pub kind: String,
+    /// ONE deterministic sentence for the row, built from the worker digest's
+    /// fields (pending kind and its question, the live phrase, the last turn
+    /// result) — never a model call, never a secret. It always has text: a
+    /// working row with nothing in its tail falls back to the title.
+    pub headline: String,
+    /// A working row's structured live phrase, by the client's list-row
+    /// rules: `Workflow <run> · phase <label>` for a running workflow, else
+    /// the last assistant line, redacted and clipped like `headline`. Absent
+    /// when the tail has neither, so a list row keeps its own constant rather
+    /// than repeating the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<String>,
+    /// Bound task (`tsk_…`), when the session carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// `GET /v1/owner/glance`: the owner's world as one read-only projection —
+/// Main's lineage subtree plus the sessions the owner opened by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerGlance {
+    /// When the glance was rendered (UTC RFC3339).
+    pub generated_at: String,
+    /// The owner's local-day offset the `doneToday` count was taken in, in
+    /// minutes east of UTC (`-Date().getTimezoneOffset()` in the browser).
+    pub timezone_offset_minutes: i32,
+    /// The §5.1/§5.2 count segments.
+    pub counts: OwnerGlanceCounts,
+    /// The sessions `counts.doneUnseen` counted (◉), newest first, at most
+    /// [`OWNER_GLANCE_ROW_CAP`]. ⑤ 刚完成 lists exactly these, so the section
+    /// and the segment are one set at every width (home.md §7).
+    pub done_unseen_ids: Vec<String>,
+    /// Owner-scope sessions waiting on someone, at most
+    /// [`OWNER_GLANCE_ROW_CAP`].
+    pub waiting: Vec<OwnerGlanceRow>,
+    /// Owner-scope sessions making progress, at most [`OWNER_GLANCE_ROW_CAP`].
+    pub working: Vec<OwnerGlanceRow>,
+    /// Rows beyond the caps.
+    pub more: GlanceMore,
+}
+
 /// `GET /v1/lineages/{id}/glance`: the workers the lineage dispatched that
 /// are waiting on someone or working, plus today's completions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

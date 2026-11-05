@@ -26,6 +26,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
+import { uiMode } from "../../lib/status";
 import { known, type Id } from "../../types/wire";
 import { HomeList } from "./HomeList";
 import { LONG_PRESS_MS } from "../home/RowActions";
@@ -43,10 +44,36 @@ const hub = {
   screens: {} as Record<string, unknown>,
   answering: {} as Record<string, true>,
   connection: "live",
+  // home-glance-d060: ① reads this, never the instance list.
+  glance: null as {
+    counts: { needYou: number; doneUnseen: number; working: number; doneToday: number };
+    doneUnseenIds?: string[];
+  } | null,
 };
+
+/** The owner glance the row's ① and ⑤ read (the Hub's numbers, verbatim). */
+function setGlance(
+  counts: { needYou?: number; doneUnseen?: number; working?: number } = {},
+  doneUnseenIds: string[] = [],
+) {
+  hub.glance = {
+    counts: { needYou: 0, doneUnseen: 0, working: 0, doneToday: 0, ...counts },
+    doneUnseenIds,
+  };
+}
 
 const resumeMock = vi.fn();
 const listeners = new Set<() => void>();
+/** The per-row reads the home used to issue; home-glance-d060 retires the journal one. */
+/** The glance's per-row phrase and headline (r6 item 2). */
+const glanceRows = vi.hoisted(() => ({
+  phrases: {} as Record<string, string>,
+  headlines: {} as Record<string, string>,
+}));
+const rowReads = vi.hoisted(() => ({
+  refreshScreens: vi.fn(() => Promise.resolve(undefined)),
+  hydrateRowSummaries: vi.fn(() => Promise.resolve(undefined)),
+}));
 /** The store's freshness projection (home.md §8) as the component sees it. */
 const health = { lastOkAt: Date.now() as number | null, failingSince: null as number | null, settledSeq: 0 };
 const healthListeners = new Set<() => void>();
@@ -83,9 +110,15 @@ vi.mock("../../lib/store", async (importOriginal) => {
       hostName: () => "alpha",
       usageRollupOf: () => null,
       summaryOf: () => undefined,
+      // home-glance-d060: the row body's phrase is the glance's structured
+      // phrase (r6: never its title-falling headline), and the ① row owns the
+      // shared glance poll (§5.3).
+      glanceHeadlineOf: (id: string) => glanceRows.headlines[id],
+      glancePhraseOf: (id: string) => glanceRows.phrases[id],
+      refreshGlance: () => Promise.resolve(undefined),
       resume: (...args: unknown[]) => resumeMock(...args),
-      refreshScreens: vi.fn().mockResolvedValue(undefined),
-      hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
+      refreshScreens: rowReads.refreshScreens,
+      hydrateRowSummaries: rowReads.hydrateRowSummaries,
     },
   };
 });
@@ -144,6 +177,11 @@ async function openQuiet() {
 beforeEach(() => {
   resumeMock.mockReset();
   refreshMock.mockClear();
+  rowReads.refreshScreens.mockClear();
+  rowReads.hydrateRowSummaries.mockClear();
+  glanceRows.phrases = {};
+  glanceRows.headlines = {};
+  hub.glance = null;
   health.lastOkAt = Date.now();
   health.failingSince = null;
   localStorage.removeItem(SPACES_PREFS_KEY);
@@ -730,6 +768,8 @@ describe("① 工作中 filter and the group header", () => {
 describe("⑤ 刚完成", () => {
   it("lists the unseen finished rows under the queue", async () => {
     hub.instances = [row("ins-done", { activity: known("idle"), unseen: true })];
+    // ⑤ lists the glance's ◉ set, not a re-derivation over the instances.
+    setGlance({ doneUnseen: 1 }, ["ins-done"]);
     renderHome();
     const section = await screen.findByTestId("home-just-done");
     expect(section).toHaveTextContent("title ins-done");
@@ -744,6 +784,7 @@ describe("① 完成未看 filter", () => {
       row("ins-done", { activity: known("idle"), unseen: true }),
       row("ins-work", { activity: known("working") }),
     ];
+    setGlance({ doneUnseen: 1, working: 1 });
     renderHome();
     const segment = await screen.findByTestId("glance-done-unseen");
     expect(segment).toHaveTextContent("1 完成未看");
@@ -799,9 +840,101 @@ describe("① count vs the phone ledger's set", () => {
         parent: { instanceId: "ins-parent", runId: "run_1", commandId: "cmd_1" },
       }),
     ];
+    // The Hub's owner-scope count includes the child; the ledger lists it too.
+    setGlance({ working: 2 });
     renderHome();
     expect(await screen.findByTestId("glance-working")).toHaveTextContent("2 工作中");
     expect(screen.getAllByTestId("home-row")).toHaveLength(2);
+  });
+});
+
+describe("the home poll", () => {
+  it("reads no journal per row — one glance carries every headline", async () => {
+    hub.instances = [
+      row("ins-a", { activity: known("working") }),
+      row("ins-b", { activity: known("working") }),
+    ];
+    setGlance({ working: 2 });
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    await screen.findByTestId("glance-working");
+    // The mount tick is the poll's first iteration. The per-row journal read
+    // that used to feed each body is gone — one glance carries every headline
+    // (home.md §5.3); the tty screen read is a different source and stays.
+    expect(rowReads.hydrateRowSummaries).not.toHaveBeenCalled();
+  });
+});
+
+describe("the phone row's next step", () => {
+  /**
+   * [r6 item 2] The same precedence as /sessions: a pending interaction's own
+   * summary, a turn error verbatim, then a working row's glance phrase (the
+   * workflow phase), else the constant. The title-falling headline never
+   * becomes the body.
+   */
+  it("keeps the structured sources ahead of the glance phrase, and never paints the headline", async () => {
+    hub.instances = [
+      row("ins-wf", { activity: known("working") }),
+      row("ins-appr", { activity: known("waiting-interaction") }),
+      row("ins-fail", { lastTurnError: { at: "2026-09-19T10:00:00.000Z", text: "overloaded" } }),
+      row("ins-work", { activity: known("working") }),
+    ];
+    hub.interactions = [
+      queueInteraction({ id: "int_appr" as Id, instanceId: "ins-appr" as Id, hostId: "host-a" }),
+    ];
+    for (const instance of hub.instances) {
+      glanceRows.headlines[instance.id] = `title ${instance.id}`;
+      glanceRows.phrases[instance.id] = `assistant line ${instance.id}`;
+    }
+    glanceRows.phrases["ins-wf"] = "Workflow wf-native-demo · phase Review";
+    delete glanceRows.phrases["ins-work"];
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    // The turn-failed row is idle: open the idle fold it sits behind.
+    const idleFold = screen.queryByTestId("home-idle-fold");
+    if (idleFold) await userEvent.click(idleFold);
+    const bodyOf = (id: string) =>
+      screen
+        .getAllByTestId("home-row")
+        .find((el) => el.querySelector(`a[href="/s/${id}"]`))
+        ?.querySelector("[data-testid='home-row-body']")?.textContent;
+    expect(bodyOf("ins-wf")).toBe("Workflow wf-native-demo · phase Review");
+    expect(bodyOf("ins-appr")).not.toContain("assistant line");
+    expect(bodyOf("ins-appr")).not.toContain("title ins-appr");
+    expect(bodyOf("ins-fail")).toBe("overloaded");
+    expect(bodyOf("ins-work")).toBe("运行中…");
+  });
+});
+
+describe("the home poll's screen reads", () => {
+  /**
+   * [r4 item 4] The ledger renders child rows (nested under their parent), and
+   * their next-step sentence reads the tty screen like any other row. Once
+   * mapInstance carried `parent`, a top-level-only filter starved them.
+   */
+  it("hydrates a child row's /screen like its parent's", async () => {
+    const tty = mockDb.instances.find((instance) => uiMode(instance) === "tty-attachable")!;
+    const ttyRow = (id: string, patch: Partial<Instance> = {}) =>
+      row(id, {
+        driver: tty.driver,
+        kind: tty.kind,
+        capabilities: tty.capabilities,
+        activity: known("working"),
+        ...patch,
+      });
+    hub.instances = [
+      ttyRow("ins-parent"),
+      ttyRow("ins-child", {
+        parent: { instanceId: "ins-parent", runId: null, commandId: null },
+        creatorOrigin: "agent",
+      }),
+    ];
+    expect(hub.instances.every((instance) => uiMode(instance) === "tty-attachable")).toBe(true);
+    renderHome();
+    await screen.findAllByTestId("home-row");
+    await waitFor(() => expect(rowReads.refreshScreens).toHaveBeenCalled());
+    const lastCall = rowReads.refreshScreens.mock.calls.at(-1) as unknown[] | undefined;
+    expect(lastCall?.[0]).toEqual(["ins-parent", "ins-child"]);
   });
 });
 

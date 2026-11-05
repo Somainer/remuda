@@ -102,7 +102,14 @@ function selectHome(snapshot: HubState, prefs: SpacePrefs, nowMs: number): HomeS
     titleOf: (instanceId) => hubStore.titleOf(instanceId as Id),
     rollupOf: (instanceId) => hubStore.usageRollupOf(instanceId as Id),
     screenOf: (instanceId) => snapshot.screens[instanceId],
-    summaryOf: (instanceId) => hubStore.summaryOf(instanceId as Id),
+    // home-glance-d060 §5.3: the row body's phrase is the owner glance's one
+    // deterministic headline. The per-row journal read that used to project it
+    // is gone; the poll reads one glance instead.
+    // The working row's phrase: the glance's structured one (a running
+    // workflow and its phase, else the last assistant line), then a followed
+    // session's own summary — the same precedence as SessionList.
+    summaryOf: (instanceId) =>
+      hubStore.glancePhraseOf(instanceId as Id) ?? hubStore.summaryOf(instanceId as Id),
     eventsOf: (instanceId) => snapshot.events[instanceId],
     childLiveOf: (instanceId) => childLiveIds.has(instanceId),
     nowMs,
@@ -261,37 +268,35 @@ export const HomeList = memo(function HomeList() {
     });
   }, [branchCandidates]);
 
-  // Mirror SessionList's row hydration cadence exactly: the store projects
-  // live phrases for every rendered row, while /screen reads go to
-  // tty-attachable rows only (the store additionally skips exited/failed
-  // rows, so the phone home issues no screen traffic for dead sessions —
-  // c-mobilenew's no-/screen-500 contract).
+  // Mirror SessionList's screen hydration cadence exactly: /screen reads go to
+  // tty-attachable rows only (the store skips exited/failed rows, so the phone
+  // home issues no screen traffic for dead sessions — c-mobilenew's
+  // no-/screen-500 contract). Child rows are rendered here (nested under their
+  // parent), so they are hydrated too: r4 item 4, after mapInstance began
+  // carrying `parent` and a top-level-only filter silently starved them.
+  // home-glance-d060: the per-row JOURNAL read that used to feed each row's
+  // body is gone — the poll's one `GET /v1/owner/glance` carries every headline
+  // (home.md §5.3).
   const screenIds = useMemo(
     () =>
       instances
-        .filter((instance) => instance.parent == null && uiMode(instance) === "tty-attachable")
+        .filter((instance) => uiMode(instance) === "tty-attachable")
         .map((instance) => instance.id),
     [instances],
   );
-  const topLevelIds = useMemo(
-    () => instances.filter((instance) => instance.parent == null).map((instance) => instance.id),
-    [instances],
-  );
   const screenKey = screenIds.join(",");
-  const topKey = topLevelIds.join(",");
   useEffect(() => {
     const tick = () => {
       if (screenIds.length) void hubStore.refreshScreens(screenIds as Id[]);
-      if (topLevelIds.length) void hubStore.hydrateRowSummaries(topLevelIds as Id[]);
     };
     tick();
     const timer = window.setInterval(tick, 2500);
     return () => window.clearInterval(timer);
     // Identity-stable ids: the selection slice reuses the cached instance list
-    // while nothing row-visible changed, and the joined keys are what actually
-    // identify the hydration set.
+    // while nothing row-visible changed, and the joined key is what actually
+    // identifies the hydration set.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [screenKey, topKey]);
+  }, [screenKey]);
 
   const groups = useMemo<HomeGroup[]>(
     () =>

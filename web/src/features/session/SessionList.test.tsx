@@ -57,6 +57,12 @@ vi.mock("../../lib/store", () => ({
     refresh: vi.fn(async () => undefined),
     titleOf: (id: string) => titles[id] ?? id,
     summaryOf: (id: string) => summaries[id] ?? "",
+    // home-glance-d060: the row phrase reads the owner glance's structured
+    // phrase (never its title-falling headline), and the list mounts the
+    // shared glance poll (refcounted).
+    glanceHeadlineOf: (id: string) => headlines[id],
+    glancePhraseOf: (id: string) => phrases[id],
+    refreshGlance: () => Promise.resolve(undefined),
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: (id: string) => effortEffectiveState[id] ?? null,
@@ -82,6 +88,10 @@ const hostNames: Record<string, string> = { "host-a": "alpha", "host-b": "beta" 
 /// Per-instance live phrases projected from journal tails; empty/absent means
 /// the working row falls back to its constant sentence.
 const summaries: Record<string, string> = {};
+/// The owner glance's per-row phrase and headline (r6 item 2): the phrase is
+/// the structured one; the headline may be just the title.
+const phrases: Record<string, string> = {};
+const headlines: Record<string, string> = {};
 /// Per-instance effective-model observations the mocked store hands back
 /// (model-pin-1). Empty by default: most rows have not read one back.
 const modelEffective: Record<
@@ -147,6 +157,8 @@ beforeEach(() => {
   titles.ins_a = "spill 抖动";
   titles.ins_b = "等待批准";
   for (const key of Object.keys(summaries)) delete summaries[key];
+  for (const key of Object.keys(phrases)) delete phrases[key];
+  for (const key of Object.keys(headlines)) delete headlines[key];
   for (const key of Object.keys(runningModel)) delete runningModel[key];
   for (const key of Object.keys(effortEffectiveState)) delete effortEffectiveState[key];
 });
@@ -484,6 +496,70 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     );
 
     delete summaries.ins_a;
+  });
+
+  /**
+   * [r6 item 2] nextStep's precedence for every row kind, with the glance
+   * offering a phrase AND a title-falling headline for each row: the
+   * structured sources win (the pending interaction's summary, the workflow
+   * phase), the glance phrase only feeds a working row, and the headline is
+   * never the sentence.
+   */
+  it("keeps nextStep's precedence per row kind under the glance's phrase and headline", () => {
+    const question = {
+      ...approvalInteraction("int_q", "ins_q", "unused"),
+      kind: "question",
+      request: { kind: "question", title: "Pick a branch", fields: [{}, {}] },
+    };
+    hub.instances = [
+      session("ins_wf", { activity: known("working") }),
+      session("ins_appr", { activity: known("waiting-interaction") }),
+      session("ins_q", { activity: known("waiting-interaction") }),
+      session("ins_fail", { lastTurnError: { at: "2026-09-19T00:00:00.000Z", text: "overloaded" } }),
+      session("ins_work", { activity: known("working") }),
+      session("ins_idle"),
+    ];
+    hub.interactions = [approvalInteraction("int_a", "ins_appr", "rm -rf build"), question] as never;
+    for (const instance of hub.instances) {
+      titles[instance.id] = `title ${instance.id}`;
+      headlines[instance.id] = `title ${instance.id}`;
+      phrases[instance.id] = `assistant line ${instance.id}`;
+    }
+    phrases.ins_wf = "Workflow wf-native-demo · phase Review";
+    delete phrases.ins_work;
+    renderList();
+    const stepOf = (id: string) =>
+      screen
+        .getAllByTestId("board-card")
+        .find((card) => card.querySelector(`a[href="/s/${id}"]`))!
+        .querySelector("[data-testid='session-next-step']")?.textContent;
+    // workflow: the structured phrase, not the headline (the title).
+    expect(stepOf("ins_wf")).toBe("Workflow wf-native-demo · phase Review");
+    // approval / question: the pending request's own summary beats any phrase.
+    expect(stepOf("ins_appr")).toBe("rm -rf build");
+    expect(stepOf("ins_q")).toBe("Pick a branch · 2 题待回答");
+    // turn-failed: an idle row; the failed turn is a queue card (§4.5), and
+    // the row keeps the idle sentence, never a phrase.
+    expect(stepOf("ins_fail")).toBe("回合结束、进程仍在 · 可继续发送");
+    // working with no phrase: the constant, never the title headline.
+    expect(stepOf("ins_work")).toBe("运行中…");
+    // idle: the constant, whatever the glance says.
+    expect(stepOf("ins_idle")).toBe("回合结束、进程仍在 · 可继续发送");
+  });
+
+  it("falls back to a followed session's own summary below the glance phrase", () => {
+    hub.instances = [session("ins_a", { activity: known("working") }), session("ins_b", { activity: known("working") })];
+    summaries.ins_a = "Workflow wf_9f3 · phase compile";
+    summaries.ins_b = "stale followed phrase";
+    phrases.ins_b = "Workflow wf_b · phase Verify";
+    renderList();
+    const stepOf = (id: string) =>
+      screen
+        .getAllByTestId("board-card")
+        .find((card) => card.querySelector(`a[href="/s/${id}"]`))!
+        .querySelector("[data-testid='session-next-step']")?.textContent;
+    expect(stepOf("ins_a")).toBe("Workflow wf_9f3 · phase compile");
+    expect(stepOf("ins_b")).toBe("Workflow wf_b · phase Verify");
   });
 
   it("uses the constant working sentence when no phrase is known", () => {

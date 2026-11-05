@@ -208,6 +208,30 @@ describe("rank(): the seven ranks, newest first within a rank", () => {
     expect([...parents]).toEqual(["ins-parent"]);
   });
 
+  it("[r4 item 2] wakes a parent only for a DISPATCHED child, never for a live resume", () => {
+    const edge = { instanceId: "ins-old" as Id, runId: null, commandId: null };
+    // The Hub's D-026 shape: the resumed session is parent AND resumedFrom, and
+    // the stamp is the chain root's. Live, but nothing will come back to ins-old.
+    const resumed = session("ins-resumed", {
+      activity: known("working"),
+      parent: edge,
+      resumedFrom: "ins-old" as Id,
+      creatorOrigin: "human",
+    });
+    expect(liveChildParents([session("ins-old"), resumed]).size).toBe(0);
+    // A worker its Agent dispatched does wake it — and so does that worker's
+    // scoped respawn (parent = the dispatcher, resumedFrom = the old worker),
+    // whose inherited stamp still says `agent`.
+    const worker = session("ins-worker", {
+      activity: known("working"),
+      parent: edge,
+      creatorOrigin: "agent",
+    });
+    expect([...liveChildParents([session("ins-old"), worker])]).toEqual(["ins-old"]);
+    const resumedWorker = { ...worker, id: "ins-worker-2" as Id, resumedFrom: "ins-worker-1" as Id };
+    expect([...liveChildParents([session("ins-old"), resumedWorker])]).toEqual(["ins-old"]);
+  });
+
   it("lifts only an idle live session with a live child into awaiting-wake", () => {
     const idle = session("s", { activity: known("idle") });
     expect(rank(idle, true)).toBe("awaiting-wake");

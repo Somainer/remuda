@@ -1252,6 +1252,12 @@ pub async fn restrict_agent_routes(
                     // and the feature switch; admitting the path loosens
                     // nothing by itself.
                     || path == "/v1/interactions"
+                    // cb-search: journal search. The handler applies the
+                    // journal read predicate (`owns()`) inside the query, so
+                    // admitting the path widens nothing; the status omits
+                    // the Hub-wide counts for Agent origin.
+                    || path == "/v1/search"
+                    || path == "/v1/search/status"
                     || match lineage_read_target(path).or_else(|| glance_read_target(path)) {
                         Some(id) => agent_owns_lineage(&state, &device, id).await?,
                         None => false,

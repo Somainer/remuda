@@ -7354,6 +7354,134 @@
           "more"
         ],
         "additionalProperties": true
+      },
+      "JournalSearchHit": {
+        "additionalProperties": false,
+        "description": "One journal row that matched.",
+        "properties": {
+          "instanceId": {
+            "description": "The chapter whose journal holds the row.",
+            "type": "string"
+          },
+          "lineageId": {
+            "description": "That chapter's lineage (the first chapter's id).",
+            "type": "string"
+          },
+          "seq": {
+            "description": "The row's journal seq (decimal string).",
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "observedAt": {
+            "description": "When the Hub stored the row (RFC 3339).",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "message",
+              "tool_call",
+              "tool_result"
+            ],
+            "type": "string"
+          },
+          "role": {
+            "description": "`user` or `assistant` for a message.",
+            "type": "string"
+          },
+          "matchedBy": {
+            "description": "`fts` (bm25-ranked) or `like` (substring).",
+            "enum": [
+              "fts",
+              "like"
+            ],
+            "type": "string"
+          },
+          "snippet": {
+            "description": "At most 200 characters of the row's indexed text, secrets redacted. Untrusted data.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instanceId",
+          "lineageId",
+          "seq",
+          "observedAt",
+          "kind",
+          "matchedBy",
+          "snippet"
+        ],
+        "type": "object"
+      },
+      "JournalSearchResult": {
+        "additionalProperties": false,
+        "description": "Full-text hits best first, then substring hits newest first.",
+        "properties": {
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/JournalSearchHit"
+            },
+            "type": "array"
+          },
+          "partial": {
+            "description": "The query ran past its time budget; more rows may match.",
+            "type": "boolean"
+          },
+          "indexComplete": {
+            "description": "False while the backfill is still indexing older rows.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "hits",
+          "partial",
+          "indexComplete"
+        ],
+        "type": "object"
+      },
+      "JournalSearchStatus": {
+        "additionalProperties": false,
+        "description": "Backfill progress; the counts are Human and Bot only.",
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "running",
+              "done"
+            ],
+            "type": "string"
+          },
+          "doneAt": {
+            "type": "string"
+          },
+          "scannedRows": {
+            "description": "Journal rows the backfill has read.",
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "indexedRows": {
+            "description": "Index rows the backfill has written.",
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "docs": {
+            "description": "Index rows now.",
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "journalRows": {
+            "description": "Journal rows now.",
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "complete",
+          "state"
+        ],
+        "type": "object"
       }
     }
   },
@@ -15278,6 +15406,122 @@
           }
         }
       }
+    },
+    "/v1/search": {
+      "get": {
+        "operationId": "journalSearch",
+        "summary": "Search the journals the caller may read",
+        "description": "FTS5 MATCH hits ranked by bm25, then LIKE hits for CJK and short terms (a run of CJK characters is one token, so a two-character query hits by substring); FTS syntax in q is literal. Every whitespace-separated term must match. A hit is returned only when the caller may read that instance's journal: an Agent reads its own lineage's chapters and the instances whose parent is one of them (owns()); Human and Bot devices read every instance. The predicate is applied in the query before ranking and the limit, so foreign rows neither displace the caller's hits nor appear in any count. instance, lineage and since only narrow; outside the scope they give no hits, not 403. Indexed text is secret-redacted and bounded (tool inputs and results 2 KiB, messages 32 KiB). One query has a 1.5 s budget; past it the response is partial.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "description": "Query text: at most 8 whitespace-separated terms (all must match) and 256 characters.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this chapter (`ins_…`).",
+            "in": "query",
+            "name": "instance",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this lineage's chapters (the first chapter's `ins_…`).",
+            "in": "query",
+            "name": "lineage",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only rows observed at or after this RFC 3339 time.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Hits to return (default 20, at most 50; larger is clamped).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalSearchResult"
+                }
+              }
+            },
+            "description": "Hits"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "search"
+        ]
+      }
+    },
+    "/v1/search/status": {
+      "get": {
+        "operationId": "journalSearchStatus",
+        "summary": "Progress of the journal search backfill",
+        "description": "Whether the background backfill has indexed every journal row older than the index. The Hub-wide counts (scannedRows, indexedRows, docs, journalRows) are returned to Human and Bot devices only; an Agent gets complete, state and doneAt.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalSearchStatus"
+                }
+              }
+            },
+            "description": "Backfill status"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "search"
+        ]
+      }
     }
   },
   "servers": [
@@ -15335,6 +15579,10 @@
     {
       "name": "owner",
       "description": "The owner's notices: `remuda owner notify` and the 「告诉你」 cards (D-060 §11.5)."
+    },
+    {
+      "name": "search",
+      "description": "Journal search across the chapters a caller may read (cb-search, protocol.md §8.4)."
     }
   ]
 }

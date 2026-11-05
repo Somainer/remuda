@@ -1810,6 +1810,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search the journals the caller may read
+         * @description FTS5 MATCH hits ranked by bm25, then LIKE hits for CJK and short terms (a run of CJK characters is one token, so a two-character query hits by substring); FTS syntax in q is literal. Every whitespace-separated term must match. A hit is returned only when the caller may read that instance's journal: an Agent reads its own lineage's chapters and the instances whose parent is one of them (owns()); Human and Bot devices read every instance. The predicate is applied in the query before ranking and the limit, so foreign rows neither displace the caller's hits nor appear in any count. instance, lineage and since only narrow; outside the scope they give no hits, not 403. Indexed text is secret-redacted and bounded (tool inputs and results 2 KiB, messages 32 KiB). One query has a 1.5 s budget; past it the response is partial.
+         */
+        get: operations["journalSearch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/search/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Progress of the journal search backfill
+         * @description Whether the background backfill has indexed every journal row older than the index. The Hub-wide counts (scannedRows, indexedRows, docs, journalRows) are returned to Human and Bot devices only; an Agent gets complete, state and doneAt.
+         */
+        get: operations["journalSearchStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/supply/catalog": {
         parameters: {
             query?: never;
@@ -3105,6 +3145,51 @@ export interface components {
             instanceId: string;
             /** @description False when rows below the window floor were cut; descend with beforeSeq=fromSeq-1. */
             reachedAfterSeq: boolean;
+        };
+        /** @description One journal row that matched. */
+        JournalSearchHit: {
+            /** @description The chapter whose journal holds the row. */
+            instanceId: string;
+            /** @enum {string} */
+            kind: "message" | "tool_call" | "tool_result";
+            /** @description That chapter's lineage (the first chapter's id). */
+            lineageId: string;
+            /**
+             * @description `fts` (bm25-ranked) or `like` (substring).
+             * @enum {string}
+             */
+            matchedBy: "fts" | "like";
+            /** @description When the Hub stored the row (RFC 3339). */
+            observedAt: string;
+            /** @description `user` or `assistant` for a message. */
+            role?: string;
+            /** @description The row's journal seq (decimal string). */
+            seq: string;
+            /** @description At most 200 characters of the row's indexed text, secrets redacted. Untrusted data. */
+            snippet: string;
+        };
+        /** @description Full-text hits best first, then substring hits newest first. */
+        JournalSearchResult: {
+            hits: components["schemas"]["JournalSearchHit"][];
+            /** @description False while the backfill is still indexing older rows. */
+            indexComplete: boolean;
+            /** @description The query ran past its time budget; more rows may match. */
+            partial: boolean;
+        };
+        /** @description Backfill progress; the counts are Human and Bot only. */
+        JournalSearchStatus: {
+            complete: boolean;
+            /** @description Index rows now. */
+            docs?: string;
+            doneAt?: string;
+            /** @description Index rows the backfill has written. */
+            indexedRows?: string;
+            /** @description Journal rows now. */
+            journalRows?: string;
+            /** @description Journal rows the backfill has read. */
+            scannedRows?: string;
+            /** @enum {string} */
+            state: "pending" | "running" | "done";
         };
         /** @description One chapter of a lineage (D-057 §5). */
         LineageChapter: {
@@ -8420,6 +8505,68 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    journalSearch: {
+        parameters: {
+            query: {
+                /** @description Query text: at most 8 whitespace-separated terms (all must match) and 256 characters. */
+                q: string;
+                /** @description Only this chapter (`ins_…`). */
+                instance?: string;
+                /** @description Only this lineage's chapters (the first chapter's `ins_…`). */
+                lineage?: string;
+                /** @description Only rows observed at or after this RFC 3339 time. */
+                since?: string;
+                /** @description Hits to return (default 20, at most 50; larger is clamped). */
+                limit?: number;
+            };
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hits */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JournalSearchResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    journalSearchStatus: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Backfill status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JournalSearchStatus"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     supplyCatalog: {

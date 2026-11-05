@@ -37,7 +37,8 @@ remuda-push.workspace = true
 fancy-regex = "0.19"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite.workspace = true
+# `hooks`: the journal search query's time budget (`progress_handler`).
+rusqlite = { workspace = true, features = ["hooks"] }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 serde.workspace = true
 serde_json.workspace = true

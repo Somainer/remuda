@@ -2223,6 +2223,48 @@ export type InteractionState = ("pending" | "answer-committed" | "resolved" | "e
 
 export type JournalEvent = (Observation | (RegistryEvent & { "instanceId"?: never }));
 
+/** JournalSearchBackfillState wire values; `protocol.md` §8. */
+export type JournalSearchBackfillState = ("pending" | "running" | "done");
+
+/** One journal row that matched. */
+export type JournalSearchHit = ({
+  "instanceId": (string);
+  "kind": JournalSearchKind;
+  "lineageId": (string);
+  "matchedBy": JournalSearchMatch;
+  "observedAt": (string);
+  "role"?: (string | null);
+  "seq": U64;
+  "snippet": (string);
+  [key: string]: unknown;
+});
+
+/** JournalSearchKind wire values; `protocol.md` §8. */
+export type JournalSearchKind = ("message" | "tool_call" | "tool_result");
+
+/** JournalSearchMatch wire values; `protocol.md` §8. */
+export type JournalSearchMatch = ("fts" | "like");
+
+/** `GET /v1/search` response. */
+export type JournalSearchResult = ({
+  "hits": ((JournalSearchHit)[]);
+  "indexComplete": (boolean);
+  "partial": (boolean);
+  [key: string]: unknown;
+});
+
+/** `GET /v1/search/status` response. The counts are Hub-wide, so they are returned to Human and Bot callers only. */
+export type JournalSearchStatus = ({
+  "complete": (boolean);
+  "docs"?: (U64 | (null));
+  "doneAt"?: (string | null);
+  "indexedRows"?: (U64 | (null));
+  "journalRows"?: (U64 | (null));
+  "scannedRows"?: (U64 | (null));
+  "state": JournalSearchBackfillState;
+  [key: string]: unknown;
+});
+
 /** JournalWatermark; `protocol.md` §7.1. */
 export type JournalWatermark = ({
   "durableSeq": U64;

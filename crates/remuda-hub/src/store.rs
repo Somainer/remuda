@@ -4682,6 +4682,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![instance_id, seq, event_id, event.to_string(), now],
             )?;
+            crate::search::index_event(conn, &instance_id, seq, &event, &now)?;
             conn.execute(
                 "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
                 params![seq, now, instance_id],
@@ -4735,6 +4736,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![instance_id, seq, event_id, event.to_string(), now],
             )?;
+            crate::search::index_event(conn, &instance_id, seq, &event, &now)?;
             conn.execute(
                 "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
                 params![seq, now, instance_id],
@@ -8095,17 +8097,19 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
 /// The seen-hub rung of the `PRAGMA user_version` ladder in
 /// [`try_open_conn`] (`instance_views` + `instances.turn_end_seq`): 2 and 3
 /// are the ma-lineage ended_at backfills, 4 is the D-060 memory schema,
-/// 6 is the D-060 memory write log.
+/// 6 is the D-060 memory write log, 7 the journal search index (cb-search).
 pub(crate) const SEEN_SCHEMA_RUNG: i64 = 5;
 
 /// Top rung of the ladder; a fresh database climbs to it. Exposed to the
 /// schema tests through [`crate::store_test_support`], never used by the Hub.
-pub const SCHEMA_USER_VERSION: i64 = crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION;
+pub const SCHEMA_USER_VERSION: i64 = crate::search::SEARCH_SCHEMA_VERSION;
 
 /// One ladder, no gaps: the seen rung sits above the D-060 memory rung, which
-/// sits above the ma-lineage backfills; the memory write log is the top.
+/// sits above the ma-lineage backfills; the memory write log is next and the
+/// journal search index is the top.
 const _: () = assert!(SEEN_SCHEMA_RUNG > crate::memory::MEMORY_SCHEMA_VERSION);
-const _: () = assert!(SCHEMA_USER_VERSION > SEEN_SCHEMA_RUNG);
+const _: () = assert!(crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION > SEEN_SCHEMA_RUNG);
+const _: () = assert!(SCHEMA_USER_VERSION == crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION + 1);
 
 /// Writer-side connection opener: sets WAL, the busy timeout, and runs the
 /// schema batch below.
@@ -8617,6 +8621,15 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             "user_version",
             crate::memory::MEMORY_WRITE_LOG_SCHEMA_VERSION,
         )?;
+        tx.commit()?;
+    }
+    if schema_version < crate::search::SEARCH_SCHEMA_VERSION {
+        // cb-search: the journal search tables and triggers. No rows: the
+        // existing journal is indexed by the background backfill, so a large
+        // journal never delays boot. One transaction with the marker.
+        let tx = conn.unchecked_transaction()?;
+        crate::search::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", crate::search::SEARCH_SCHEMA_VERSION)?;
         tx.commit()?;
     }
     // Rows written before the column existed are each their own lineage.
@@ -16657,6 +16670,9 @@ fn append_loaded_event(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![instance_id, seq, event_id, event.to_string(), now],
     )?;
+    // cb-search: the row's searchable text is indexed in its own append
+    // transaction, so a new row is found immediately.
+    crate::search::index_event(conn, instance_id, seq, &event, &now)?;
     // Cards this event's terminal transition invalidates settle in the SAME
     // transaction; callers broadcast the returned settlement after commit
     // (c-cardsettle).

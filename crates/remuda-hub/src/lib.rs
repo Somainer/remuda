@@ -88,6 +88,7 @@ mod registry;
 mod restart;
 mod root_turn;
 /// The shared secret lint (memory writes, brief lint; main-agent.md §12.5).
+mod search;
 pub mod secret_lint;
 mod seen;
 mod skill_context;
@@ -2506,6 +2507,9 @@ async fn spawn_inner(
     let bootstrap_resolution = resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
+    // cb-search: index the journal rows older than the search index in the
+    // background; boot never waits for it.
+    crate::search::spawn_backfill(store.clone());
     store
         .mark_all_hosts_offline()
         .await
@@ -2822,6 +2826,7 @@ pub fn router(state: AppState) -> Router {
         .merge(projects::routes())
         .merge(tasks::routes())
         .merge(memory::routes())
+        .merge(search::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())

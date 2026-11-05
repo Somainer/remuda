@@ -1719,7 +1719,7 @@ fn restore_tx(
 
 /// FTS5 query for `terms`: each term a quoted phrase (FTS syntax in user text
 /// is data), implicitly ANDed.
-fn fts_query(terms: &[&str]) -> String {
+pub(crate) fn fts_query(terms: &[&str]) -> String {
     terms
         .iter()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
@@ -1727,7 +1727,7 @@ fn fts_query(terms: &[&str]) -> String {
         .join(" ")
 }
 
-fn like_pattern(term: &str) -> String {
+pub(crate) fn like_pattern(term: &str) -> String {
     let mut out = String::with_capacity(term.len() + 2);
     out.push('%');
     for ch in term.chars() {

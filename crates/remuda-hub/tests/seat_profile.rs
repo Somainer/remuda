@@ -783,3 +783,59 @@ async fn an_agent_create_cannot_configure_skills() -> Result<()> {
     assert_eq!(status, 400, "{body}");
     Ok(())
 }
+
+/// A launch the Node refused never started: its entity names the instance's
+/// own id as a placeholder session. An owner Resume after the fix (main-agent
+/// §3.4.2) must launch fresh from the origin spec, never `--resume` that id.
+#[tokio::test]
+async fn a_refused_launch_resumes_as_a_fresh_create_not_a_bogus_session() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host, false, capable()).await?;
+    let (lineage, _) = seat(
+        &ctx,
+        &mut node,
+        json!({"skills": ["/srv/skills/locked-kit"]}),
+    )
+    .await?;
+    node.appends.send((
+        lineage.clone(),
+        json!({"kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "instance", "entityId": lineage,
+            "revision": "3", "previousState": "preparing", "state": "failed",
+            "reasonCode": "launch refused (launch-capability-unreadable): …",
+            "evidenceEventIds": [],
+            "entity": {"id": lineage, "nativeRef": {"sessionId": {"state": "known", "value": lineage}}}
+        }}),
+    ))?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let view = ctx.get(&format!("/v1/instances/{lineage}")).await?;
+            if view["lifecycle"] == json!("failed") {
+                return anyhow::Ok(view);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    ctx.ok(&format!("/v1/instances/{lineage}/resume"), json!({}))
+        .await?;
+    let params = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (method, params) = node.frames.recv().await.context("node closed")?;
+            if method == "instance.create" || method == "instance.resume" {
+                return anyhow::Ok((method, params));
+            }
+        }
+    })
+    .await??;
+    assert_eq!(params.0, "instance.create", "{params:?}");
+    assert!(
+        params.1["spec"].get("resumeSessionId").is_none(),
+        "{params:?}"
+    );
+    assert_eq!(
+        params.1["spec"]["skills"],
+        json!(["/srv/skills/locked-kit"])
+    );
+    Ok(())
+}

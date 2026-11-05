@@ -2538,7 +2538,7 @@ pub(crate) async fn recovery_source(
     lineage: &crate::store::LineageRecord,
     current: &crate::store::InstanceRecord,
 ) -> Result<RecoverySource, HubError> {
-    if let Some(session) = current.native_session_id.clone() {
+    if let Some(session) = native_session(current) {
         return Ok(RecoverySource::Chapter(session));
     }
     let chapters = state
@@ -2553,12 +2553,24 @@ pub(crate) async fn recovery_source(
             .store
             .get_instance_read(chapter.instance_id.clone())
             .await?
-            && let Some(session) = earlier.native_session_id
+            && let Some(session) = native_session(&earlier)
         {
             return Ok(RecoverySource::Earlier(session));
         }
     }
     Ok(RecoverySource::Fresh)
+}
+
+/// The chapter's native session id, if it ever reported one. A Node names a
+/// launch that never started (its create rejected or refused, cb-seat-profile)
+/// with the instance's own id as a placeholder in its entity's `nativeRef`;
+/// that is no conversation to `--resume`, so the continuation is a fresh
+/// launch from the origin spec instead.
+fn native_session(chapter: &crate::store::InstanceRecord) -> Option<String> {
+    chapter
+        .native_session_id
+        .clone()
+        .filter(|session| *session != chapter.instance_id)
 }
 
 /// Why a successor's create could not be prepared, typed by whether retrying

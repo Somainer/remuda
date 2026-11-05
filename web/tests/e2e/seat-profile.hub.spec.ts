@@ -147,14 +147,21 @@ test.describe("desktop seat profile", () => {
     await expect(bar.getByTestId("main-resume")).toBeVisible({ timeout: 20_000 });
     await bar.getByTestId("main-resume").click();
     await expect(bar.getByTestId("main-status-chapter")).toHaveText("第 2 章", { timeout: 30_000 });
-    // The status line names chapter 2 before 恢复 navigates to its page.
-    await page.waitForURL((url) => url.pathname.startsWith("/s/") && !url.pathname.includes(firstId), {
-      timeout: 30_000,
-    });
-    const secondId = page.url().match(/\/s\/([^/]+)/)?.[1];
-    expect(secondId).toBeTruthy();
+    // Chapter 2 from the lineage record (the bar's own navigation is
+    // main-ui.hub.spec.ts's subject), then its page.
+    const chapter2 = async () => {
+      const record = await page.request.get(`/v1/lineages/${firstId}`);
+      const body = (await record.json()) as { chapters?: { instanceId: string; generation: number }[] };
+      return body.chapters?.find((chapter) => chapter.generation === 2)?.instanceId ?? "";
+    };
+    await expect.poll(chapter2, { timeout: 30_000 }).not.toBe("");
+    const secondId = await chapter2();
     expect(secondId).not.toBe(firstId);
-    created.push(secondId!);
+    created.push(secondId);
+    await page.goto(`/s/${secondId}`);
+    await expect(page.getByTestId("seat-profile").getByTestId("seat-profile-revision")).toHaveText("修订 2", {
+      timeout: 20_000,
+    });
     await expect(page.getByTestId("seat-profile").getByTestId("seat-profile-pending")).toHaveCount(0, {
       timeout: 20_000,
     });

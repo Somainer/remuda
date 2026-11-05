@@ -1013,6 +1013,8 @@ mod gate_scan {
                 "METHOD_GATE_RESOLVE_LANDING",
                 remuda_protocol::METHOD_GATE_RESOLVE_LANDING,
             ),
+            // A wake-up's check runs on its host; it writes to no pane.
+            ("METHOD_WAKE_CHECK", remuda_protocol::METHOD_WAKE_CHECK),
         ]
     };
     /// Receivers of a `.notify(` that is not a Node transport, `(file,

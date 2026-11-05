@@ -5355,6 +5355,14 @@ impl Store {
             // one that holds any grant or carries a restart policy. Plain
             // instances need none.
             let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
+            // D-062 r3 item 5: a claimed herdr pane is never a restart target
+            // (nor a grant holder): it gets no lineage row.
+            if continuity && driver == crate::herdr_claims::DRIVER {
+                return Err(StoreError::Conflict(
+                    "a claimed herdr pane has no continuity: no grants, no restart policy (D-062)"
+                        .into(),
+                ));
+            }
             if continuity {
                 let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
                 let mut origin_spec_ref = json!({

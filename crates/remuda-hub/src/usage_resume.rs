@@ -1092,6 +1092,12 @@ fn record_wait(
     turn_command: Option<String>,
     observed: OffsetDateTime,
 ) -> Result<Option<Value>, StoreError> {
+    // D-062 r3 item 5: a claimed herdr pane gets no resume row; its
+    // continuation would be Hub voice typed into a process Remuda did not
+    // start.
+    if crate::herdr_claims::claimed_row(conn, instance_id)? {
+        return Ok(None);
+    }
     let at = |at: OffsetDateTime| crate::config::rfc3339(at);
     let mut detail = json!({ "class": verdict.class.as_str() });
     if let Some(resets_at) = verdict.resets_at {
@@ -1473,6 +1479,9 @@ fn try_continue(conn: &Connection, row: &Row) -> Result<bool, StoreError> {
     let Some((host_id, lifecycle, activity, fenced_at, ended_at, auto)) = instance else {
         return finish(state::DONE, "not-live");
     };
+    if crate::herdr_claims::claimed_row(conn, &row.instance_id)? {
+        return finish(state::DONE, "claimed-pane");
+    }
     if fenced_at.is_some()
         || ended_at.is_some()
         || !matches!(lifecycle.as_str(), "ready" | "running")

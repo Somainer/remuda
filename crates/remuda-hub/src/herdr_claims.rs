@@ -72,6 +72,50 @@ pub(crate) const PANE_WRITE_OPS: &[&str] = &[
     "instance.purge",
 ];
 
+/// D-062 r3 item 5: whether `instance_id` is a claimed herdr pane, read
+/// inside a store transaction. Hub-origin input (inbox batches, usage-resume
+/// continuations, restart notices, wake runs) never reaches one: Remuda did
+/// not start its process, so Hub voice typed into it is unsafe. Each of those
+/// paths refuses a claimed target when its row is created.
+pub(crate) fn claimed_row(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM instances WHERE id = ?1 AND driver = ?2)",
+        rusqlite::params![instance_id, DRIVER],
+        |row| row.get(0),
+    )
+}
+
+/// Whether `lineage_id` holds a claimed pane (a claimed instance is its own
+/// lineage; any claimed chapter counts).
+pub(crate) fn claimed_lineage(
+    conn: &rusqlite::Connection,
+    lineage_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM instances
+                         WHERE (id = ?1 OR lineage_id = ?1) AND driver = ?2)",
+        rusqlite::params![lineage_id, DRIVER],
+        |row| row.get(0),
+    )
+}
+
+/// 409 for a Hub-origin feature asked of a claimed pane.
+pub(crate) fn takes_no_hub_input(what: &str) -> HubError {
+    HubError::Conflict(format!(
+        "a claimed external herdr pane takes no Hub-written input, so it cannot have {what} (D-062)"
+    ))
+    .with_next(
+        "claimed-pane",
+        NextStep::new(
+            action::FIX_REQUEST,
+            "drive a claimed pane yourself; Hub-written input is only for instances Remuda started",
+        ),
+    )
+}
+
 /// Hub-stamped proof, on a forwarded payload, that [`authorize_pane_write`]
 /// admitted the write. `agent_scope::stamp` strips any caller-supplied copy.
 pub(crate) const CLAIM_WRITE_MARK: &str = "claimWrite";
@@ -749,6 +793,37 @@ mod backstop {
         verify_direct(&state, "instance.send", &json!({"instanceId": "ins_other"}))
             .await
             .expect("not a claimed row");
+        // D-062 r3 item 5: a claimed row never gets continuity (a restart
+        // policy or grants), so it can never be a restart target.
+        for delegation in [
+            crate::store::InstanceDelegation {
+                restart: Some(crate::store::RestartPolicy {
+                    on_process_loss: true,
+                    max_per_hour: 3,
+                }),
+                ..Default::default()
+            },
+            crate::store::InstanceDelegation {
+                grants: vec!["address-owner".into()],
+                ..Default::default()
+            },
+        ] {
+            let refused = state
+                .store
+                .insert_instance_delegated(
+                    host.clone(),
+                    None,
+                    "claude".into(),
+                    DRIVER.into(),
+                    None,
+                    json!({"kind": "claude", "driver": DRIVER}),
+                    delegation,
+                    crate::agent_scope::CallerAuthority::internal(),
+                )
+                .await
+                .expect_err("no continuity for a claimed row");
+            assert!(refused.to_string().contains("D-062"), "{refused}");
+        }
         hub.shutdown().await;
     }
 }

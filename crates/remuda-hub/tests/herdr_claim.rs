@@ -342,6 +342,13 @@ impl Fixture {
         body
     }
 
+    /// The Hub's database, for rows written before a rule existed.
+    fn db(&self) -> Result<rusqlite::Connection> {
+        let db = rusqlite::Connection::open(self._dir.path().join("data").join("hub.sqlite"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        Ok(db)
+    }
+
     async fn audit(&self, instance_id: &str) -> Result<Vec<Value>> {
         Ok(self
             .hub
@@ -1424,6 +1431,353 @@ async fn a_detach_the_node_refused_is_queued_again_by_release() -> Result<()> {
         .await?;
     assert_eq!(third["released"], false, "{third}");
     assert_eq!(fixture.node.params_of("instance.close").len(), 2);
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+// ---- D-062 r3 item 5: Hub-origin input never reaches a claimed pane ----
+
+/// Every Node call that would put input into (or launch over) the pane.
+fn pane_inputs(node: &FakeNode) -> Vec<String> {
+    node.methods()
+        .into_iter()
+        .filter(|method| {
+            matches!(
+                method.as_str(),
+                "instance.send"
+                    | "instance.keys"
+                    | "tty.write"
+                    | "instance.resume"
+                    | "instance.create"
+                    | "lineage.fence"
+            )
+        })
+        .collect()
+}
+
+/// Hub-written `instance.send` rows queued for `id`.
+fn hub_sends_queued(fixture: &Fixture, id: &str) -> Result<i64> {
+    Ok(fixture.db()?.query_row(
+        "SELECT COUNT(*) FROM commands WHERE instance_id = ?1 AND operation = 'instance.send'
+           AND json_extract(payload_json, '$.origin') = 'hub'",
+        [id],
+        |row| row.get(0),
+    )?)
+}
+
+const LATER: &str = "2099-01-01T00:00:00.000Z";
+
+#[tokio::test]
+async fn the_gate_refuses_hub_origin_input_to_a_claimed_pane() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let store = fixture.hub.store().context("store")?;
+    // The shape of an inbox batch, a usage-resume continuation or a restart
+    // notice: Hub voice, `origin: hub`.
+    let (command, _) = store
+        .queue_command(
+            None,
+            Some(id.clone()),
+            fixture.host.clone(),
+            "instance.send".into(),
+            json!({"instanceId": id, "origin": "hub",
+                   "input": {"type": "prompt", "text": "facts", "origin": "hub"}}),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let refused = fixture
+        .hub
+        .test_handle()
+        .test_forward_command_online(&command.command_id)
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
+    let row = store
+        .get_command(command.command_id.clone())
+        .await?
+        .context("row")?;
+    assert_eq!(row.state, "settled");
+    assert!(
+        row.settlement_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("human-only")),
+        "{:?}",
+        row.settlement_reason
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_pane_is_never_an_inbox_subscriber() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let (status, body) = fixture
+        .call(
+            "PATCH",
+            &format!("/v1/lineages/{id}/inbox"),
+            &fixture.human(),
+            Some(&json!({"optIn": true})),
+        )
+        .await?;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], "claimed-pane", "{body}");
+    // An opt-in written before this rule still receives nothing: the host's
+    // offline fact goes to every opted-in lineage on it, but not this one.
+    let db = fixture.db()?;
+    db.execute(
+        "INSERT OR REPLACE INTO inbox_subscriptions (lineage_id, opt_in, muted_kinds_json, updated_at)
+         VALUES (?1, 1, '[]', '2026-01-01T00:00:00.000Z')",
+        [&id],
+    )?;
+    db.execute(
+        "INSERT OR REPLACE INTO inbox_host_links (host_id, online, changed_at, lost_at)
+         VALUES (?1, 1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        [&fixture.host],
+    )?;
+    db.execute(
+        "UPDATE hosts SET state = 'offline' WHERE id = ?1",
+        [&fixture.host],
+    )?;
+    fixture.hub.test_inbox_tick(LATER).await?;
+    fixture.hub.test_settle_inbox().await?;
+    let facts: i64 = db.query_row(
+        "SELECT COUNT(*) FROM inbox_facts WHERE subscriber_lineage_id = ?1",
+        [&id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(facts, 0, "a claimed pane records no inbox fact");
+    // A fact row left from before is never batched into the pane either.
+    db.execute(
+        "UPDATE hosts SET state = 'online' WHERE id = ?1",
+        [&fixture.host],
+    )?;
+    db.execute(
+        "INSERT INTO inbox_facts (subscriber_lineage_id, kind, dedupe_key, payload_json,
+                                  state_entered_at, created_at)
+         VALUES (?1, 'host-offline', 'left-over', '{}', '2026-01-01T00:00:00.000Z',
+                 '2026-01-01T00:00:00.000Z')",
+        [&id],
+    )?;
+    db.execute(
+        "INSERT OR IGNORE INTO inbox_deliver_due (lineage_id) VALUES (?1)",
+        [&id],
+    )?;
+    fixture.hub.test_settle_inbox().await?;
+    fixture.hub.test_settle_inbox().await?;
+    assert_eq!(hub_sends_queued(&fixture, &id)?, 0, "no batch formed");
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_pane_gets_no_usage_resume_continuation() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    let (status, body) = fixture
+        .call(
+            "PATCH",
+            &format!("/v1/instances/{id}"),
+            &fixture.human(),
+            Some(&json!({"autoContinue": true})),
+        )
+        .await?;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], "claimed-pane", "{body}");
+    // A wait row and the flag written before this rule: the reset fires,
+    // and no continuation is typed into the pane.
+    let db = fixture.db()?;
+    db.execute(
+        "UPDATE instances SET auto_continue = 1 WHERE id = ?1",
+        [&id],
+    )?;
+    db.execute(
+        "INSERT INTO resume_on_reset (instance_id, run_generation, window_id, source, resets_at,
+                                      fire_at, jitter_ms, state, created_at, updated_at)
+         VALUES (?1, 1, 'five_hour', 'structured', '2026-01-01T00:00:00.000Z',
+                 '2026-01-01T00:00:00.000Z', 0, 'waiting', '2026-01-01T00:00:00.000Z',
+                 '2026-01-01T00:00:00.000Z')",
+        [&id],
+    )?;
+    // Just after the reset (much later, the row would expire unanswered).
+    let fired = "2026-01-01T00:00:30.000Z";
+    fixture.hub.test_inbox_tick(fired).await?;
+    fixture.hub.test_settle_inbox().await?;
+    fixture.hub.test_inbox_tick(fired).await?;
+    fixture.hub.test_settle_inbox().await?;
+    let (state, reason): (String, Option<String>) = db.query_row(
+        "SELECT state, reason FROM resume_on_reset WHERE instance_id = ?1",
+        [&id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(reason.as_deref(), Some("claimed-pane"), "{state}");
+    assert_eq!(hub_sends_queued(&fixture, &id)?, 0);
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_pane_is_never_a_wake_target() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    for mode in ["persistent", "fresh"] {
+        let (status, body) = fixture
+            .call(
+                "POST",
+                &format!("/v1/lineages/{id}/wake-ups"),
+                &fixture.human(),
+                Some(
+                    &json!({"name": format!("nightly-{mode}"), "text": "Check the build.",
+                             "trigger": {"kind": "at", "afterSecs": 60}, "mode": mode,
+                             "notify": "failure"}),
+                ),
+            )
+            .await?;
+        assert_eq!(status, 409, "{mode}: {body}");
+        assert_eq!(body["reason"], "claimed-pane", "{mode}: {body}");
+    }
+    // Wake-ups written before this rule fire, and nothing reaches the pane:
+    // no batch for the persistent one, no child for the fresh one — even with
+    // an opt-in and an agent credential bound to the pane, as they could
+    // have been before.
+    let db = fixture.db()?;
+    db.execute(
+        "INSERT OR REPLACE INTO inbox_subscriptions (lineage_id, opt_in, muted_kinds_json, updated_at)
+         VALUES (?1, 1, '[]', '2026-01-01T00:00:00.000Z')",
+        [&id],
+    )?;
+    fixture
+        .hub
+        .test_mint_agent_token("hclaim-wake-agent", &id)
+        .await?;
+    for mode in ["persistent", "fresh"] {
+        db.execute(
+            "INSERT INTO wake_ups (wake_id, lineage_id, name, text, trigger_kind, trigger_json,
+                                   every_secs, check_json, mode, notify, state, next_fire_at,
+                                   missed_count, when_cursor, request_json, creator_origin,
+                                   creator_instance_id, creator_device_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'Check the build.', 'at', '{\"kind\":\"at\",\"afterSecs\":60}',
+                     NULL, NULL, ?4, 'failure', 'active', '2026-01-01T00:00:00.000Z', 0, 0, '{}',
+                     'human', NULL, 'dev_test', '2026-01-01T00:00:00.000Z',
+                     '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![format!("wak_left_{mode}"), id, format!("left-{mode}"), mode],
+        )?;
+    }
+    fixture.hub.test_wake_tick(LATER).await?;
+    fixture.hub.test_settle_inbox().await?;
+    fixture.hub.test_wake_tick(LATER).await?;
+    fixture.hub.test_settle_inbox().await?;
+    assert_eq!(hub_sends_queued(&fixture, &id)?, 0);
+    let children: i64 = db.query_row(
+        "SELECT COUNT(*) FROM instances WHERE json_extract(spec_json, '$.wakeRunId') IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(children, 0, "no fresh child on the pane's behalf");
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claimed_pane_is_never_a_restart_target() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    // The Node attests the claimed process ended (process-end evidence).
+    fixture
+        .hub
+        .store()
+        .context("store")?
+        .append_journal(
+            fixture.host.clone(),
+            id.clone(),
+            None,
+            json!({"kind":"lifecycle","observedAt":"2026-11-01T01:00:00.000Z","payload":{
+                "type":"native","topic":"session","nativeName":"session",
+                "status":{"state":"known","value":"failed"},"severity":"error",
+                "affectsCompletion":true,"relatedIds":{"exitCode":"137","signal":"KILL"}}}),
+        )
+        .await?;
+    // A restart policy written before this rule (a claim never gets one).
+    let db = fixture.db()?;
+    db.execute(
+        "INSERT INTO lineages (lineage_id, current_instance_id, generation, state, paused_by_json,
+                               paused_at, restart_json, origin_spec_ref, updated_at)
+         VALUES (?1, ?1, 1, 'running', NULL, NULL, '{\"onProcessLoss\":true,\"maxPerHour\":3}',
+                 '{\"origin\":\"human\",\"spec\":{}}', '2026-01-01T00:00:00.000Z')",
+        [&id],
+    )?;
+    let lifecycle: String = db.query_row(
+        "SELECT lifecycle FROM instances WHERE id = ?1",
+        [&id],
+        |row| row.get(0),
+    )?;
+    assert!(
+        matches!(lifecycle.as_str(), "exited" | "failed"),
+        "{lifecycle}"
+    );
+    let decided = fixture.hub.test_handle().test_supervise().await;
+    assert!(decided.is_empty(), "{decided:?}");
+    let decisions: i64 = db.query_row(
+        "SELECT COUNT(*) FROM lineage_restart_decisions WHERE failed_instance_id = ?1",
+        [&id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(decisions, 0);
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_notify_never_types_into_a_claimed_pane() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let id = claimed(&fixture).await?;
+    // Owner-notify is a push to the owner; even narrowed to the claimed
+    // instance it writes nothing to the pane.
+    let mut headers = fixture.human();
+    headers.push(("x-remuda-instance-id", id.clone()));
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/owner/notify",
+            &headers,
+            Some(&json!({"title": "Build", "body": "The nightly build failed."})),
+        )
+        .await?;
+    assert!(status < 500, "{status} {body}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(hub_sends_queued(&fixture, &id)?, 0);
+    assert!(
+        pane_inputs(&fixture.node).is_empty(),
+        "{:?}",
+        fixture.node.methods()
+    );
     fixture.hub.shutdown().await;
     Ok(())
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { known, na, unknownKnowledge, type Id } from "../../types/wire";
-import { deriveApprovalRows, type ApprovalFilters, type ApprovalSource } from "./approvalRows";
+import { approvalHeaderCounts, deriveApprovalRows, type ApprovalFilters, type ApprovalSource } from "./approvalRows";
 import { deriveInboxQueue } from "../mobile/inboxRows";
 import {
   CARRIER_LABEL,
@@ -138,6 +138,25 @@ describe("deriveApprovalRows keeps routed items (D-061)", () => {
     expect(departed).toEqual([]);
     // The owner's 「需要你」 queue holds only the owner's item.
     expect(deriveInboxQueue(s).map((q) => q.item.id)).toEqual(["itx_o"]);
+  });
+
+  it("the header counts the owner's rows like the sidebar, and names the routed ones (r2 item 2)", () => {
+    const s = source(
+      [
+        approval({ id: "itx_o", instanceId: "ins_1" }),
+        approval({ id: "itx_o2", instanceId: "ins_1", routedTo: "owner" }),
+        approval({ id: "itx_m", instanceId: "ins_1", routedTo: "main" }),
+        approval({ id: "itx_m2", instanceId: "ins_1", routedTo: "main" }),
+        approval({ id: "itx_g", instanceId: "ins_1", routedTo: "agent" }),
+      ],
+      [inst({ id: "ins_1" })],
+    );
+    const { queue } = deriveApprovalRows(s, FILTERS);
+    const counts = approvalHeaderCounts(queue);
+    expect(counts).toEqual({ owner: 2, main: 2, agent: 1 });
+    // 待处理 N is the sidebar inbox count's membership.
+    expect(counts.owner).toBe(deriveInboxQueue(s).length);
+    expect(approvalHeaderCounts([])).toEqual({ owner: 0, main: 0, agent: 0 });
   });
 
   it("the card signature changes when the routing does (the lift relabels it)", () => {

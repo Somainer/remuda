@@ -267,6 +267,8 @@ test.describe("routed-to", () => {
       const row = page.locator(`[data-testid="approval-row"][data-interaction-id="${worker.interactionId}"]`);
       await expect(row).toBeVisible({ timeout: 20_000 });
       await expect(row.getByTestId("approval-routed")).toHaveText("已转给 Main");
+      // The header counts what waits on the owner and names the routed row.
+      await expect(page.getByTestId("approvals-routed-main")).toHaveText(/已转给 Main 1$/);
     } finally {
       await cleanup(page);
     }

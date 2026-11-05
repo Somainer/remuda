@@ -4,7 +4,12 @@ import {
   type InteractionUiState,
 } from "../../lib/interactionStatus";
 import { formatClock } from "../../lib/format";
-import { deriveActiveInteractions, deriveRecentInstances, type InboxInstanceRow } from "../mobile/inboxRows";
+import {
+  deriveActiveInteractions,
+  deriveRecentInstances,
+  routedAway,
+  type InboxInstanceRow,
+} from "../mobile/inboxRows";
 import type { UsageRollup } from "../session/contextUsage";
 import type { Host, Instance, UiStatus } from "../../types/instance";
 import type { Id } from "../../types/wire";
@@ -124,6 +129,22 @@ function rowSignature(
     u: uiState,
     f: focused ? 1 : 0,
   });
+}
+
+/**
+ * The /approvals header numbers over the (chip-filtered) queue tier: `owner`
+ * is what waits on the owner — the same `deriveInboxQueue` membership the
+ * sidebar inbox count reads — and `main` / `agent` are the rows the tier
+ * keeps although they were routed away (D-061, labelled on their cards).
+ */
+export function approvalHeaderCounts(queue: readonly ApprovalRow[]): {
+  owner: number;
+  main: number;
+  agent: number;
+} {
+  const counts = { owner: 0, main: 0, agent: 0 };
+  for (const row of queue) counts[routedAway(row.item) ?? "owner"] += 1;
+  return counts;
 }
 
 export function deriveApprovalRows(

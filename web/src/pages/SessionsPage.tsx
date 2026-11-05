@@ -17,6 +17,7 @@ import { HomeQueue } from "../features/home/HomeQueue";
 import { JustDone } from "../features/home/JustDone";
 import { WorkingList } from "../features/home/WorkingList";
 import { useMainAside } from "../features/home/useMain";
+import { JournalSearch } from "../features/search/JournalSearch";
 import css from "./SessionsPage.module.css";
 
 /** The URL's `rank` list (home.md §5.2 ① tap); the list's filter model reads it. */
@@ -147,6 +148,9 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
           {/* ④ 需要你 (home.md §2.2–2.3, §4): the 2-column grid at the top
               of the main column, under the 1280 Main card; hidden while the
               list search (?q=) has text. */}
+          {/* cb-search (main-agent.md §12.7): while the list filter has
+              text, the same words can be searched inside the journals. */}
+          {!mobile && searching ? <JournalSearch query={params.get("q") ?? ""} /> : null}
           {!mobile ? <HomeQueue placement="desktop" searching={searching} /> : null}
           {/* ⑤ 刚完成 (home.md §2.2, §7): under the queue. */}
           {!mobile ? <JustDone placement="desktop" /> : null}

@@ -23,10 +23,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Default per-step wall-clock budgets (seconds). The Hub e2e name must win
-# over the generic web- prefix; scans and everything else get the 30 minute
-# outer bound as well.
+# Default per-step wall-clock budgets (seconds), first match wins. The Hub e2e
+# names must win over the generic web- prefix, and web-hub-e2e-main (the
+# opt-in Main pass, about 3 minutes) over web-hub-e2e, whose name it extends;
+# scans and everything else get the 30 minute outer bound as well.
 DEFAULT_TIMEOUTS = (
+    ("web-hub-e2e-main", 15 * 60),
     ("web-hub-e2e", 30 * 60),
     ("cargo-", 30 * 60),
     ("web-", 20 * 60),

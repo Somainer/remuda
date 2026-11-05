@@ -2205,7 +2205,7 @@ origin/main（`c27e0eac`）的首页现状：
    - 触摸、sheet、菜单和行内焦点期间不重排（home.md §3）。
 
 4. **计数口径（R4、R5、R12）。**
-   - **N = A + B。** A 是 `status=pending`、没有过期、并且（`routed-to` 之后）`routedTo=owner` 的交互数。B 是「任务待你」的张数。
+   - **N = A + B。** A 是 `status=pending`、没有过期、并且 `routedTo=owner` 的交互数（`routed-to`，home.md §5.1）。B 是「任务待你」的张数。
    - **应用图标角标 = N**，页面打开时和 PWA 关闭时用同一个口径。这一条取代 ui-spec v0.2.4 的「OS 角标与收件箱队列同源」。导航上「收件箱」的数字仍然是 A。
    - **计数行：** 手机 `需要你 · 完成未看 · 工作中`；桌面再加「今日完成」。
    - **段的取舍：** 没有真实来源的段隐藏；首个快照前每段显示「–」；已知为 0 的段省略；绝不显示一个未知的 0（ui-spec §3.3）。
@@ -2294,7 +2294,7 @@ origin/main（`c27e0eac`）的首页现状：
 | `POST /v1/owner/notices/{id}/ack` | owner 范围的确认，所有设备一起生效；幂等 | 「知道了」 | 同上 | **是**，同上 |
 | `GET /v1/lineages/{id}/wakes` | wake 列表：`wakeId`、`name`、`trigger`、`nextFireAt`（可为 null，UI 显示「—」）、`notify`、`state`、`missed` | ⑩ 定时行与「今天」卡；rank 第 4 档 | `home-wakes`（hub 部分并进 `cb-wake-engine`，或在其后另开） | **是**，D-060 `cb-wake-engine`：`remuda wake list` 的 HTTP 形状。Agent 来源按该切片的规则访问自己血缘的 wake |
 | `DELETE /v1/lineages/{id}/wakes/{wakeId}` | 取消一个 wake；幂等 | ⑩ sheet 里逐条取消 | 同上 | **是**，`remuda wake rm` |
-| `GET /v1/interactions` 每项的 `routedTo` | `"owner"` 或 `"main"`。由 Hub 按 main-agent.md §8.1 的同一路由谓词给出；approval 永远是 `"owner"` | 转给 Main 的提问不进队列、不计入角标；`with_badge` 与 `deriveInboxQueue` 也按它过滤 | `routed-to` | **否**：依赖 D-051 委托与 D-057 §8.1，不属于 D-060 |
+| `GET /v1/interactions` 每项的 `routedTo` | `"owner"` 或 `"main"`，`routed-to` 增补了 `"agent"`。唯一来源是推送决定（main-agent.md §8.1）：仍是 pending、并且有一行未 lift 的 `routed-to-running-parent` 抑制行时，血缘是 Main 的（当前章节持有 `address-owner`）为 `"main"`，是其他 Agent 上级的为 `"agent"`；其余一律 `"owner"`，包括 approval、没有抑制行、已 lift、Human 上级和 store 读取出错。lift 之后即为 `"owner"`，Main 恢复后也不回退。客户端把缺失或不认识的值当作 `"owner"`（home.md §5.1） | 转走的提问不进队列、不计入 N、角标和收件箱导航计数，在 /approvals 里标「已转给 Main」，owner 仍可作答；`with_badge` 与 `deriveInboxQueue` 也按它过滤；Main 卡显示「正在处理 N 个 worker 提问」 | `routed-to` | **否**：依赖 D-051 委托与 D-057 §8.1，不属于 D-060 |
 
 现有路由上的行为变化（不是新路由）：
 - `crates/remuda-hub/src/alerts.rs` 里交互推送的 URL 改为 `/sessions?focus=`（`home-queue`）；
@@ -2311,7 +2311,6 @@ origin/main（`c27e0eac`）的首页现状：
 - 回到前台、首次 refresh 结束之前，按钮不会因为「可能过期」被禁用。
 
 **不保证：**
-- **`routed-to` 落地之前，** 转给 Main 的 worker 提问仍然进入「需要你」，存在重复计数（home.md §10）。
 - **`seen-hub` 落地之前，** 失败卡的「知道了」只在本设备生效。
 - **前台宽限期里的点击**可能撞上并发冲突，由 409/410 显示「已在其他设备处理」。
 - **不支持 Badging API 的平台**上什么也不做，不用通知条数冒充角标。

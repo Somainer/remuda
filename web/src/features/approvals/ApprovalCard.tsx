@@ -8,6 +8,7 @@ import type { UiStatus } from "../../types/instance";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import type { InteractionUiState } from "../../lib/interactionStatus";
 import { optionAnswerFor } from "./answers";
+import { routedAway } from "../mobile/inboxRows";
 import {
   QUEUE_STATUS_TEXT,
   carrierLabel,
@@ -116,6 +117,24 @@ function StatusLine({
         {QUEUE_STATUS_TEXT[uiState]}
       </p>
     </div>
+  );
+}
+
+/** D-061: the label of an item routed away from the owner. */
+const ROUTED_LABEL = { main: "已转给 Main", agent: "已转给 agent" } as const;
+
+/**
+ * D-061: an item the Hub routed to Main (or another Agent parent) stays in
+ * /approvals and the owner may still answer it (first answer wins); the tag
+ * says who is handling it, which is also why it is not in 「需要你」.
+ */
+function RoutedTag({ item }: { item: Interaction }) {
+  const to = routedAway(item);
+  if (!to) return null;
+  return (
+    <span className={css.routedTag} data-testid="approval-routed" data-routed-to={to}>
+      {ROUTED_LABEL[to]}
+    </span>
   );
 }
 
@@ -255,6 +274,7 @@ export const DecisionCard = memo(function DecisionCard({
           / {view.workspaceLabel || "—"} / {view.instanceKind}
         </span>
         <RootTurnTag rootTurn={item.rootTurn} surface="approvals" />
+        <RoutedTag item={item} />
       </div>
 
       <StatusLine uiState={uiState} dot={statusDotOf(uiState)} />

@@ -9203,6 +9203,10 @@ JSON
             super::parse_step_marker("gate: web-hub-e2e (retried)"),
             Some(("web-hub-e2e".into(), true))
         );
+        assert_eq!(
+            super::parse_step_marker("gate: web-hub-e2e-main"),
+            Some(("web-hub-e2e-main".into(), false))
+        );
         // Detail/banner lines contain a colon and stay attributed to the step.
         assert!(super::parse_step_marker("gate: cargo-test: timed out").is_none());
         assert!(super::parse_step_marker("gate: Rust tests: remuda (full)").is_none());
@@ -9419,6 +9423,8 @@ Running 8 tests across 2 projects
             "{summary:?}"
         );
         assert!(super::extract_summary("secret-scan", &lines).is_empty());
+        // The opt-in Main pass is a Playwright step too.
+        assert_eq!(super::extract_summary("web-hub-e2e-main", &lines), summary);
     }
 
     #[test]

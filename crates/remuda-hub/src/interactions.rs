@@ -56,6 +56,9 @@ const DELEGATED_DECISIONS_FORCE_ON_ENV: &str = "REMUDA_DELEGATED_DECISIONS_FORCE
 const DELEGATED_DECISIONS_FORCE_OFF_ENV: &str = "REMUDA_DELEGATED_DECISIONS_FORCE_OFF";
 
 static DELEGATED_GLOBAL_OVERRIDE: std::sync::RwLock<Option<bool>> = std::sync::RwLock::new(None);
+/// Test seam: replaces `REMUDA_DELEGATED_DECISIONS_FORCE_OFF` while set.
+static DELEGATED_FORCE_OFF_OVERRIDE: std::sync::RwLock<Option<Vec<String>>> =
+    std::sync::RwLock::new(None);
 
 fn env_bool(name: &str) -> Option<bool> {
     let raw = std::env::var(name).ok()?;
@@ -106,10 +109,15 @@ pub(crate) fn delegated_decisions_enabled(project_id: Option<&str>) -> bool {
         .unwrap_or(None)
         .or_else(|| env_bool(DELEGATED_DECISIONS_ENV))
         .unwrap_or(false);
+    let force_off = DELEGATED_FORCE_OFF_OVERRIDE
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| env_id_list(DELEGATED_DECISIONS_FORCE_OFF_ENV));
     resolve_delegated_decisions(
         global,
         &env_id_list(DELEGATED_DECISIONS_FORCE_ON_ENV),
-        &env_id_list(DELEGATED_DECISIONS_FORCE_OFF_ENV),
+        &force_off,
         project_id,
     )
 }
@@ -620,6 +628,9 @@ pub async fn list_interactions(
     if agent_origin {
         items = delegated_visible_items(&state, &device, items).await?;
     }
+    // D-061 `routedTo`: who each item waits on, read from the push decision
+    // (D-057 §8.1), never a second routing predicate.
+    crate::push_route::stamp_routed_to(&state, &mut items).await;
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 
@@ -1197,6 +1208,12 @@ pub mod delegated_decisions_test_support {
     /// Override the global `REMUDA_DELEGATED_DECISIONS` switch in tests.
     pub fn set_global_override(value: Option<bool>) {
         *super::DELEGATED_GLOBAL_OVERRIDE.write().unwrap() = value;
+    }
+
+    /// Replace the `REMUDA_DELEGATED_DECISIONS_FORCE_OFF` project list in
+    /// tests (`None` restores the environment's).
+    pub fn set_force_off_override(projects: Option<Vec<String>>) {
+        *super::DELEGATED_FORCE_OFF_OVERRIDE.write().unwrap() = projects;
     }
 }
 

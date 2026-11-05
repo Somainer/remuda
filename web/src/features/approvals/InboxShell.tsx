@@ -27,6 +27,7 @@ import {
   DEPARTED_STATUS_TEXT,
   decisionPreview,
   decisionTitle,
+  approvalHeaderCounts,
   deriveApprovalRows,
   type ApprovalRow,
 } from "./approvalRows";
@@ -549,7 +550,9 @@ function DesktopInbox({
   );
 
   const { queue, recent, departed } = rows;
-  const pendingCount = queue.length;
+  // The header counts what waits on the owner (the sidebar inbox count's
+  // membership); the routed rows the tier keeps are named beside it (D-061).
+  const headerCounts = approvalHeaderCounts(queue);
   const filterKey = `${kind}\u0000${hostFilter}\u0000${workspaceFilter}`;
   const queueLimit = useIncrementalLimit(queue.length, { resetKey: filterKey });
   const recentLimit = useIncrementalLimit(recent.length, { resetKey: filterKey });
@@ -584,7 +587,13 @@ function DesktopInbox({
         actions={
           <span className={desktopCss.pending}>
             <span className={desktopCss.pendingDot} aria-hidden />
-            待处理 {pendingCount}
+            <span data-testid="approvals-pending-count">待处理 {headerCounts.owner}</span>
+            {headerCounts.main > 0 ? (
+              <span data-testid="approvals-routed-main"> · 已转给 Main {headerCounts.main}</span>
+            ) : null}
+            {headerCounts.agent > 0 ? (
+              <span data-testid="approvals-routed-agent"> · 已转给 agent {headerCounts.agent}</span>
+            ) : null}
           </span>
         }
       />

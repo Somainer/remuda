@@ -135,14 +135,33 @@ test.describe("desktop Main entry", () => {
     expect(cardBox && listBox && cardBox.y + cardBox.height <= listBox.y + 1).toBe(true);
     await expect(page.getByTestId("main-row")).toHaveCount(0);
     await expect(card.getByTestId("main-card-chapter")).toHaveText("第 1 章");
-    // Line 1 names a live state of the seat (the fake turn may still be open).
-    await expect(card.getByTestId("main-card-status")).toHaveText(/^(在问你|空闲|工作中|正在启动)/, { timeout: 20_000 });
+    // The fake create raises an approval and leaves it pending: Main asks.
+    await expect(card.getByTestId("main-card-status")).toHaveText(/^在问你/, { timeout: 20_000 });
 
-    const text = `main-ui ping ${Date.now()}`;
-    await card.getByTestId("composer-input").fill(text);
+    // home.md §6.3: while Main asks, the input still sends a new message (the
+    // question is answered on ④'s pinned card). A mouse click on 发送 with
+    // the input focused must land: the quick-ask chips above the input stay
+    // up through the press instead of moving 发送 out from under it.
+    const input = card.getByTestId("composer-input");
+    const asking = `main-ui ping ${Date.now()}`;
+    await input.fill(asking);
+    await expect(card.getByTestId("composer-suggestions")).toBeVisible();
     await card.getByTestId("composer-send").click();
-    await expect(card.getByTestId("main-card-reply")).toHaveText(`echo: ${text}`, { timeout: 30_000 });
+    await expect(card.getByTestId("main-card-reply")).toHaveText(`echo: ${asking}`, { timeout: 30_000 });
+    await expect(input).toHaveValue("");
     await shot(page, "main-ui-1280.png");
+
+    // Answer Main's question on its pinned ④ card; the card reads 空闲 and the
+    // same mouse send lands again.
+    const pinned = page.locator('[data-testid="home-queue-card"][data-main-asking="1"]');
+    await pinned.first().getByRole("button", { name: "允许一次" }).click();
+    await expect(pinned).toHaveCount(0, { timeout: 20_000 });
+    await expect(card.getByTestId("main-card-status")).toHaveText(/^空闲/, { timeout: 20_000 });
+    const idle = `main-ui idle ${Date.now()}`;
+    await input.fill(idle);
+    await expect(card.getByTestId("composer-suggestions")).toBeVisible();
+    await card.getByTestId("composer-send").click();
+    await expect(card.getByTestId("main-card-reply")).toHaveText(`echo: ${idle}`, { timeout: 30_000 });
   });
 
   test("1440: the card heads the right column, 工作中 follows it", async ({ page }) => {

@@ -254,8 +254,8 @@
 队列是全页唯一的「需要你」。从上到下依次是：
 
 1. **Main 在问你**：Main 现行章节上的待处理交互，置顶，只计一次（`home-main-extras`）。
-2. **其他待处理交互**：`GET /v1/interactions` 中 `status=pending` 且没有过期的项，派生规则和收件箱一样（`deriveInboxQueue`），顺序也和收件箱「待你处理」档一样。`routed-to` 落地后，`routedTo=main` 的项不进入队列（§5.1）。
-3. **任务待你**：`GET /v1/tasks` 中未归档、`blockedReason` 非空、并且它的会话都没有待处理交互的任务（§4.6）。
+2. **其他待处理交互**：`GET /v1/interactions` 中 `status=pending` 且没有过期的项，派生规则和收件箱一样（`deriveInboxQueue`），顺序也和收件箱「待你处理」档一样。`routedTo` 为 `main` 或 `agent` 的项不进入队列（§5.1）。
+3. **任务待你**：`GET /v1/tasks` 中未归档、`blockedReason` 非空、并且它的会话都没有在等 owner 的待处理交互（`routedTo=owner`）的任务（§4.6）。
 4. **告诉你**：Main 用 `remuda owner notify` 发出、还没确认的通知（D-060 决策 7）。notices 的 list 与 ack 路由和卡片已随 `cb-owner-notify` 落地（[main-agent.md §11.7](./main-agent.md#117-implementation-notes-cb-owner-notify-2026-11-03)），按创建时间新的在前。
 5. **回合失败**：`GET /v1/instances` 中带 `lastTurnError` 的实例（D-057 OA6），离开规则见 §4.5。
 
@@ -322,21 +322,29 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 
 - 首页只能有一个「需要你」，就是这个队列。台账（⑦）不再单独渲染任务层的「需要你」组（`buildHomeTaskLayer` 的 attention 组）。`/board` 和任务列表里的「需要你」组不受影响（ui-spec §2.9）。
 - 一个未归档、由 owner 阻塞的任务（`blockedReason` 非空）：
-  - 它的某个会话已经有待处理交互时，只显示那张交互卡，不显示任务卡；
-  - 它的会话都没有待处理交互时，显示一张「任务待你」卡，操作是「打开任务」。
+  - 它的某个会话已经有在等 owner 的待处理交互（`routedTo=owner`）时，只显示那张交互卡，不显示任务卡；
+  - 它的会话都没有在等 owner 的待处理交互（`routedTo=owner`）时，显示一张「任务待你」卡，操作是「打开任务」。转给 Main 或其他 agent 的交互不算（§5.1）。
 - 计数行和角标用同一套口径（§5）。
 
 ## 5 计数口径
 
 ### 5.1 「需要你」N 与应用角标
 
-**N = A + B。** A 是真正在等 owner 的交互数：`status=pending`、没有过期，并且在 `routed-to` 落地后满足 `routedTo=owner`。B 是没有对应交互的 owner 阻塞任务数（§4.6）。
+**N = A + B。** A 是真正在等 owner 的交互数：`status=pending`、没有过期，并且 `routedTo=owner`。B 是没有对应交互的 owner 阻塞任务数（§4.6）。
 
 - **Main 的提问只算一次。** 它就是 A 里的一项，不会因为同时出现在 Main 卡上而再算一次。
 - **不计入 N 的：** 完成未看、「告诉你」通知、回合失败。
-- **应用图标角标 = N。** 页面打开时由 `syncAppBadge` 设置；PWA 关闭时由推送载荷的 `badge` 字段设置（ui-spec §4.5）。所以 Hub 的 `with_badge` 计数（`alerts.rs`）也必须用这个口径：`home-queue` 把 B 加进去，`routed-to` 把 A 收窄到 `routedTo=owner`。
+- **应用图标角标 = N。** 页面打开时由 `syncAppBadge` 设置；PWA 关闭时由推送载荷的 `badge` 字段设置（ui-spec §4.5）。所以 Hub 的 `with_badge` 计数（`alerts.rs`）也用这个口径：`home-queue` 把 B 加进去，`routed-to` 把 A 收窄到 `routedTo=owner`。
 - **导航上「收件箱」的数字**（PhoneNav、桌面侧栏）仍然是收件箱队列本身，也就是 A。所以 N 减去收件箱的数字，恰好等于「任务待你」卡的张数。D-061 因此修订了 ui-spec v0.2.4「OS 角标与收件箱队列同源」：OS 角标改为 N，收件箱导航计数不变。
-- **`routed-to` 落地之前，** 按 D-051 转给 Main 的 worker 提问仍然出现在队列里，也计入 N，有重复计数的风险。§10 把这一点列为已知降级。
+- **`routedTo`（`routed-to`，D-061）。** `GET /v1/interactions` 的每一项都带 `routedTo`，由 Hub 从推送决定读出（main-agent.md §8.1），不另设第二个路由谓词：
+  - **唯一来源是推送决定。** 一项算作「转走了」，当且仅当它的 owner 推送被扣下了。`routedTo="main"` 当且仅当这一项仍是 pending，并且有一行**未 lift** 的 `push_suppressions`（规则 `routed-to-running-parent`），这一行的血缘是 Main 的，也就是当前章节持有 `address-owner` 的血缘。
+  - **非 Main 的 Agent 上级是 `"agent"`。** 未 lift 的抑制行、血缘不是 Main 的：owner 没被推送，所以这一项也不计入 owner 的数。D-061 原文只列了 `"owner" | "main"`，这是对它的增补。
+  - **其余一律是 `"owner"`：** approval、没有抑制行、抑制行已 lift、Human 上级、已经不是 pending。读 Hub store 出错时也是 `"owner"`，日志只记类别。
+  - **lift 即刻生效，并且不回退。** Main 暂停、重启或主机失联时，lift 在把推送放进 outbox 的同一个写事务里标记这一行（main-agent.md §8.3）。所以这一项在它的推送发出的那一刻进入队列，那条推送的角标已经把它算进去了。角标从不藏起一个已经推送过的项。不再抑制（§8.3），所以 Main 恢复运行之后，被 lift 的项仍是 `"owner"`；新的提问照常判定。Hub 重启时如果 D-051 开关关了（全局，或子会话的项目进了 `_FORCE_OFF`），已有的抑制行也会被 lift（`admission-revoked`，main-agent.md §8.8），因为那时 Main 既看不到也答不了它。
+  - **客户端把缺失或不认识的值当作 `"owner"`**（`web/src/features/mobile/inboxRows.ts` 的 `routedAway`），所以老 Hub 退化为今天的行为。
+  - **owner 仍然看得到。** 转走的项留在 /approvals 和会话 transcript 里（main-agent.md §8.1），卡上标「已转给 Main」或「已转给 agent」，owner 仍可以在那里作答，先到先得。它只离开「需要你」队列、N、角标和收件箱导航计数；手机收件箱的「待你处理」档也不再列它（它和队列是同一个 `deriveInboxQueue`）。
+  - **转走的项不「覆盖」它的任务。** 一个 owner 阻塞任务的会话只有转走的交互时，这个任务按 B 计，显示「任务待你」卡（§4.6）。Hub 的 `owner_queue_count` 与网页的 `ownerBlockedTasks` 用同一口径。
+  - **Hub 侧的其他计数。** owner glance（`GET /v1/owner/glance`，§5.3）的「需要你」A 也按这一规则收窄，读同一个 `push_route::routed_away`。`remuda glance` 读的是血缘 glance（`GET /v1/lineages/{id}/glance`），它的「等待」是 worker 在等某个人，包括在等 Main，不是 owner 的「需要你」，所以不收窄：转给 Main 的提问正是 Main 要在那里看到的。
 
 ### 5.2 计数行
 
@@ -420,11 +428,16 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - **发送：** 走 `POST /v1/instances/{mainId}/commands`，带 commandId（D-055 的 outbox）。
 - **结果未知时：** 用 `GET /v1/instances/{id}/commands/{commandId}` 对账，绝不自动重发。
 - **章节已被取代：** 消息发给了已被取代的章节、被拒收时，按钮变成「发送给当前 Main」，并且生成一个**新的** commandId（main-agent.md §9）。
+- **Main 在问你时：** 输入条照常发送一条**新消息**，不回答、也不禁用。Main 的问题只在 ④ 的置顶卡上回答（§4.1 第 1 类），发出的消息不会改变那条交互。
 - **血缘暂停：** 发送键变成「恢复」。
 - **Main 的主机离线：** placeholder 提示「消息会排队，主机上线后送达」。
 - **语音：** 只在 `SpeechRecognition` 或 `getUserMedia` 可用时渲染语音按钮（ui-spec §4.8）。iOS 独立 PWA 上不可用，就不渲染，不放一个点了没反应的按钮。
 - **快捷提问 chip**（`home-main-extras`）：
   - 只在输入条获得焦点时出现。候选是：谁在等我、昨晚跑完了什么、哪些卡住了、今天落地了什么。
+  - chip 行在输入框上方。焦点在输入条内移动（例如 Tab 到发送键）时 chip 保留，离开输入条才收起（`main-ui-fix`）：
+    - 按下输入条里的按钮时，输入框保持焦点，chip 行不收起；
+    - 按下输入条外的控件（例如 1280 下 Main 卡下方 ④ 的「允许一次」）时，chip 行等这次按压结束、点击送达之后才收起；
+    - 原因：chip 行在按下时收起，会把发送键或下方的卡片挪离指针，那次点击就会落空，消息或回答被静默丢掉。
   - 只有存在真实计数时，chip 才带数字（例如「谁在等我 2」）。
   - 只列出 Main 当前 grant 能回答的问题。
   - 点 chip 只把文字填进输入框，发送仍然要另点一次。
@@ -512,7 +525,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 | **今天（只用现有路由）** | ① 的需要你、工作中两段；②（没有 ★）；④（含「任务待你」，失败卡用 §4.5 的过渡规则）；⑦；⑧；推送落点与关闭态角标（`home-queue`、`home-polish`）；单行按钮 | ⑤、◉、③、⑨、⑩、今日完成 |
 | **加 seen 路由**（`seen-hub` → `seen-web`） | ⑤、◉、标为已看；失败卡改为被看过就离开 | — |
 | **加 `ma-main-ui`**（→ `home-main-card` → `home-main-extras`） | ③、⑨、桌面右栏与 ⑥、Main 提问置顶、快捷提问、交给 Main、★ | 「告诉你」卡 |
-| **加路由标记**（`routed-to`） | 转给 Main 的 worker 提问不再进入「需要你」，也不计入角标；Main 卡显示「正在处理 N 个 worker 提问」 | 在此之前全部显示，有重复计数的风险 |
+| **加路由标记**（`routed-to`） | 转给 Main 或其他 agent 的 worker 提问不再进入「需要你」，也不计入角标和收件箱导航计数，在 /approvals 里标「已转给 Main」；Main 卡显示「正在处理 N 个 worker 提问」（N 已知且大于 0 时才显示，过期时变灰，§8） | — |
 | **加 owner glance**（`cb-digest` → `home-glance-d060`） | 今日完成、headline；删除逐行读 journal 的轮询 | — |
 | **加 notices 路由**（`cb-owner-notify` → `home-to-you`） | 「告诉你」卡 | — |
 | **加 wakes 路由**（`cb-wake-engine` → `home-wakes`） | ⑩；第 4 档按 wake 判定 | — |
@@ -557,7 +570,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 - **先探测：** 正式跑 RC 之前，先用一次真实会话确认所选动作确实弹出了授权，也就是 journal 里有一条 approval 交互。把 Claude Code 版本和这条交互的种类记进证据。
 - **两个都不弹时：** 把**这一个** RC worker 改成 `manual` 模式，用 Bash 执行 `touch rc-probe`。在 brief 回复里写明理由和版本。
 - **禁止：** 在 Remuda 自己的 checkout、任何共享仓库，或者任何别人的 `.git` 里执行这些动作。
-- **交互路由：** RC 环境里要么没有 address-owner 血缘，要么 D-051 开关是关的（它是 Hub 进程环境变量，D-051）。否则 worker 的提问会转给 Main，不进入「需要你」。
+- **交互路由：** RC 环境里要么没有 address-owner 血缘，要么 D-051 开关是关的（它是 Hub 进程环境变量，D-051）。否则 worker 的提问会转给 Main（`routedTo=main`，§5.1），不进入「需要你」。`routed-to` 自己的 RC 正相反：开关打开，正是要看提问转给 Main。
 - **同一个 RC 的问题部分：** 让真实 claude worker 发一个 3 个选项的 AskUserQuestion。`auto` 模式下它走 `PreToolUse`（[askq-pretooluse-1](./evidence/askq-pretooluse-1.md)）。在 WebKit iPhone 上从 `/m` 回答之后，读 `GET /v1/instances/{id}/journal`，断言 worker 确实继续往下执行了。
 
 ## 13 计划任务与依赖
@@ -576,7 +589,7 @@ D-061 修订了 ui-spec §2.5「AskUserQuestion 不在列表里填完」：上�
 | `ma-main-ui` | D-057 Main 界面（main-agent.md §9、§15） | 见 main-agent.md §15 |
 | `home-main-card` | ③、⑨、桌面右栏、⑥ | `ma-main-ui`、`home-queue` |
 | `home-main-extras` | 快捷提问、交给 Main、★、Main 提问置顶且只计一次 | `home-main-card` |
-| `routed-to` | `GET /v1/interactions` 上的 `routedTo`；`with_badge` 只计 `routedTo=owner`；`deriveInboxQueue` 按它过滤 | D-051 委托上线、`home-main-card` |
+| `routed-to` | `GET /v1/interactions` 上的 `routedTo`（`owner`/`main`/`agent`，由推送决定读出，§5.1）；`with_badge` 只计 `routedTo=owner`；`deriveInboxQueue` 按它过滤；/approvals 标「已转给 Main」；Main 卡「正在处理 N 个 worker 提问」 | D-051 委托上线、`home-main-card`；owner glance（`home-glance-d060`）的 A 同样收窄 |
 | `home-glance-d060` | `GET /v1/owner/glance`；①、⑥ 和行改用 glance；删除逐行 journal 轮询；今日完成 | D-060 `cb-digest` |
 | `home-to-you` | notices 的 list 与 ack 路由；首页复用 D-060 的「告诉你」卡 | D-060 `cb-owner-notify` |
 | `home-wakes` | wakes 的 list 与 delete 路由；⑩ | D-060 `cb-wake-engine`、`cb-owner-notify` |

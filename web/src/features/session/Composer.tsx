@@ -289,7 +289,8 @@ export function Composer({
   const ask = variant === "ask";
   const scope = draftScope ?? instanceId;
   const [text, setText] = useState(() => readDraft(scope));
-  // home.md §6.3: the quick-ask chips appear only while the input has focus.
+  // home.md §6.3: the quick-ask chips appear once the input takes focus, and
+  // stay while focus is anywhere inside this composer (its 发送 included).
   const [inputFocused, setInputFocused] = useState(false);
   const [menu, setMenu] = useState<MenuId>(null);
   // D-042: phone options sheet (attachments / harness / permission / effort),
@@ -730,6 +731,62 @@ export function Composer({
     const timer = window.setTimeout(() => setInterrupted(false), 4000);
     return () => window.clearTimeout(timer);
   }, [interrupted]);
+
+  const chipsShown = ask && inputFocused && (suggestions?.length ?? 0) > 0;
+
+  // A press outside the composer blurs the input on the press. Hiding the
+  // chips row right then would move everything laid out below it (④'s cards
+  // under the desktop Main card) up under the pointer before the release, and
+  // that click would land on something else or nowhere. So while a pointer is
+  // down the hide waits until the press has finished (its click included),
+  // and then applies only if focus did not come back into the composer.
+  const pointerDownRef = useRef(false);
+  const cancelPendingHideRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (!ask) return;
+    const down = () => {
+      pointerDownRef.current = true;
+    };
+    const up = () => {
+      pointerDownRef.current = false;
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+      cancelPendingHideRef.current?.();
+    };
+  }, [ask]);
+  const hideChipsAfterPress = () => {
+    if (!pointerDownRef.current) {
+      setInputFocused(false);
+      return;
+    }
+    if (cancelPendingHideRef.current) return;
+    let timer = 0;
+    const released = () => {
+      // The click is dispatched in the same task as the release; a zero
+      // timeout runs after it.
+      timer = window.setTimeout(finish, 0);
+    };
+    const detach = () => {
+      window.removeEventListener("pointerup", released, true);
+      window.removeEventListener("pointercancel", released, true);
+      window.clearTimeout(timer);
+      cancelPendingHideRef.current = null;
+    };
+    const finish = () => {
+      detach();
+      if (rootRef.current?.contains(document.activeElement)) return;
+      setInputFocused(false);
+    };
+    window.addEventListener("pointerup", released, true);
+    window.addEventListener("pointercancel", released, true);
+    cancelPendingHideRef.current = detach;
+  };
 
   const canSubmit = () => {
     if (primaryOverride) return false;
@@ -1550,6 +1607,20 @@ export function Composer({
       data-model={model}
       data-variant={ask ? "ask" : undefined}
       className={ask ? `${css.composerRoot} ${css.askRoot}` : css.composerRoot}
+      onBlur={(event) => {
+        // Focus moving to another control of this composer (Tab to 发送)
+        // keeps the chips: only leaving the composer hides them.
+        if (rootRef.current?.contains(event.relatedTarget as Node | null)) return;
+        hideChipsAfterPress();
+      }}
+      onMouseDown={(event) => {
+        // The chips row sits above the input, so hiding it on the press would
+        // move 发送 out from under the pointer before the release and the
+        // click would never land (main-ui :123). While the chips show, a
+        // press on this composer's buttons keeps the textarea focused.
+        if (!chipsShown) return;
+        if ((event.target as HTMLElement).closest("button")) event.preventDefault();
+      }}
       onSubmit={(e) => {
         e.preventDefault();
         void submitPrimary();
@@ -1628,7 +1699,7 @@ export function Composer({
       {/* home.md §6.3: quick-ask chips, only while the 问 Main input focused.
           A tap fills the draft through the SAME path as typing and never
           sends; mousedown is swallowed so the textarea keeps focus. */}
-      {ask && inputFocused && suggestions && suggestions.length > 0 ? (
+      {chipsShown && suggestions ? (
         <div className={css.askChips} data-testid="composer-suggestions" role="group" aria-label="快捷提问">
           {suggestions.map((suggestion) => (
             <button
@@ -1683,7 +1754,6 @@ export function Composer({
             writeDraft(scope, e.target.value);
           }}
           onFocus={() => setInputFocused(true)}
-          onBlur={() => setInputFocused(false)}
           onPaste={(event) => {
             // Swallow the paste only when a file was actually taken: otherwise
             // plain-text pasting and the iOS caret both break.

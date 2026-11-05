@@ -31,6 +31,7 @@ mod project;
 pub(crate) mod registry;
 mod report;
 mod retire;
+mod search;
 pub mod ssh;
 pub mod table;
 mod task;
@@ -79,6 +80,7 @@ commands! {
     Land(gate::LandArgs),
     Watch(watch::WatchArgs),
     Glance(glance::GlanceArgs),
+    Search(search::SearchArgs),
     Worker(worker::WorkerArgs),
     Report(report::ReportArgs),
     Retire(retire::RetireArgs),

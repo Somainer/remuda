@@ -186,7 +186,12 @@ test.describe("phone seat profile", () => {
       await page.goto(`/s/${mainId}`);
       const panel = page.getByTestId("seat-profile");
       await expect(panel).toBeVisible({ timeout: 20_000 });
-      const saved = await putProfile(page, mainId, { expectedRevision: 0, effort: { name: "high" } });
+      // This seat names no model, so its first edit lists the candidates.
+      const saved = await putProfile(page, mainId, {
+        expectedRevision: 0,
+        effort: { name: "high" },
+        modelCandidates: ["e2e/model-a"],
+      });
       expect(saved.ok(), await saved.text()).toBe(true);
       await page.reload();
       await expect(panel.getByTestId("seat-profile-pending")).toHaveText("待下一章节生效", { timeout: 20_000 });

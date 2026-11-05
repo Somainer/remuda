@@ -1567,22 +1567,43 @@ async fn the_owners_words_are_stored_only_in_the_command_row() -> Result<()> {
     }
 
     let hits = scan_data_dir(&ctx.dir.path().join("data"), SENTINEL);
+    // The seat's own input record: the user message naming that command.
+    let input_row = |hit: &Hit| {
+        let payload: Value = hit
+            .row
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or(Value::Null);
+        hit.table.as_deref() == Some("journal")
+            && hit.row.get("instance_id") == Some(&json!(seat))
+            && payload["kind"] == "message"
+            && payload["payload"]["role"] == "user"
+            && payload["payload"]["commandId"] == json!(owner)
+    };
+    let input_rows: Vec<(Option<&Value>, Option<&Value>)> = hits
+        .iter()
+        .filter(|hit| input_row(hit))
+        .map(|hit| (hit.row.get("instance_id"), hit.row.get("seq")))
+        .collect();
+    // cb-search: the journal search index holds a redacted copy of that same
+    // row, keyed by its (instance, seq) and deleted with it; the FTS table is
+    // external content over the index rows and stores no text of its own.
+    let index_row = |hit: &Hit| {
+        hit.table.as_deref() == Some("journal_search_docs")
+            && input_rows.contains(&(hit.row.get("instance_id"), hit.row.get("seq")))
+    };
+    let index_texts: Vec<Option<&Value>> = hits
+        .iter()
+        .filter(|hit| index_row(hit))
+        .map(|hit| hit.row.get("text"))
+        .collect();
     let allowed = |hit: &Hit| match hit.table.as_deref() {
         // The owner's own command row.
         Some("commands") => hit.row.get("id") == Some(&json!(owner)),
-        // The seat's own input record: the user message naming that command.
-        Some("journal") => {
-            let payload: Value = hit
-                .row
-                .get("payload_json")
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or(Value::Null);
-            hit.row.get("instance_id") == Some(&json!(seat))
-                && payload["kind"] == "message"
-                && payload["payload"]["role"] == "user"
-                && payload["payload"]["commandId"] == json!(owner)
-        }
+        Some("journal") => input_row(hit),
+        Some("journal_search_docs") => index_row(hit),
+        Some("journal_fts") => index_texts.contains(&hit.row.get("text")),
         _ => false,
     };
     let leaks: Vec<String> = hits

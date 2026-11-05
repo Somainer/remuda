@@ -182,6 +182,16 @@ fn data_encoding_base64(bytes: &[u8]) -> String {
     out
 }
 
+/// A check every raw input write on one bridge must pass before its bytes
+/// are queued (D-062 r3 item 2: a claimed herdr pane re-verifies, at each
+/// write, that the process it claimed still runs there).
+pub trait TtyWriteGuard: Send + Sync {
+    /// `Ok` admits the write; an error drops it and is the write's error.
+    fn admit(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send + '_>>;
+}
+
 enum Backend {
     /// `ctl` carries writes/resizes into the control task; `alt_screen` is
     /// the byte-stream scanner's current DEC alt-screen reading.
@@ -205,6 +215,8 @@ struct TtySession {
     backend: Backend,
     cols: AtomicU16,
     rows: AtomicU16,
+    /// Run before every input write; `None` for Remuda-launched carriers.
+    guard: Option<Arc<dyn TtyWriteGuard>>,
 }
 
 /// Per-Node TTY bridges (one per pty-backed instance).
@@ -245,6 +257,19 @@ impl TtyRegistry {
         cols: u16,
         rows: u16,
     ) -> Result<Id, NodeError> {
+        self.start_guarded(instance_id, bridge, cols, rows, None)
+            .await
+    }
+
+    /// [`Self::start`], with a [`TtyWriteGuard`] every input write must pass.
+    pub async fn start_guarded(
+        &self,
+        instance_id: InstanceId,
+        bridge: TtyBridge,
+        cols: u16,
+        rows: u16,
+        guard: Option<Arc<dyn TtyWriteGuard>>,
+    ) -> Result<Id, NodeError> {
         self.stop(&instance_id).await;
         let stream_id = Id::new("tty")?;
         let stream_epoch = Id::new("epoch")?;
@@ -273,6 +298,7 @@ impl TtyRegistry {
                     },
                     cols: AtomicU16::new(cols),
                     rows: AtomicU16::new(rows),
+                    guard: guard.clone(),
                 });
                 spawn_herdr_pump(
                     Arc::clone(&session),
@@ -298,6 +324,7 @@ impl TtyRegistry {
                     backend: Backend::Local(Arc::clone(&local)),
                     cols: AtomicU16::new(cols),
                     rows: AtomicU16::new(rows),
+                    guard: guard.clone(),
                 });
                 spawn_local_pump(
                     Arc::clone(&session),
@@ -411,6 +438,9 @@ impl TtyRegistry {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| NodeError::InvalidRequest("instance has no TTY bridge".into()))?;
+        if let Some(guard) = &session.guard {
+            guard.admit().await?;
+        }
         match &session.backend {
             Backend::Herdr { ctl, .. } => {
                 ctl.send(Ctl::Write(bytes.to_vec()))

@@ -665,11 +665,39 @@ async fn pane_gone_ends_the_instance_with_evidence_and_never_touches_it() {
     );
 }
 
-fn sleeper() -> std::process::Child {
-    std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("stand-in process")
+/// A stand-in process, killed and reaped on drop so a failing test leaves
+/// nothing running.
+struct Sleeper(std::process::Child);
+
+impl std::ops::Deref for Sleeper {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Sleeper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn sleeper() -> Sleeper {
+    Sleeper(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stand-in process"),
+    )
 }
 
 async fn set_process(harness: &Harness, pane: &str, pid: u32, name: &str, shell: Option<u32>) {
@@ -1134,4 +1162,237 @@ async fn a_claim_files_under_the_registered_workspace_holding_the_pane() {
         .await
         .expect("resolve");
     assert_eq!(outside.remuda_workspace_id, None);
+}
+
+/// Calls in the log that write to a pane.
+fn pane_writes(harness: &Harness) -> Vec<Value> {
+    harness
+        .calls()
+        .into_iter()
+        .filter(|call| {
+            matches!(
+                call["method"].as_str(),
+                Some("pane.send_text" | "pane.send_keys" | "agent.prompt" | "terminal.input")
+            )
+        })
+        .collect()
+}
+
+/// Wait until the watcher's first probe has read the pane's process (the
+/// claim's own resolve read it once before).
+async fn wait_first_probe(harness: &Harness, pane: &str) {
+    let start = Instant::now();
+    while harness
+        .calls()
+        .iter()
+        .filter(|call| call["method"] == "pane.process_info" && touches(call, pane))
+        .count()
+        < 2
+    {
+        assert!(start.elapsed() < WAIT, "the watcher never probed {pane}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_write_right_after_the_process_is_replaced_is_dropped_and_ends_the_claim() {
+    let harness = Harness::new().await;
+    // No probe runs between the replacement and the write: the watcher
+    // probes once at claim time, then sleeps for an hour.
+    harness.node.set_herdr_claim_poll(Duration::from_secs(3600));
+    for write in ["send", "keys", "tty"] {
+        let mut agent = sleeper();
+        set_process(&harness, "w1:p2", agent.id(), "codex", None).await;
+        harness.clear_calls();
+        let id = claim_codex_on_p2(&harness).await.meta.id;
+        harness.wait_call("terminal.control", "w1:p2").await;
+        wait_first_probe(&harness, "w1:p2").await;
+        // A shell takes the pane's foreground, and at once a write arrives.
+        let mut shell = sleeper();
+        set_process(&harness, "w1:p2", shell.id(), "bash", None).await;
+        harness.clear_calls();
+        let wire = id.as_id().to_string();
+        let (method, params) = match write {
+            "send" => (
+                "instance.send",
+                json!({"instanceId": wire, "input": {"type": "prompt", "text": "rm -rf x"}, "origin": "human"}),
+            ),
+            "keys" => (
+                "instance.keys",
+                json!({"instanceId": wire, "keys": ["enter"], "origin": "human"}),
+            ),
+            _ => (
+                "tty.write",
+                json!({"instanceId": wire, "dataBase64": "eA0=", "origin": "human"}),
+            ),
+        };
+        let _ = crate::transport::hubnode::dispatch_method(&harness.node, method, params).await;
+        harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
+        let journal = harness.journal(&id);
+        assert!(journal.contains(REASON_PROCESS_GONE), "{write}: {journal}");
+        assert!(
+            journal.contains("is no longer the foreground agent"),
+            "{write}: {journal}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            pane_writes(&harness).is_empty(),
+            "{write}: a write reached the replacing process: {:?}",
+            harness.calls()
+        );
+        assert!(
+            !harness
+                .calls()
+                .iter()
+                .any(|call| call["method"] == "session.snapshot"),
+            "{write}: the write's own check ended the claim, not a probe: {:?}",
+            harness.calls()
+        );
+        for child in [&mut agent, &mut shell] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_pane_whose_process_info_fails_refuses_every_write() {
+    let harness = Harness::new().await;
+    harness.node.set_herdr_claim_poll(Duration::from_secs(3600));
+    let id = harness
+        .claim(harness.target("w1", "w1:t1", None))
+        .await
+        .expect("claim")
+        .meta
+        .id;
+    harness.wait_call("terminal.control", "w1:p1").await;
+    wait_first_probe(&harness, "w1:p1").await;
+    // The server answers, but cannot say what runs in the pane.
+    harness
+        .client()
+        .call_raw("fake.fail_pane_process", json!({"pane_id": "w1:p1"}))
+        .await
+        .expect("process info fails");
+    harness.clear_calls();
+    let wire = id.as_id().to_string();
+    let refused = crate::transport::hubnode::dispatch_method(
+        &harness.node,
+        "tty.write",
+        json!({"instanceId": wire, "dataBase64": "eA0=", "origin": "human"}),
+    )
+    .await
+    .expect_err("an unknown process takes no TTY input");
+    assert!(refused.to_string().contains("refused"), "{refused}");
+    for (method, params) in [
+        (
+            "instance.send",
+            json!({"instanceId": wire, "input": {"type": "prompt", "text": "x"}, "origin": "human"}),
+        ),
+        (
+            "instance.keys",
+            json!({"instanceId": wire, "keys": ["esc"], "origin": "human"}),
+        ),
+    ] {
+        let _ = crate::transport::hubnode::dispatch_method(&harness.node, method, params).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        pane_writes(&harness).is_empty(),
+        "a write reached a pane whose process is unknown: {:?}",
+        harness.calls()
+    );
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Ready,
+        "one refused write is not the end; the probes decide"
+    );
+}
+
+#[tokio::test]
+async fn unknown_process_info_ends_the_claim_after_consecutive_probes() {
+    for none in [false, true] {
+        let harness = Harness::new().await;
+        let id = harness
+            .claim(harness.target("w1", "w1:t1", None))
+            .await
+            .expect("claim")
+            .meta
+            .id;
+        harness
+            .client()
+            .call_raw(
+                "fake.fail_pane_process",
+                json!({"pane_id": "w1:p1", "none": none}),
+            )
+            .await
+            .expect("process info fails");
+        harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
+        let journal = harness.journal(&id);
+        assert!(journal.contains(REASON_PROCESS_UNKNOWN), "{journal}");
+        assert!(
+            journal.contains(&format!("in {UNKNOWN_PROBES_TO_END} probes in a row")),
+            "{journal}"
+        );
+        assert!(
+            !journal.contains(REASON_PANE_GONE),
+            "the pane is there: {journal}"
+        );
+        assert!(harness.destructive_calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_claim_row_with_no_recorded_process_ends_at_reattach() {
+    let harness = Harness::new().await;
+    let id = harness
+        .claim(harness.target("w1", "w1:t1", None))
+        .await
+        .expect("claim")
+        .meta
+        .id;
+    harness.wait_call("terminal.control", "w1:p1").await;
+    harness.node.shutdown().await.expect("node shutdown");
+    // A row claimed before the process identity was recorded (round 1).
+    let mut row = harness.store.get_instance(&id).expect("row");
+    row.herdr_claim.as_mut().expect("claim").process = None;
+    harness.store.remove_instance(&id).expect("remove");
+    harness.store.insert_instance(row).expect("reinsert");
+    harness.clear_calls();
+    let own_dir = harness.root.path().join("sessions/mine");
+    let restarted = node(&harness.store, harness.data.path(), &own_dir);
+    restarted.set_herdr_claim_root(harness.root.path().to_path_buf());
+    restarted
+        .reconcile_herdr()
+        .await
+        .expect("startup reconcile");
+    assert_eq!(
+        harness.store.get_instance(&id).expect("row").lifecycle,
+        InstanceLifecycle::Exited
+    );
+    let journal = harness.journal(&id);
+    assert!(journal.contains(REASON_PROCESS_UNKNOWN), "{journal}");
+    assert!(
+        journal.contains("recorded no process identity"),
+        "{journal}"
+    );
+    assert!(
+        !restarted
+            .inner
+            .instance_drivers
+            .read()
+            .await
+            .contains_key(&id),
+        "nothing to verify, so nothing is re-attached"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !harness
+            .calls()
+            .iter()
+            .any(|call| call["method"] == "terminal.control"),
+        "no bridge is opened on it: {:?}",
+        harness.calls()
+    );
+    assert!(pane_writes(&harness).is_empty());
+    assert!(harness.destructive_calls().is_empty());
 }

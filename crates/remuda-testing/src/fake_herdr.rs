@@ -1034,6 +1034,9 @@ struct State {
     /// D-062 r2: per-pane shell pid override (`fake.set_pane_process` with
     /// `shell_pid`), so a claim test can replace the pane's shell.
     pane_shell: HashMap<String, u32>,
+    /// D-062 r3: panes whose `pane.process_info` fails (`true`: answers with
+    /// no `process_info` at all) while the session snapshot still answers.
+    pane_process_failure: HashMap<String, bool>,
     /// JSONL append target recording the `env` map every `workspace.create`
     /// and `pane.split` actually received — the only place a driver test can
     /// assert on the pane environment the launch produced (the recipe's
@@ -1098,6 +1101,7 @@ impl State {
             call_log: None,
             pane_process: HashMap::new(),
             pane_shell: HashMap::new(),
+            pane_process_failure: HashMap::new(),
         }
     }
 
@@ -1451,7 +1455,24 @@ fn handle_rpc(
             if let Some(pane_id) = req.params.get("pane_id").and_then(Value::as_str) {
                 st.pane_process.remove(pane_id);
                 st.pane_shell.remove(pane_id);
+                st.pane_process_failure.remove(pane_id);
             }
+            ok()
+        }
+        // D-062 r3: `{pane_id, none?}` — `pane.process_info` for the pane
+        // fails (or, with `none: true`, answers without process info).
+        "fake.fail_pane_process" => {
+            let pane_id = req
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .ok_or(("invalid_request", "missing pane_id".to_string()))?;
+            let none = req
+                .params
+                .get("none")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            st.pane_process_failure.insert(pane_id.to_string(), none);
             ok()
         }
         "session.snapshot" => snapshot(&st),
@@ -1998,6 +2019,22 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
         .or_else(|| st.panes.keys().next().map(String::as_str))
         .ok_or(("invalid_request", "missing pane_id".into()))?
         .to_string();
+    match st.pane_process_failure.get(&pane_id) {
+        Some(true) => {
+            return serde_json::to_value(PaneProcessInfoResult {
+                kind: "pane_process_info".into(),
+                process_info: None,
+            })
+            .map_err(json_err);
+        }
+        Some(false) => {
+            return Err((
+                "internal_error",
+                format!("process info for {pane_id} is not available"),
+            ));
+        }
+        None => {}
+    }
     let foreground_processes = if let Some((pid, name)) = st.pane_process.get(&pane_id) {
         vec![PaneProcessInfoProcess {
             pid: *pid,

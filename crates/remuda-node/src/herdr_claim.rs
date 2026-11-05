@@ -47,7 +47,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -65,8 +65,15 @@ const MAX_PANES: usize = 256;
 pub const REASON_PANE_GONE: &str = "herdr-pane-gone";
 /// Reason code when the claimed process ended (process-end evidence).
 pub const REASON_PROCESS_GONE: &str = "herdr-process-gone";
+/// Reason code when herdr answers but cannot say what runs in the claimed
+/// pane for [`UNKNOWN_PROBES_TO_END`] probes in a row, or the claim recorded
+/// no process to compare with (D-062 r3 item 3): the claim fails closed.
+pub const REASON_PROCESS_UNKNOWN: &str = "herdr-process-unknown";
 /// Reason code of a release (detach; the pane keeps running).
 pub const REASON_RELEASED: &str = "released";
+/// Consecutive probes whose `pane.process_info` gives no answer (while the
+/// session snapshot does) before the claim ends.
+const UNKNOWN_PROBES_TO_END: u32 = 3;
 /// Native diagnostic carrying `lost` / `ok` contact with the herdr server.
 pub const CONTACT_EVENT: &str = "herdr_claim_contact";
 
@@ -166,8 +173,27 @@ enum Probe {
         reason: &'static str,
         evidence: String,
     },
-    /// Pane present, process alive.
+    /// The server answered but `pane.process_info` did not: nothing can be
+    /// said about the claimed process, so it is never read as alive.
+    Unknown(String),
+    /// Pane present, the claimed process still in its role.
     Alive { status: AgentStatus },
+}
+
+/// The claimed process now, against the identity recorded at claim time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Identity {
+    /// Same pid and kernel start time, still in its role (agent leader or
+    /// shell).
+    Same,
+    /// The claim is over: the process left its role, exited, or none was
+    /// recorded to compare with.
+    Ended {
+        reason: &'static str,
+        evidence: String,
+    },
+    /// `pane.process_info` failed or answered without process info.
+    Unknown(String),
 }
 
 impl DevNode {
@@ -438,7 +464,7 @@ impl DevNode {
             kind = ?resolution.kind,
             "herdr pane claimed"
         );
-        self.start_claimed(&instance_id, resolution.claim, resolution.kind, false)
+        self.start_claimed(&instance_id, resolution.claim, resolution.kind, false, 0)
             .await;
         self.inner.store.get_instance(&instance_id)
     }
@@ -486,7 +512,7 @@ impl DevNode {
                         &evidence,
                     );
                 }
-                probe @ (Probe::Alive { .. } | Probe::Unreachable(_)) => {
+                probe @ (Probe::Alive { .. } | Probe::Unreachable(_) | Probe::Unknown(_)) => {
                     tracing::info!(instance = %id.as_id(), pane = %claim.pane_id, "re-attaching claimed herdr pane");
                     // D-062 r2 item 3: a contact state journaled before the
                     // restart is stale; journal what this Node sees now, so a
@@ -502,7 +528,11 @@ impl DevNode {
                         if lost { "lost" } else { "ok" },
                         &error,
                     );
-                    self.start_claimed(&id, claim, instance.kind, lost).await;
+                    // An unknown identity re-attaches with every write
+                    // refused and counts toward the end like a live probe.
+                    let unknown = u32::from(matches!(probe, Probe::Unknown(_)));
+                    self.start_claimed(&id, claim, instance.kind, lost, unknown)
+                        .await;
                 }
             }
         }
@@ -531,6 +561,7 @@ impl DevNode {
         claim: HerdrClaim,
         kind: AgentKind,
         contact_lost: bool,
+        unknown_probes: u32,
     ) {
         let poll = self
             .inner
@@ -556,6 +587,7 @@ impl DevNode {
             detached: AtomicBool::new(false),
             gone: AtomicBool::new(false),
             contact_lost: AtomicBool::new(contact_lost),
+            unknown_probes: AtomicU32::new(unknown_probes),
             watcher: std::sync::Mutex::new(None),
         });
         let handle = pane.spawn_watcher();
@@ -570,9 +602,13 @@ impl DevNode {
         // the pane's current size so claiming never reflows the human's
         // terminal; a PWA viewer resizes it like any herdr client later.
         let (cols, rows) = pane_geometry(&pane.client(), &pane.claim.pane_id).await;
+        // D-062 r3 item 2: every raw input write re-checks the claimed
+        // process first (the guard holds the pane weakly: no cycle through
+        // the registry).
+        let guard: Arc<dyn crate::TtyWriteGuard> = Arc::new(ClaimWriteGuard(Arc::downgrade(&pane)));
         if let Err(error) = self
             .tty()
-            .start(id.clone(), pane.bridge(), cols, rows)
+            .start_guarded(id.clone(), pane.bridge(), cols, rows, Some(guard))
             .await
         {
             tracing::warn!(%error, instance = %id.as_id(), "claimed pane tty bridge failed to start");
@@ -731,6 +767,8 @@ pub(crate) struct ClaimedPane {
     detached: AtomicBool,
     gone: AtomicBool,
     contact_lost: AtomicBool,
+    /// Consecutive probes with no process info (D-062 r3 item 3).
+    unknown_probes: AtomicU32,
     watcher: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
@@ -784,22 +822,25 @@ impl ClaimedPane {
                     }
                 }
                 Probe::Gone { reason, evidence } => {
-                    if self.detached.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    self.gone.store(true, Ordering::SeqCst);
-                    tracing::info!(instance = %self.instance_id.as_id(), reason, "claimed herdr pane ended");
-                    end_claim(
-                        self.store.as_ref(),
-                        &self.instance_id,
-                        &self.claim.pane_id,
-                        reason,
-                        &evidence,
-                    );
-                    self.tty.stop(&self.instance_id).await;
+                    self.end(reason, &evidence).await;
                     return;
                 }
+                Probe::Unknown(error) => {
+                    let streak = self.unknown_probes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if streak == 1 {
+                        tracing::warn!(instance = %self.instance_id.as_id(), pane = %self.claim.pane_id, "claimed pane's process is unknown; writes refused");
+                    }
+                    if streak >= UNKNOWN_PROBES_TO_END {
+                        let evidence = format!(
+                            "herdr answered but reported no process for pane {} in {streak} probes in a row ({error}); the claim cannot be verified",
+                            self.claim.pane_id
+                        );
+                        self.end(REASON_PROCESS_UNKNOWN, &evidence).await;
+                        return;
+                    }
+                }
                 Probe::Alive { status } => {
+                    self.unknown_probes.store(0, Ordering::SeqCst);
                     if self.contact_lost.swap(false, Ordering::SeqCst) {
                         tracing::info!(instance = %self.instance_id.as_id(), "claimed herdr server answers again");
                         journal_contact(
@@ -839,7 +880,52 @@ impl ClaimedPane {
         Some(agent.agent.agent_status)
     }
 
+    /// D-062 r3 item 2: the gate in front of every write to the pane. It
+    /// re-reads `pane.process_info` and the kernel start time NOW and compares
+    /// them with the recorded identity, so a write in the window between two
+    /// probes never reaches a process that replaced the claimed one. A
+    /// replaced process ends the claim and the write is dropped; an unknown
+    /// one refuses the write.
+    async fn admit_write(&self) -> Result<(), DriverError> {
+        self.ensure_attached()?;
+        match identity(&self.client(), &self.claim, self.kind).await {
+            Identity::Same => Ok(()),
+            Identity::Ended { reason, evidence } => {
+                self.end(reason, &evidence).await;
+                Err(claim_failure(format!(
+                    "claimed pane write dropped; the claim ended: {evidence}"
+                )))
+            }
+            Identity::Unknown(error) => Err(claim_failure(format!(
+                "claimed pane write refused: herdr cannot say what runs in pane {} ({error})",
+                self.claim.pane_id
+            ))),
+        }
+    }
+
+    /// End the claim with process-end evidence: journal it, settle the row
+    /// `exited`, stop the bridge and the watcher. Once; never after a
+    /// release; never touches the pane.
+    async fn end(&self, reason: &'static str, evidence: &str) {
+        if self.detached.load(Ordering::SeqCst) || self.gone.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::info!(instance = %self.instance_id.as_id(), reason, "claimed herdr pane ended");
+        end_claim(
+            self.store.as_ref(),
+            &self.instance_id,
+            &self.claim.pane_id,
+            reason,
+            evidence,
+        );
+        self.tty.stop(&self.instance_id).await;
+        // Last: when the watcher itself ends the claim this aborts its own
+        // task, which then returns.
+        self.stop_watcher();
+    }
+
     async fn send_prompt(&self, prompt: String) -> Result<(), DriverError> {
+        self.admit_write().await?;
         let client = self.client();
         if self.agent_status().await.is_some() {
             client
@@ -864,6 +950,7 @@ impl ClaimedPane {
     }
 
     async fn send_keys(&self, keys: Vec<String>) -> Result<(), DriverError> {
+        self.admit_write().await?;
         self.client()
             .pane_send_keys(&self.claim.pane_id, keys)
             .await
@@ -985,10 +1072,13 @@ impl Driver for ClaimedPane {
         })
     }
 
+    /// Never handed out: the claim's only bridge is the guarded one
+    /// [`DevNode::start_claimed`] opens, whose every input write re-checks the
+    /// claimed process. An unguarded bridge would skip that check.
     fn tty_bridge(
         &self,
     ) -> Pin<Box<dyn Future<Output = Option<remuda_driver::TtyBridge>> + Send + '_>> {
-        Box::pin(async move { self.ensure_attached().ok().map(|()| self.bridge()) })
+        Box::pin(std::future::ready(None))
     }
 
     fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
@@ -1003,6 +1093,23 @@ impl Driver for ClaimedPane {
         >,
     > {
         Box::pin(async move { self.screen().await })
+    }
+}
+
+/// The claimed bridge's [`crate::TtyWriteGuard`]: [`ClaimedPane::admit_write`]
+/// before every raw input write.
+struct ClaimWriteGuard(std::sync::Weak<ClaimedPane>);
+
+impl crate::TtyWriteGuard for ClaimWriteGuard {
+    fn admit(&self) -> Pin<Box<dyn Future<Output = Result<(), NodeError>> + Send + '_>> {
+        Box::pin(async move {
+            let Some(pane) = self.0.upgrade() else {
+                return Err(NodeError::DriverUnavailable);
+            };
+            pane.admit_write()
+                .await
+                .map_err(|error| NodeError::Driver(error.to_string()))
+        })
     }
 }
 
@@ -1180,43 +1287,73 @@ async fn probe(client: &Client, claim: &HerdrClaim, kind: AgentKind) -> Probe {
         .iter()
         .find(|agent| agent.pane_id == claim.pane_id)
         .map_or(pane.agent_status, |agent| agent.agent_status);
-    if let Some(process) = &claim.process
-        && let Ok(result) = client.pane_process_info(Some(claim.pane_id.clone())).await
-        && let Some(info) = result.process_info
-    {
-        let now = current_claimed_pid(&info, kind);
-        let ticks = now.and_then(kernel_start_ticks);
-        if !same_process(process, now, ticks) {
-            let role = if kind == AgentKind::Terminal {
-                "shell"
-            } else {
-                "foreground agent"
-            };
-            let evidence = match now {
-                Some(pid) if pid == process.pid && ticks.is_none() => format!(
-                    "process {} (pid {}) in pane {} has exited",
-                    process.command, process.pid, claim.pane_id
-                ),
-                Some(pid) if pid == process.pid => format!(
-                    "pid {} in pane {} was reused by another process (start time changed)",
-                    process.pid, claim.pane_id
-                ),
-                Some(pid) => format!(
-                    "the claimed {} (pid {}) is no longer the {role} of pane {}: pid {pid} is",
-                    process.command, process.pid, claim.pane_id
-                ),
-                None => format!(
-                    "the claimed {} (pid {}) left pane {}; it has no {role} now",
-                    process.command, process.pid, claim.pane_id
-                ),
-            };
-            return Probe::Gone {
-                reason: REASON_PROCESS_GONE,
-                evidence,
-            };
-        }
+    match identity(client, claim, kind).await {
+        Identity::Same => Probe::Alive { status },
+        Identity::Ended { reason, evidence } => Probe::Gone { reason, evidence },
+        Identity::Unknown(error) => Probe::Unknown(error),
     }
-    Probe::Alive { status }
+}
+
+/// D-062 r2/r3: compare the process now in the claimed role (agent leader or
+/// shell) with the recorded pid and kernel start time. Used by every probe
+/// and before every write.
+async fn identity(client: &Client, claim: &HerdrClaim, kind: AgentKind) -> Identity {
+    let Some(process) = &claim.process else {
+        // Round-1 data: nothing to compare with, so nothing is ever verified.
+        return Identity::Ended {
+            reason: REASON_PROCESS_UNKNOWN,
+            evidence: format!(
+                "the claim on pane {} recorded no process identity; claim the pane again",
+                claim.pane_id
+            ),
+        };
+    };
+    let info = match client.pane_process_info(Some(claim.pane_id.clone())).await {
+        Ok(result) => match result.process_info {
+            Some(info) => info,
+            None => {
+                return Identity::Unknown(format!(
+                    "pane.process_info reported nothing for pane {}",
+                    claim.pane_id
+                ));
+            }
+        },
+        Err(error) => {
+            return Identity::Unknown(format!("pane.process_info failed: {}", short_error(&error)));
+        }
+    };
+    let now = current_claimed_pid(&info, kind);
+    let ticks = now.and_then(kernel_start_ticks);
+    if same_process(process, now, ticks) {
+        return Identity::Same;
+    }
+    let role = if kind == AgentKind::Terminal {
+        "shell"
+    } else {
+        "foreground agent"
+    };
+    let evidence = match now {
+        Some(pid) if pid == process.pid && ticks.is_none() => format!(
+            "process {} (pid {}) in pane {} has exited",
+            process.command, process.pid, claim.pane_id
+        ),
+        Some(pid) if pid == process.pid => format!(
+            "pid {} in pane {} was reused by another process (start time changed)",
+            process.pid, claim.pane_id
+        ),
+        Some(pid) => format!(
+            "the claimed {} (pid {}) is no longer the {role} of pane {}: pid {pid} is",
+            process.command, process.pid, claim.pane_id
+        ),
+        None => format!(
+            "the claimed {} (pid {}) left pane {}; it has no {role} now",
+            process.command, process.pid, claim.pane_id
+        ),
+    };
+    Identity::Ended {
+        reason: REASON_PROCESS_GONE,
+        evidence,
+    }
 }
 
 /// Journal process-end evidence and settle the instance `exited`. The pane is
@@ -1498,12 +1635,20 @@ fn unreachable_error(addr: &SessionAddr, error: &remuda_herdr::Error) -> NodeErr
 /// A claimed pane's failure, worded so the Node's own carrier recovery never
 /// mistakes it for loss of the Node's session (`carrier_recovery::is_carrier_loss`).
 fn pane_error(call: &str, error: &remuda_herdr::Error) -> DriverError {
-    let text = short_error(error)
+    claim_failure(format!(
+        "claimed pane {call} failed: {}",
+        short_error(error)
+    ))
+}
+
+/// A claim's driver failure, worded the same way as [`pane_error`].
+fn claim_failure(text: String) -> DriverError {
+    let text = text
         .replace(remuda_herdr::SERVER_UNAVAILABLE, "not answering")
         .replace("server is shutting down", "stopping")
         .replace("carrier unavailable", "unavailable")
         .replace("herdr unreachable", "unreachable");
-    DriverError::Failed(format!("claimed pane {call} failed: {text}"))
+    DriverError::Failed(text)
 }
 
 fn short_error(error: &remuda_herdr::Error) -> String {

@@ -73,8 +73,13 @@ export function SeatProfilePanel({
   }
 
   const profile = view.profile ?? null;
-  const unavailable = view.lastLaunch?.payload.unavailable ?? [];
-  const refusal = view.lastLaunch?.payload.refusal ?? null;
+  // r2 item 5: a chapter that failed before materialisation has no snapshot
+  // of its own; the newest one is then an earlier chapter's and is labelled
+  // so, never shown as this chapter's launch.
+  const lastLaunch = view.lastLaunch ?? null;
+  const ownLaunch = lastLaunch !== null && lastLaunch.instanceId === view.liveChapter.instanceId;
+  const unavailable = lastLaunch?.payload.unavailable ?? [];
+  const refusal = lastLaunch?.payload.refusal ?? null;
   const models = profile?.modelCandidates ?? [];
 
   const startEdit = () => {
@@ -134,7 +139,12 @@ export function SeatProfilePanel({
             待下一章节生效
           </span>
         ) : null}
-        {unavailable.length > 0 ? (
+        {lastLaunch !== null && !ownLaunch ? (
+          <span className={css.item} data-testid="seat-profile-no-snapshot">
+            本章没有启动快照
+          </span>
+        ) : null}
+        {ownLaunch && unavailable.length > 0 ? (
           <span className={css.item} data-tone="attention" data-testid="seat-profile-unavailable-count">
             上次启动 {unavailable.length} 项不可用
           </span>
@@ -189,6 +199,11 @@ export function SeatProfilePanel({
 
       {unavailable.length > 0 ? (
         <ul className={css.unavailable} data-testid="seat-profile-unavailable">
+          {!ownLaunch && lastLaunch ? (
+            <li className={css.earlier} data-testid="seat-profile-earlier">
+              上一章（第 {lastLaunch.generation} 章）的启动快照：
+            </li>
+          ) : null}
           {unavailable.map((item) => (
             <li key={`${item.class}:${item.name}`}>
               {CLASS_LABEL[item.class] ?? item.class} <code>{item.name}</code>：

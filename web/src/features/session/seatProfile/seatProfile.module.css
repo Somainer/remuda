@@ -112,6 +112,12 @@
   font-family: var(--font-mono);
 }
 
+.earlier {
+  list-style: none;
+  margin-left: calc(-1 * var(--space-4));
+  color: var(--fg-muted);
+}
+
 .refused {
   color: var(--danger-fg);
 }

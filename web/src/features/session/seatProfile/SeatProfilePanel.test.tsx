@@ -154,4 +154,32 @@ describe("SeatProfilePanel", () => {
     expect(bodyOf(initial, initial, 0)).toEqual({ expectedRevision: 0 });
     expect(bodyOf({ ...initial, role: "  lead  " }, initial, 0)).toEqual({ expectedRevision: 0, role: "lead" });
   });
+  it("labels an earlier chapter's snapshot, never as this chapter's launch", async () => {
+    getSeatProfile.mockResolvedValueOnce(
+      view({
+        liveChapter: { instanceId: "ins_c3", generation: 3, appliedRevision: 2 },
+        lastLaunch: {
+          instanceId: "ins_c2",
+          generation: 2,
+          payload: {
+            launch: "create",
+            harness: "claude",
+            driver: "claude-sdk",
+            profileRevision: "2",
+            configured: [],
+            resolved: [],
+            skipped: [],
+            removed: [],
+            unavailable: [{ class: "skill", name: "review-kit", reason: "missing" }],
+            refusal: null,
+          },
+        },
+      }),
+    );
+    renderPanel("ins_c3");
+    expect(await screen.findByTestId("seat-profile-no-snapshot")).toHaveTextContent("本章没有启动快照");
+    expect(screen.queryByTestId("seat-profile-unavailable-count")).toBeNull();
+    expect(screen.getByTestId("seat-profile-earlier")).toHaveTextContent("上一章（第 2 章）的启动快照");
+    expect(screen.getByTestId("seat-profile-unavailable")).toHaveTextContent("技能 review-kit：不存在");
+  });
 });

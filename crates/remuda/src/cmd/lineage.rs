@@ -307,10 +307,22 @@ fn render(view: &Value) -> String {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if unavailable.is_empty() {
-            out.push_str("last launch: nothing unavailable\n");
+        // A chapter that failed before materialisation has no snapshot of
+        // its own: the newest one is an earlier chapter's, and says so.
+        let own = launch["instanceId"] == view["liveChapter"]["instanceId"];
+        let label = if own {
+            "last launch".to_owned()
         } else {
-            out.push_str("last launch, unavailable:\n");
+            out.push_str("this chapter has no launch snapshot (本章没有启动快照)\n");
+            format!(
+                "previous chapter (generation {}, 上一章)",
+                launch["generation"]
+            )
+        };
+        if unavailable.is_empty() {
+            out.push_str(&format!("{label}: nothing unavailable\n"));
+        } else {
+            out.push_str(&format!("{label}, unavailable:\n"));
             for item in unavailable {
                 out.push_str(&format!(
                     "  {} {}: {}\n",
@@ -414,5 +426,24 @@ mod tests {
         assert!(text.contains("待下一章节生效"), "{text}");
         assert!(text.contains("skill kit: unreadable"), "{text}");
         assert!(text.contains("applied revision 1"), "{text}");
+    }
+
+    #[test]
+    fn show_labels_an_earlier_chapters_snapshot() {
+        let text = render(&json!({
+            "lineageId": "ins_x",
+            "profile": null,
+            "liveChapter": {"instanceId": "ins_c3", "generation": 3, "appliedRevision": null},
+            "pending": false,
+            "lastLaunch": {"instanceId": "ins_c2", "generation": 2, "payload": {
+                "unavailable": [{"class": "skill", "name": "kit", "reason": "missing"}],
+                "refusal": null}}
+        }));
+        assert!(text.contains("本章没有启动快照"), "{text}");
+        assert!(
+            text.contains("previous chapter (generation 2, 上一章), unavailable:"),
+            "{text}"
+        );
+        assert!(!text.contains("last launch"), "{text}");
     }
 }

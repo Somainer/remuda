@@ -346,7 +346,14 @@ fn read_target(path: &str) -> Option<&str> {
         // ap-command-read: the command ledger, so an Agent reconciles a send
         // by its commandId (D-055) instead of re-sending it.
         Some("commands") => true,
-        Some(suffix) => suffix.strip_prefix("commands/").is_some_and(one_segment),
+        Some(suffix) => {
+            suffix.strip_prefix("commands/").is_some_and(one_segment)
+                // ap-subagent-read: a subagent's transcript.
+                || suffix
+                    .strip_prefix("subagents/")
+                    .and_then(|rest| rest.strip_suffix("/transcript"))
+                    .is_some_and(one_segment)
+        }
     };
     (!id.is_empty() && admitted).then_some(id)
 }
@@ -1568,6 +1575,22 @@ mod tests {
                 admission(method.clone(), path),
                 AgentRouteAdmission::Refused,
                 "{method} {path}"
+            );
+        }
+        // ap-subagent-read: a subagent's transcript under an owned instance.
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/subagents/a1b2/transcript"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        for path in [
+            "/v1/instances/ins_1/subagents//transcript",
+            "/v1/instances/ins_1/subagents/a/b/transcript",
+            "/v1/instances/ins_1/subagents/a1b2",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Refused,
+                "{path}"
             );
         }
         assert_eq!(

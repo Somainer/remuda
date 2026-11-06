@@ -101,7 +101,7 @@ Two limits recur below:
 | Send keys from the key bar | commands, `instance.keys` | Safety. Keystrokes | — |
 | Type into the terminal | `/v1/follow?tty=1` | Safety. Keystrokes: the socket is not admitted for Agents, and `tty.write` always needs the D-017 approval | — |
 | See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/diff`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
-| Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Gap. Refused by `read_target`, as for command reads, though the handler re-checks ownership | `ap-subagent-read` |
+| Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Agent route. Owned targets (`owns()`), checked again by the handler (`require_instance_read`) | — |
 | See Main's seat profile, its pending badge and the last launch snapshot (cb-seat-profile, D-063) | `GET /v1/lineages/{id}/profile` | Agent route. The caller's own lineage only (the seat reads its own profile and model candidates; main-agent.md §3.4.2) | — |
 | Edit Main's seat profile (identity, model candidates, effort, permission mode, skills) | `PUT /v1/lineages/{id}/profile` with `expectedRevision` | Safety. Delegation never widens authority: the profile holds the permission mode its next chapter launches with, so only an unnarrowed Human edits it; an Agent (the seat itself included) gets 403 `profile-human-only` (OA1, OA2) | — |
 
@@ -396,7 +396,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
-| `ap-subagent-read` | a subagent's transcript |
 | `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |
 | `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |

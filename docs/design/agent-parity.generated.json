@@ -281,7 +281,8 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/subagents/{agentId}/transcript",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {

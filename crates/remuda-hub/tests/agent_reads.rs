@@ -1,11 +1,13 @@
-//! ap-command-read: the command reads an Agent makes on an instance it owns.
+//! ap-command-read and ap-subagent-read: the per-instance reads an Agent makes
+//! on an instance it owns.
 //!
 //! Each newly admitted route is read by an Agent for its own instance and its
 //! direct child (200), and refused for a sibling in the same project and for
 //! an instance in another project (the middleware's `agent-route` 403, as for
 //! every other per-instance read). A plain Human reads all of them, and a
 //! Human token narrowed to the parent with `x-remuda-instance-id` gets exactly
-//! the Agent's answers. Instances are store-inserted.
+//! the Agent's answers. Instances are store-inserted; the one Node read (the
+//! subagent transcript) is answered by a scripted transport.
 
 use anyhow::{Context, Result};
 use remuda_hub::{HubConfig, spawn};
@@ -258,4 +260,27 @@ async fn an_agent_reads_the_commands_of_what_it_owns_only() -> Result<()> {
         .await?;
     assert_eq!(reply.status, 404, "{}", reply.body);
     Ok(())
+}
+
+#[tokio::test]
+async fn an_agent_reads_the_subagent_transcripts_of_what_it_owns_only() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let family = family(&ctx).await?;
+    ctx.hub
+        .test_set_node_reply(
+            &ctx.host,
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": { "agentId": "a1b2", "available": true, "events": [] }
+            })),
+        )
+        .await;
+    assert_owned_reads(
+        &ctx,
+        &family,
+        |target| vec![format!("/v1/instances/{target}/subagents/a1b2/transcript")],
+        |_, body| assert_eq!(body["available"], true, "{body}"),
+    )
+    .await
 }

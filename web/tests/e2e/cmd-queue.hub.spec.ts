@@ -20,7 +20,7 @@ import { login } from "./hub-auth";
  *
  * The sentinels exist only in the fake Node, so the file self-skips without
  * HUB_E2E_FAKE_NODE=1. The gate's `web-hub-e2e-main` step sets it: this spec
- * is in FAKE_NODE_SPECS of web/scripts/e2e-hub-main.mjs
+ * is in the `fake-node` group of web/scripts/e2e-hub-main.mjs
  * (`pnpm run test:e2e:hub:main`); the main `test:e2e:hub` pass skips it.
  */
 

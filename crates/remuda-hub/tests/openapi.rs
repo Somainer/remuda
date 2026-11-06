@@ -1,6 +1,6 @@
 //! Assert the hand-maintained OpenAPI 3.1 document covers Hub HTTP routes.
 //!
-//! Source: `crates/remuda-hub/src/*.rs` `.route(` / `nest_service("/push"` registrations.
+//! Source: `crates/remuda-hub/src/**/*.rs` `.route(` / `nest_service("/push"` registrations.
 //!
 //! The scan carries the HTTP **method** as well as the path, and the
 //! `CommandRecord` schema is diffed against the struct as it actually
@@ -107,12 +107,15 @@ fn split_top_args(inside: &str) -> Vec<&str> {
 /// still seen).
 fn source_routes() -> BTreeSet<(String, String)> {
     // Discover feature modules so registering a route never needs a second
-    // registration in this test. Skip inline test fixtures below #[cfg(test)].
-    let files = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .map(|path| std::fs::read_to_string(path).unwrap());
+    // registration in this test. The walk is recursive: nested modules such
+    // as `src/bot/mod.rs` register routes too. Skip inline test fixtures below
+    // #[cfg(test)].
+    let files = rust_sources(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    )))
+    .into_iter()
+    .map(|path| std::fs::read_to_string(path).unwrap());
     let mut routes = BTreeSet::new();
     for src in files {
         let src = src.split("#[cfg(test)]").next().unwrap();
@@ -159,6 +162,24 @@ fn source_routes() -> BTreeSet<(String, String)> {
         }
     }
     routes
+}
+
+/// Every `.rs` file under `dir`, recursively, in a stable order.
+fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            files.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+    files
 }
 
 fn ident_char(b: u8) -> bool {

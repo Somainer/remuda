@@ -755,11 +755,12 @@ async fn a_different_program_in_the_claimed_pane_ends_the_claim() {
         (agent.id(), "codex")
     );
     assert!(recorded.start_ticks.is_some());
-    // A different program takes the pane's foreground, and the agent exits.
+    // A different program takes the pane's foreground. The agent stays alive
+    // until the claim has ended: a watcher probe already in flight may have
+    // read the old pid from herdr, and if the agent died before it read the
+    // pid's start time it would rightly journal "has exited" instead.
     let mut other = sleeper();
     set_process(&harness, "w1:p2", other.id(), "vim", None).await;
-    agent.kill().expect("agent exits");
-    agent.wait().expect("reaped");
     harness.wait_lifecycle(&id, InstanceLifecycle::Exited).await;
     let journal = harness.journal(&id);
     assert!(journal.contains(REASON_PROCESS_GONE), "{journal}");
@@ -767,6 +768,8 @@ async fn a_different_program_in_the_claimed_pane_ends_the_claim() {
         journal.contains("is no longer the foreground agent"),
         "{journal}"
     );
+    agent.kill().expect("agent exits");
+    agent.wait().expect("reaped");
     // Nothing more is written to the pane.
     harness.clear_calls();
     let wire = id.as_id().to_string();

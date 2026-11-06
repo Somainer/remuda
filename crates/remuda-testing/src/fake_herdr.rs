@@ -341,6 +341,12 @@ pub fn herdr_frames_path() -> PathBuf {
     fixtures_dir().join("herdr").join("terminal-observe.jsonl")
 }
 
+/// The bundled frames, compiled into the binary. [`herdr_frames_path`] names
+/// the source checkout the binary was BUILT from; a reused binary (a shared
+/// target dir that outlived a throwaway worktree, like the landing gate's)
+/// would otherwise fail every relay with ENOENT before reading any input.
+const BUNDLED_FRAMES: &str = include_str!("../fixtures/herdr/terminal-observe.jsonl");
+
 /// Captured live session (sanitized).
 pub fn herdr_session_ok_path() -> PathBuf {
     fixtures_dir().join("herdr").join("session-ok.jsonl")
@@ -847,7 +853,11 @@ fn write_frames(
     rows: u16,
     keep_open: bool,
 ) -> Result<(), FakeHerdrError> {
-    let body = std::fs::read_to_string(frames)?;
+    let body = if frames == herdr_frames_path() {
+        BUNDLED_FRAMES.to_owned()
+    } else {
+        std::fs::read_to_string(frames)?
+    };
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for line in body.lines() {

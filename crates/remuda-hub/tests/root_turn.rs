@@ -1464,8 +1464,13 @@ fn scan_sqlite(path: &std::path::Path, needle: &str) -> Vec<Hit> {
         .expect("tables");
     let mut hits = Vec::new();
     for table in tables {
-        let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
-        let mut statement = conn.prepare(&sql).expect("select");
+        let quoted = table.replace('"', "\"\"");
+        // The rowid too where the table has one: an FTS row names its
+        // content row only by rowid.
+        let mut statement = conn
+            .prepare(&format!("SELECT rowid AS __rowid, * FROM \"{quoted}\""))
+            .or_else(|_| conn.prepare(&format!("SELECT * FROM \"{quoted}\"")))
+            .expect("select");
         let columns: Vec<String> = statement
             .column_names()
             .iter()
@@ -1506,9 +1511,12 @@ fn scan_sqlite(path: &std::path::Path, needle: &str) -> Vec<Hit> {
 
 /// (a) Store-level default-deny: after an owner-turn dispatch, its approval,
 /// a task create and a split, a string from the owner's input is stored only
-/// in the owner's command row and in the seat's own input record — never in a
-/// task doc, a roster row, an interaction, a journal payload or any other
-/// table or file the Hub writes.
+/// in the owner's command row, in the seat's own input record, and in the
+/// journal search index's copy derived from that record (cb-search: a
+/// document of the seat's own instance covering that row, with its
+/// redacted, FTS-indexed form, deleted with the row) — never in a task doc,
+/// a roster row, an interaction, another journal payload or any other table
+/// or file the Hub writes.
 #[tokio::test]
 async fn the_owners_words_are_stored_only_in_the_command_row() -> Result<()> {
     let (ctx, mut node) = Ctx::boot().await?;
@@ -1586,24 +1594,32 @@ async fn the_owners_words_are_stored_only_in_the_command_row() -> Result<()> {
         .filter(|hit| input_row(hit))
         .map(|hit| (hit.row.get("instance_id"), hit.row.get("seq")))
         .collect();
-    // cb-search: the journal search index holds a redacted copy of that same
-    // row, keyed by its (instance, seq) and deleted with it; the FTS table is
-    // external content over the index rows and stores no text of its own.
+    // cb-search: the journal search index holds a copy of that same row's
+    // text (the raw concatenation and its redacted form), in a document of
+    // the seat's own instance whose row range covers it, deleted with it;
+    // the FTS table is external content over those documents and names one
+    // only by rowid.
     let index_row = |hit: &Hit| {
+        let seq = |name: &str| hit.row.get(name).and_then(Value::as_i64);
         hit.table.as_deref() == Some("journal_search_docs")
-            && input_rows.contains(&(hit.row.get("instance_id"), hit.row.get("seq")))
+            && hit.row.get("instance_id") == Some(&json!(seat))
+            && input_rows.iter().any(|(_, row_seq)| {
+                let row_seq = row_seq.and_then(Value::as_i64);
+                matches!((seq("first_seq"), seq("seq"), row_seq),
+                    (Some(first), Some(last), Some(at)) if first <= at && at <= last)
+            })
     };
-    let index_texts: Vec<Option<&Value>> = hits
+    let index_ids: Vec<Option<&Value>> = hits
         .iter()
         .filter(|hit| index_row(hit))
-        .map(|hit| hit.row.get("text"))
+        .map(|hit| hit.row.get("id"))
         .collect();
     let allowed = |hit: &Hit| match hit.table.as_deref() {
         // The owner's own command row.
         Some("commands") => hit.row.get("id") == Some(&json!(owner)),
         Some("journal") => input_row(hit),
         Some("journal_search_docs") => index_row(hit),
-        Some("journal_fts") => index_texts.contains(&hit.row.get("text")),
+        Some("journal_fts") => index_ids.contains(&hit.row.get("__rowid")),
         _ => false,
     };
     let leaks: Vec<String> = hits

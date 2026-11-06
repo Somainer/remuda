@@ -207,8 +207,8 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `instance create` | `POST /v1/instances`; `GET /v1/hosts` only for label or unplaced creates | Agent route, as "Create a session". With an explicit `--host` the CLI reads no host list; with `--labels` or no host it tries `GET /v1/hosts`, which is refused for Agent origin, and lets the Hub place (`crates/remuda/src/cmd/instance.rs`). A computer-use create needs the list and fails for Agent origin. `--permission-mode` follows "never beyond the creator" (OA1) | — |
-| `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
-| `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
+| `instance list` | `GET /v1/hosts` and `GET /v1/instances`, with `--watch` `GET /v1/follow`; for an Agent caller `GET /v1/caller` and `GET /v1/instances/{id}`, polled under `--watch` | Agent route. For an Agent caller the CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) lists the caller and its direct children, as `list_instances` in `crates/remuda/src/cmd/instance.rs` does, with `GET /v1/instances/{id}` (owned targets), without host labels: the host inventory `GET /v1/hosts` is operator-only and not admitted. `--watch` re-reads them every two seconds instead of opening the all-instances follow socket `GET /v1/follow`, which is not admitted | — |
+| `agents` | as `instance list` | Agent route. The same `agents::list` path as `instance list`, `--watch` included | — |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
 | `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is admitted for an owned target, so a send whose reply was lost resolves to its ledger state; for a target the caller does not own (sent under the D-017 approval) the read is refused and the CLI prints the POST's own row, which stays `queued` | — |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
@@ -391,7 +391,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 
 | Task | Closes |
 |---|---|
-| `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure` | model, effort and ultracode changes |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |

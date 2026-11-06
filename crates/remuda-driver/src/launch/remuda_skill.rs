@@ -613,8 +613,8 @@ pub fn render_section(context: &SkillContext) -> String {
 
     out.push_str(
         "Any seat:\n\
-         - the instances you own: `remuda instance read`, `remuda instance wait`, \
-         `remuda instance send`, `remuda instance stop`;\n\
+         - the instances you own: `remuda instance list`, `remuda instance read`, \
+         `remuda instance wait`, `remuda instance send`, `remuda instance stop`;\n\
          - the board inside your scope: `remuda task list`, `remuda task show`, \
          `remuda own check`, `remuda own list`.\n\n",
     );

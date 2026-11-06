@@ -31,7 +31,8 @@ pub(crate) struct ListArgs {
     /// Restrict the table to one host id.
     #[arg(long)]
     pub host: Option<String>,
-    /// Keep the table updated from the Hub follow WebSocket; Ctrl-C stops.
+    /// Keep the table updated from the Hub follow WebSocket (an Agent seat
+    /// polls every two seconds instead); Ctrl-C stops.
     #[arg(long)]
     pub watch: bool,
     /// Emit JSON (newline-delimited snapshots when watching).
@@ -62,11 +63,18 @@ pub(crate) fn run(hub: HubOpts, args: ListArgs) -> Result<()> {
 
 pub(crate) async fn list(client: Arc<HubClient>, args: ListArgs) -> Result<()> {
     let mut lines = BTreeMap::<String, Tail>::new();
+    // ap-agent-list: an Agent caller gets neither the host inventory
+    // (operator-only) nor the all-instances follow socket, so it lists the
+    // instances it owns, without host labels, and `--watch` polls.
+    let agent = client.caller_context().await?.origin == remuda_hub_client::CallerOrigin::Agent;
     if !args.watch {
-        let rows = refresh(&client, args.host.as_deref(), &mut lines).await?;
+        let rows = refresh(&client, agent, args.host.as_deref(), &mut lines).await?;
         return display(&rows, &args, "snapshot");
     }
     let mut shutdown = crate::Shutdown::install()?;
+    if agent {
+        return poll(&client, &args, &mut shutdown).await;
+    }
     let mut rows = Vec::new();
     loop {
         let connection = tokio::select! {
@@ -104,7 +112,7 @@ pub(crate) async fn list(client: Arc<HubClient>, args: ListArgs) -> Result<()> {
                 _ = refresh_tick.tick(), if dirty => {
                     if force_tails { lines.clear(); force_tails = false; }
                     let next = tokio::select! {
-                        result = tokio::time::timeout(Duration::from_secs(10), refresh(&client, args.host.as_deref(), &mut lines)) => result,
+                        result = tokio::time::timeout(Duration::from_secs(10), refresh(&client, false, args.host.as_deref(), &mut lines)) => result,
                         result = shutdown.wait() => { result?; let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await; return Ok(()); }
                     };
                     match next {
@@ -119,12 +127,46 @@ pub(crate) async fn list(client: Arc<HubClient>, args: ListArgs) -> Result<()> {
     }
 }
 
+/// `--watch` for an Agent caller: re-read the owned instances and their tails
+/// every two seconds, since no follow socket carries their events.
+async fn poll(
+    client: &Arc<HubClient>,
+    args: &ListArgs,
+    shutdown: &mut crate::Shutdown,
+) -> Result<()> {
+    let mut rows = Vec::new();
+    loop {
+        // No follow frames move the tails on, so each pass reads them again.
+        let mut lines = BTreeMap::new();
+        let next = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(10), refresh(client, true, args.host.as_deref(), &mut lines)) => result,
+            result = shutdown.wait() => { result?; return Ok(()); }
+        };
+        match next {
+            Ok(Ok(next)) => {
+                rows = next;
+                display(&rows, args, "polling")?;
+            }
+            _ => display(&rows, args, "stale")?,
+        }
+        tokio::select! { _ = tokio::time::sleep(Duration::from_secs(2)) => {}, result = shutdown.wait() => { result?; return Ok(()); } }
+    }
+}
+
 async fn refresh(
     client: &Arc<HubClient>,
+    agent: bool,
     host: Option<&str>,
     lines: &mut BTreeMap<String, Tail>,
 ) -> Result<Vec<Value>> {
-    let (hosts, mut items) = tokio::try_join!(client.list_hosts(), client.list_instances())?;
+    let (hosts, mut items) = if agent {
+        (
+            Vec::new(),
+            super::instance::list_instance_items(client, host).await?,
+        )
+    } else {
+        tokio::try_join!(client.list_hosts(), client.list_instances())?
+    };
     items.retain(|item| host.is_none_or(|id| item["hostId"] == id));
     let mut tails = tokio::task::JoinSet::new();
     for item in &items {

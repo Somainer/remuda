@@ -1155,7 +1155,7 @@ fn ledger() -> (BTreeSet<String>, BTreeSet<String>) {
 fn the_section_names_only_verbs_in_the_ledger_today_column() {
     let (agent, other) = ledger();
     assert!(agent.contains("instance read") && agent.contains("land"));
-    assert!(other.contains("instance list") && other.contains("instance keys"));
+    assert!(other.contains("instance set") && other.contains("instance keys"));
     // The traps this test exists for.
     assert!(other.contains("merge") && other.contains("host files list"));
     assert!(!agent.contains("merge"));

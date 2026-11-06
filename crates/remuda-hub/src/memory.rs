@@ -2251,9 +2251,10 @@ pub fn routes() -> Router<AppState> {
             post(import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
         )
         .route("/v1/memory/derived", get(derived))
-        // The transcript's write rows: one writer chapter's log, Human/Bot
-        // callers only. Deliberately absent from `restrict_agent_routes`, so
-        // an Agent credential is refused before the handler.
+        // The transcript's write rows: one writer chapter's log. Human/Bot
+        // callers read any chapter; the middleware admits an Agent for an
+        // instance it owns, and the handler narrows that to the chapters of
+        // its own lineage (ap-memory-writes).
         .route("/v1/instances/{id}/memory-writes", get(memory_writes))
 }
 

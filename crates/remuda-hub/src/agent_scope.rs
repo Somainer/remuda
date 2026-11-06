@@ -329,8 +329,10 @@ pub async fn require_instance_read(
 }
 
 /// The per-instance GETs an Agent may make on an instance it owns, returning
-/// the path's instance id. Every handler behind them repeats the check
-/// ([`require_instance_read`]).
+/// the path's instance id. Every handler behind them repeats the ownership
+/// check with [`require_instance_read`], except `memory-writes`, whose handler
+/// applies its own narrower one ([`is_own_chapter`]: the caller's own
+/// lineage, never a child).
 fn read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/instances/")?;
     // Every per-instance *read* suffix must be listed: an unlisted one is

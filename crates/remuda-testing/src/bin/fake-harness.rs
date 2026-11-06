@@ -93,6 +93,7 @@ fn parse_kind(value: &str) -> Result<Dialect, String> {
 }
 
 fn main() {
+    remuda_testing::embed_build_stamp();
     let args = Args::parse();
     let options = Options {
         kind: args.kind,

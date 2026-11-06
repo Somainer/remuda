@@ -100,14 +100,22 @@ and live Hub checks automatically.
 The live Hub checks are two steps, selected together:
 - `web-hub-e2e` (`test:e2e:hub`) is the main pass.
 - `web-hub-e2e-main` (`test:e2e:hub:main`, `web/scripts/e2e-hub-main.mjs`)
-  runs the hub specs that seat the Hub's one address-owner Main. They are
-  `main-ui`, `home-extras`, `owner-notify` and `routed-to`, run on their own
-  Hub with `HUB_E2E_MAIN_UI=1 REMUDA_DELEGATED_DECISIONS=1
-  HUB_E2E_LINEAGE_FENCE=1`. The main pass skips them, and its budget has no
-  room for them (it already runs about 48 of its 50 minutes on the shared
-  devbox).
-- A unit test keeps the script's file list equal to the specs that check
-  `HUB_E2E_MAIN_UI`.
+  runs the hub specs that self-skip on a harness trigger no other pass sets,
+  one Hub per trigger group, after the main pass. Group `main` seats the
+  Hub's one address-owner Main (`HUB_E2E_MAIN_UI=1
+  REMUDA_DELEGATED_DECISIONS=1 HUB_E2E_LINEAGE_FENCE=1`). The other groups
+  set exactly the trigger their specs need: `HUB_E2E_FAKE_NODE=1`,
+  `HUB_E2E_TASK_BIND=1`, `HUB_E2E_PROJECT_SWITCHER=1`, `HUB_E2E_DIR_PICKER=1`,
+  `HUB_E2E_CARDSETTLE=1` or `HUB_E2E_API_ROUTE=1`. The main pass skips all of
+  them, and its budget has no room for them (it already runs about 48 of its
+  50 minutes on the shared devbox). The skip audit, every remaining
+  intentional skip, and both pass timings are in
+  [`evidence/hub-e2e-skips-1.md`](./evidence/hub-e2e-skips-1.md); it measures
+  the eight groups at about 340 s with the gate's build order, and proposes a
+  second opt-in step if more trigger groups are added.
+- A unit test keeps the script's groups equal to the specs that self-skip on
+  a flag the gate must set, and checks each group sets the flags its specs
+  skip without.
 - Both steps make one attempt, with Playwright's CI retry inside it, and
   both hold the same `REMUDA_E2E_LOCK` flock.
 
@@ -211,8 +219,9 @@ upstream default `127.0.0.1:58881`.
 
 Every gate step has a wall-clock deadline enforced by the gate driver:
 `cargo-*` steps 30 minutes, `web-*` steps 20 minutes, the Hub e2e step 30
-minutes (its real worst case), the opt-in Main pass (`web-hub-e2e-main`,
-about 3 minutes) 15 minutes, scans and any other step 30 minutes. Each
+minutes (its real worst case), the opt-in pass (`web-hub-e2e-main`, about
+6 minutes measured with the eight trigger groups) 15 minutes, scans and
+any other step 30 minutes. Each
 step runs in its own process group; the driver polls the child every
 200 ms. If the deadline passes, or the direct child disappears without
 `waitpid` returning (an external kill leaving the driver stuck in `wait4`,

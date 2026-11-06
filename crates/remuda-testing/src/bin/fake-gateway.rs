@@ -6,6 +6,7 @@
 //! environment it reads and the readiness line it prints.
 
 fn main() {
+    remuda_testing::embed_build_stamp();
     if let Err(err) = remuda_testing::run_fake_gateway() {
         eprintln!("fake-gateway: {err}");
         std::process::exit(1);

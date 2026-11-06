@@ -26,6 +26,7 @@ use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
 fn main() {
+    remuda_testing::embed_build_stamp();
     match run() {
         Ok(()) => std::process::exit(0),
         Err(err) => {

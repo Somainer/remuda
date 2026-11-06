@@ -43,6 +43,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    remuda_testing::embed_build_stamp();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()

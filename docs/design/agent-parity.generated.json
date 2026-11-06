@@ -247,13 +247,15 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/commands",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
       "method": "GET",
       "path": "/v1/instances/{id}/commands/{commandId}",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {

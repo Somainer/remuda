@@ -4806,8 +4806,9 @@ pub async fn list_instance_commands(
 /// list: a Human/Bot device that can read the instance may read its commands,
 /// so separately authenticated same-owner Human devices intentionally share
 /// visibility (there is no per-device command binding, matching journal
-/// reads), while Agent callers are refused at the route middleware (a commands
-/// detail path is not an agent read target) and again here. The row must
+/// reads). An Agent reads the commands of an instance it owns, like its
+/// journal (ap-command-read): the route middleware and this handler both
+/// refuse any other target. The row must
 /// belong to the instance named in the path — command ids are a global
 /// ledger, so a mismatch answers 404 rather than leaking another instance's
 /// row. A read while a forward attempt is active binds to THAT attempt's

@@ -328,16 +328,32 @@ pub async fn require_instance_read(
     Ok(())
 }
 
+/// The per-instance GETs an Agent may make on an instance it owns, returning
+/// the path's instance id. Every handler behind them repeats the check
+/// ([`require_instance_read`]).
 fn read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/instances/")?;
-    // Every per-instance *read* suffix must be listed: an unlisted one falls
-    // through to the `contains('/')` guard and is refused, which is the safe
-    // direction but silently breaks the endpoint for agent callers.
-    let id = rest
-        .strip_suffix("/journal")
-        .or_else(|| rest.strip_suffix("/screen"))
-        .unwrap_or(rest);
-    (!id.is_empty() && !id.contains('/')).then_some(id)
+    // Every per-instance *read* suffix must be listed: an unlisted one is
+    // refused, which is the safe direction but silently breaks the endpoint
+    // for agent callers.
+    let (id, suffix) = match rest.split_once('/') {
+        Some((id, suffix)) => (id, Some(suffix)),
+        None => (rest, None),
+    };
+    let admitted = match suffix {
+        None => true,
+        Some("journal" | "screen") => true,
+        // ap-command-read: the command ledger, so an Agent reconciles a send
+        // by its commandId (D-055) instead of re-sending it.
+        Some("commands") => true,
+        Some(suffix) => suffix.strip_prefix("commands/").is_some_and(one_segment),
+    };
+    (!id.is_empty() && admitted).then_some(id)
+}
+
+/// One non-empty path segment.
+fn one_segment(segment: &str) -> bool {
+    !segment.is_empty() && !segment.contains('/')
 }
 
 /// The two D-028 attachment reads, which authorize themselves against the
@@ -1502,10 +1518,30 @@ mod tests {
             admission(Method::GET, "/v1/hosts"),
             AgentRouteAdmission::Refused
         );
-        assert_eq!(
-            admission(Method::GET, "/v1/instances/ins_1/commands"),
-            AgentRouteAdmission::Refused
-        );
+        // ap-command-read: both command reads are pinned to an owned target.
+        for path in [
+            "/v1/instances/ins_1/commands",
+            "/v1/instances/ins_1/commands/cmd_1",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1")),
+                "{path}"
+            );
+        }
+        for path in [
+            "/v1/instances/ins_1/commands/",
+            "/v1/instances/ins_1/commands/cmd_1/extra",
+            "/v1/instances//commands",
+            "/v1/instances/ins_1/",
+            "/v1/instances/ins_1/resume",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Refused,
+                "{path}"
+            );
+        }
         assert_eq!(
             admission(Method::GET, "/v1/login"),
             AgentRouteAdmission::MiddlewareSkipped

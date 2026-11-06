@@ -86,7 +86,7 @@ Two limits recur below:
 | Send a new turn | commands, `instance.send` | Agent route. The send rule | — |
 | Queue a prompt while the session works | held in the browser, then `instance.send` in queue mode | Agent route. The send rule | — |
 | Steer with a held prompt | `instance.send` in steer mode | Agent route. The send rule | — |
-| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
+| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Agent route. Owned targets (`owns()`), checked again by the handler (`require_instance_read`); a command id that belongs to another instance is 404. An agent reconciles an unknown outcome by commandId (D-055) | — |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
 | Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
@@ -210,7 +210,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
-| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
+| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is admitted for an owned target, so a send whose reply was lost resolves to its ledger state; for a target the caller does not own (sent under the D-017 approval) the read is refused and the CLI prints the POST's own row, which stays `queued` | — |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
@@ -391,7 +391,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 
 | Task | Closes |
 |---|---|
-| `ap-command-read` | a send's receipt, `instance send`'s follow-up read, and every command read (`GET /v1/instances/{id}/commands`, `GET /v1/instances/{id}/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure` | model, effort and ultracode changes |

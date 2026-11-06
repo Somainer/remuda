@@ -56,8 +56,8 @@ pub const ALLOWLIST_SECTIONS: [&str; 2] = [
 ///   the refused follow socket.
 /// - `` `instance create` ``: the create is admitted, the host inventory it
 ///   falls back to is not.
-/// - `` `instance send` ``: the send is admitted, its follow-up command read is
-///   refused.
+/// - `` `instance send` ``: the send is admitted, its follow-up command read
+///   only for a target the caller owns.
 /// - `` `gate <branch>` (verify) ``: enqueue and wait are admitted, the failure
 ///   log is not.
 /// - `` `gate list` ``: with `--project` it is admitted, without it

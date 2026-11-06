@@ -101,8 +101,7 @@ const SNIPPET_LEAD_CHARS: usize = 60;
 /// - `journal_search_rows` records every journal row that carries
 ///   searchable text, keyed like the journal, with the node it belongs to.
 ///   It makes indexing idempotent and lets a node be rebuilt from its rows
-///   (rare, so a rebuild scans the instance's records by key prefix rather
-///   than keeping a second index).
+///   (the node index keeps a rebuild to the node's own records).
 /// - `journal_search_docs` holds one document per run of a node's rows
 ///   ([`step`]): the rows `first_seq..=seq` of `(instance_id, kind,
 ///   node_id)`. `raw` is the concatenated journal text, never searched or
@@ -120,6 +119,8 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             node_id TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
         ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS journal_search_rows_node
+            ON journal_search_rows (instance_id, kind, node_id, seq);
         CREATE TABLE IF NOT EXISTS journal_search_docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instance_id TEXT NOT NULL,
@@ -697,18 +698,35 @@ fn rebuild_node(
     Ok(())
 }
 
-/// Index one journal row, inside the caller's transaction; the append path
-/// and the backfill both call it. Returns whether the row was recorded (it
-/// carries searchable text and was not recorded before). The row folds
-/// into its node's newest document ([`step`]); a row below rows already
-/// folded rebuilds the node, so the order the two paths meet a node's rows
-/// in never changes its documents.
+/// A node, as its documents are keyed.
+pub(crate) type NodeKey = (String, JournalSearchKind, String);
+
+/// Index one journal row, inside the caller's transaction (the append
+/// path). Returns whether the row was recorded (it carries searchable text
+/// and was not recorded before). See [`index_row`].
 pub(crate) fn index_event(
     conn: &Connection,
     instance_id: &str,
     seq: i64,
     event: &Value,
     observed_at: &str,
+) -> rusqlite::Result<bool> {
+    index_row(conn, instance_id, seq, event, observed_at, None)
+}
+
+/// Index one row; the append path and the backfill both call it. The row
+/// folds into its node's newest document ([`step`]). A row below rows
+/// already folded (the backfill reaching a node the append path started)
+/// needs its node rebuilt from its rows, so the order the two paths meet a
+/// node's rows in never changes its documents: done here when `deferred` is
+/// `None`, or left to the caller, once per node, when it collects them.
+fn index_row(
+    conn: &Connection,
+    instance_id: &str,
+    seq: i64,
+    event: &Value,
+    observed_at: &str,
+    mut deferred: Option<&mut std::collections::BTreeSet<NodeKey>>,
 ) -> rusqlite::Result<bool> {
     let Some(piece) = extract(event) else {
         return Ok(false);
@@ -728,6 +746,13 @@ pub(crate) fn index_event(
         }
         return Ok(true);
     }
+    let key: NodeKey = (instance_id.to_string(), kind, piece.node_id.clone());
+    if let Some(set) = deferred.as_deref_mut()
+        && set.contains(&key)
+    {
+        // Its rebuild reads every recorded row, this one included.
+        return Ok(true);
+    }
     let newest: Option<(i64, DocState)> = conn
         .query_row(
             &format!(
@@ -740,9 +765,12 @@ pub(crate) fn index_event(
         )
         .optional()?;
     match newest {
-        Some((_, held)) if held.seq > seq => {
-            rebuild_node(conn, instance_id, kind, &piece.node_id)?;
-        }
+        Some((_, held)) if held.seq > seq => match deferred {
+            Some(set) => {
+                set.insert(key);
+            }
+            None => rebuild_node(conn, instance_id, kind, &piece.node_id)?,
+        },
         Some((id, held)) => match step(kind, Some(&held), &piece, seq, observed_at) {
             Step::Same(doc) => {
                 conn.execute(
@@ -813,6 +841,8 @@ fn settle_conn(conn: &mut Connection, cutoff: &str, limit: usize) -> Result<usiz
 pub(crate) struct BackfillStep {
     pub(crate) scanned: usize,
     pub(crate) indexed: usize,
+    /// Nodes rebuilt once each (met below rows already folded).
+    pub(crate) rebuilt: usize,
     pub(crate) done: bool,
 }
 
@@ -883,21 +913,36 @@ fn backfill_batch(conn: &mut Connection, limit: usize) -> Result<BackfillStep, S
         .collect::<rusqlite::Result<_>>()?
     };
     let mut step = BackfillStep::default();
-    // A batch also stops at its time budget, so one writer job never holds
-    // the writer long: rows with long streams fold slower than others.
+    // A batch also stops at its time budget, checked before each row, so one
+    // writer job never holds the writer long: rows with long streams fold
+    // slower than others. A node met below rows the append path already
+    // folded is rebuilt once, after the loop, however many of its rows the
+    // batch read.
     let started = Instant::now();
     let mut taken = 0;
+    let mut deferred = std::collections::BTreeSet::new();
     for (index, (instance_id, seq, payload, observed_at)) in rows.iter().enumerate() {
+        if index > 0 && started.elapsed() >= BACKFILL_BATCH_BUDGET {
+            break;
+        }
         backfill_hook(index)?;
         taken = index + 1;
         if let Ok(event) = serde_json::from_str::<Value>(payload)
-            && index_event(&tx, instance_id, *seq, &event, observed_at)?
+            && index_row(
+                &tx,
+                instance_id,
+                *seq,
+                &event,
+                observed_at,
+                Some(&mut deferred),
+            )?
         {
             step.indexed += 1;
         }
-        if started.elapsed() >= BACKFILL_BATCH_BUDGET {
-            break;
-        }
+    }
+    step.rebuilt = deferred.len();
+    for (instance_id, kind, node_id) in &deferred {
+        rebuild_node(&tx, instance_id, *kind, node_id)?;
     }
     step.scanned = taken;
     step.done = taken == rows.len() && rows.len() < limit;

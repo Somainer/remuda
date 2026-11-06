@@ -1250,6 +1250,61 @@ async fn an_unmarked_long_stream_is_settled_once_quiet() {
     );
 }
 
+/// r3 item 2: a node met below rows the append path folded is rebuilt once
+/// per batch, however many of its pending rows the batch reads.
+#[tokio::test]
+async fn a_straddling_node_is_rebuilt_once_per_batch() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    let rows = long_stream("m1", complete(streamed("m1", "append", "tail.")));
+    let db = fx.db();
+    let half = 15;
+    for (n, event) in rows.iter().take(half).enumerate() {
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, '2026-11-01T00:00:00.000Z')",
+            params![ins, (n + 1) as i64, format!("evt-{n}"), event.to_string()],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "UPDATE instances SET durable_seq = ?1 WHERE id = ?2",
+        params![half as i64, ins],
+    )
+    .unwrap();
+    drop(db);
+    for event in &rows[half..] {
+        fx.append(&ins, event.clone()).await;
+    }
+    let mut db = fx.db();
+    db.execute_batch(
+        "CREATE TEMP TABLE doc_deletes (n INTEGER);
+         CREATE TEMP TRIGGER count_doc_deletes AFTER DELETE ON journal_search_docs
+         BEGIN INSERT INTO doc_deletes VALUES (1); END;",
+    )
+    .unwrap();
+    let step = backfill_batch(&mut db, 2000).unwrap();
+    assert!(step.done);
+    assert_eq!(step.indexed, half);
+    assert_eq!(step.rebuilt, 1);
+    // One rebuild: the node's one document is deleted once and rebuilt.
+    let deletes: i64 = db
+        .query_row("SELECT COUNT(*) FROM doc_deletes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(deletes, 1);
+    let text: String = db
+        .query_row(
+            "SELECT text FROM journal_search_docs WHERE instance_id = ?1",
+            [&ins],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        text.starts_with("Start chunk0") && text.ends_with("tail."),
+        "{text}"
+    );
+}
+
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -1421,4 +1476,61 @@ async fn bench_backfill_query_and_append_on_a_large_journal() {
             t.elapsed().as_secs_f64() * 1000.0 / 3001.0
         );
     }
+}
+
+/// r3 item 2 measurement: a node with 5000 rows written before the index
+/// (pending backfill) and 100 more appended live, then the backfill; prints
+/// each batch's writer hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement"]
+async fn bench_straddling_node_backfill() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    let pending = 5000usize;
+    {
+        let db = fx.db();
+        db.execute_batch("BEGIN").unwrap();
+        for n in 0..pending {
+            let event = if n == 0 {
+                streamed("m1", "open", "Start ")
+            } else {
+                streamed("m1", "append", &format!("token{n} "))
+            };
+            db.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, '2026-11-01T00:00:00.000Z')",
+                params![ins, (n + 1) as i64, format!("evt-{n}"), event.to_string()],
+            )
+            .unwrap();
+        }
+        db.execute_batch("COMMIT").unwrap();
+        db.execute(
+            "UPDATE instances SET durable_seq = ?1 WHERE id = ?2",
+            params![pending as i64, ins],
+        )
+        .unwrap();
+    }
+    for n in 0..100 {
+        fx.append(&ins, streamed("m1", "append", &format!("live{n} ")))
+            .await;
+    }
+    let mut db = fx.db();
+    let mut holds = Vec::new();
+    let total = Instant::now();
+    loop {
+        let t = Instant::now();
+        let step = backfill_batch(&mut db, BACKFILL_BATCH_ROWS).unwrap();
+        holds.push(t.elapsed().as_secs_f64() * 1000.0);
+        if step.done {
+            break;
+        }
+    }
+    holds.sort_by(f64::total_cmp);
+    println!(
+        "straddle: pending={pending} live=100 batches={} total_ms={:.0} batch_ms p50={:.1} max={:.1}",
+        holds.len(),
+        total.elapsed().as_secs_f64() * 1000.0,
+        percentile(&holds, 50.0),
+        holds.last().copied().unwrap_or(0.0)
+    );
 }

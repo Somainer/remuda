@@ -1166,10 +1166,14 @@ async fn two_verify_jobs_run_in_parallel_on_two_lanes() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn land_jobs_are_serialized_and_the_second_lands_after() -> Result<()> {
     let ctx = Ctx::spawn(1).await?;
+    // A holds until released (not for a fixed 1500 ms), so "B stays queued
+    // while A is landing" is checked while A is certainly still running: on a
+    // loaded host A's fixed run had already landed and B had started.
+    let release_a = Arc::new(Notify::new());
     ctx.scripts[0].script(
         "wt/a/land",
         RunSpec {
-            delay_ms: 1500,
+            release: Some(release_a.clone()),
             status: "landed",
             merge_sha: Some("2222222222222222222222222222222222222222"),
             ..RunSpec::default()
@@ -1196,6 +1200,7 @@ async fn land_jobs_are_serialized_and_the_second_lands_after() -> Result<()> {
         .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(ctx.job(b["id"].as_str().unwrap()).await["state"], "queued");
+    release_a.notify_one();
     let a_done = ctx.wait_state(a["id"].as_str().unwrap(), &["landed"]).await;
     assert_eq!(
         a_done["mergeSha"],
@@ -1332,10 +1337,14 @@ async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_a_queued_job_marks_it_canceled_without_a_node_call() -> Result<()> {
     let ctx = Ctx::spawn(1).await?;
+    // A holds the only lane until released (not for a fixed 1500 ms), so B is
+    // certainly still queued when it is canceled: on a loaded host A's fixed
+    // run had already passed and B had been dispatched before the cancel.
+    let release_a = Arc::new(Notify::new());
     ctx.scripts[0].script(
         "wt/a/hold",
         RunSpec {
-            delay_ms: 1500,
+            release: Some(release_a.clone()),
             ..RunSpec::default()
         },
     );
@@ -1382,6 +1391,10 @@ async fn cancel_a_queued_job_marks_it_canceled_without_a_node_call() -> Result<(
         ctx.scripts[0].gate_cancels.lock().unwrap().is_empty(),
         "a queued cancel never calls the Node"
     );
+    release_a.notify_one();
+    let _ = ctx
+        .wait_state(_a["id"].as_str().unwrap(), &["passed"])
+        .await;
     Ok(())
 }
 

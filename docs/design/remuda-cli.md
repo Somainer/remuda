@@ -188,6 +188,13 @@ for a single listing, or compact newline-delimited snapshots when watching,
 with `items`, `stream`, and `stale`. Instance rows retain IDs, host link state,
 and separate lifecycle/activity/connectivity fields for automation.
 
+An Agent caller (a seat's own credential, or a Human token narrowed with
+`x-remuda-instance-id`) gets neither the host inventory nor the all-instances
+follow socket (`ap-agent-list`). For it the listing is the caller and its
+direct children, read one by one, without host labels, and `--watch` re-reads
+them and their tails every two seconds with `stream: "polling"` instead of
+following.
+
 ## Seating and dispatch permission flags (D-057)
 
 The `instance create` seating flags landed with the Phase 1 task

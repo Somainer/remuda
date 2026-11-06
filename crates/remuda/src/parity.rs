@@ -56,28 +56,18 @@ pub const ALLOWLIST_SECTIONS: [&str; 2] = [
 ///   the refused follow socket.
 /// - `` `instance create` ``: the create is admitted, the host inventory it
 ///   falls back to is not.
-/// - `` `instance send` ``: the send is admitted, its follow-up command read is
-///   refused.
-/// - `` `gate <branch>` (verify) ``: enqueue and wait are admitted, the failure
-///   log is not.
-/// - `` `gate list` ``: with `--project` it is admitted, without it
-///   `GET /v1/gate/jobs` is not.
-/// - `` `watch` `` and `` `report` ``: the worker read is admitted, the
-///   cross-project gate read is not.
+/// - `` `instance send` ``: the send is admitted, its follow-up command read
+///   only for a target the caller owns.
 /// - `Open an attachment` and `` `instance attachment` ``: the middleware
 ///   skips `GET /v1/objects/{id}` (a Node pulls it with its host token), so
 ///   it carries no middleware verdict; the handler admits an Agent that owns
 ///   the object's instance (`ap-attachments`).
-const AGENT_ROUTE_EXEMPTIONS: [&str; 11] = [
+const AGENT_ROUTE_EXEMPTIONS: [&str; 7] = [
     "Follow the session live",
     "Create a worktree for it",
     "List pending items",
     "`instance create`",
     "`instance send`",
-    "`gate <branch>` (verify)",
-    "`gate list`",
-    "`watch`",
-    "`report`",
     "Open an attachment",
     "`instance attachment`",
 ];

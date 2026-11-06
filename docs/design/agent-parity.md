@@ -1,6 +1,6 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Likewise for `cb-command-queue` (2026-11-05): `ap-configure` and the queued-command rows; and for `ap-actions` (2026-11-06). Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Likewise for `cb-command-queue` (2026-11-05): `ap-configure` and the queued-command rows. Rows closed by `ap-command-read`, `ap-gate-reads`, `ap-subagent-read`, `ap-memory-writes`, `ap-agent-list` and `ap-own-scope` (2026-11-06) were moved the same way, and likewise for `ap-actions` (2026-11-06): `ap-resume`, `ap-attachments` and the rest of `ap-configure`. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
 
 ## The two halves
 
@@ -81,12 +81,12 @@ Two limits recur below:
 | Read the transcript; load earlier; the events tab | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | Follow the session live | `GET /v1/follow` (WebSocket) | Agent route by another path: the socket is not admitted for Agent origin, and an agent reads the same journal by cursor (`remuda instance read`, `remuda instance wait`) | Phase 2 facts push changes to the parent (`cb-inbox-facts`, `cb-inbox-deliver`) |
 | See usage and context | `GET /v1/instances/{id}` (the projection's `usageRollup`) | Agent route. Owned targets | — |
-| See what the session remembered (`已记住` receipts, the transcript's write rows) | `GET /v1/instances/{id}/memory-writes` | Gap. Not admitted for Agent origin (`restrict_agent_routes` has no shape for it), although the rows are one writer chapter's own writes; the handler admits Human and Bot (`crates/remuda-hub/src/memory.rs`). An agent reads the entries themselves through the memory routes below | `ap-memory-writes` |
+| See what the session remembered (`已记住` receipts, the transcript's write rows) | `GET /v1/instances/{id}/memory-writes` | Agent route. Owned targets (`owns()`), narrowed by the handler to the chapters of the caller's own lineage, the same scope as the entries it reads through the memory routes below: the log of an owned child outside that lineage is the child seat's memory, and the handler refuses it with 403 `not-owner` (`crates/remuda-hub/src/memory.rs`); an instance the caller does not own is refused by the middleware with 403 `agent-route` | — |
 | Mark the session seen on this device | `POST /v1/instances/{id}/seen` | Safety. Records are truthful: the seen mark records what the owner looked at (D-060 `seen-hub`); only a Human device credential may advance it (`crates/remuda-hub/src/instances.rs`) | — |
 | Send a new turn | commands, `instance.send` | Agent route. The send rule | — |
 | Queue a prompt while the session works | held in the browser, then `instance.send` in queue mode | Agent route. The send rule | — |
 | Steer with a held prompt | `instance.send` in steer mode | Agent route. The send rule | — |
-| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Gap. The middleware's `read_target` admits only `/journal` and `/screen` below an instance, so command reads are refused for Agent origin; an agent cannot reconcile an unknown outcome by commandId (D-055) | `ap-command-read` admits both command reads for owned targets |
+| See a send's receipt | `GET /v1/instances/{id}/commands/{commandId}` | Agent route. Owned targets (`owns()`), checked again by the handler (`require_instance_read`); a command id that belongs to another instance is 404. An agent reconciles an unknown outcome by commandId (D-055) | — |
 | Stop the turn | commands, `instance.cancel` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
 | Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
@@ -104,7 +104,7 @@ Two limits recur below:
 | Send keys from the key bar | commands, `instance.keys` | Safety. Keystrokes | — |
 | Type into the terminal | `/v1/follow?tty=1` | Safety. Keystrokes: the socket is not admitted for Agents, and `tty.write` always needs the D-017 approval | — |
 | See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/diff`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
-| Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Gap. Refused by `read_target`, as for command reads, though the handler re-checks ownership | `ap-subagent-read` |
+| Open a subagent's transcript | `GET /v1/instances/{id}/subagents/{agentId}/transcript` | Agent route. Owned targets (`owns()`), checked again by the handler (`require_instance_read`) | — |
 | See Main's seat profile, its pending badge and the last launch snapshot (cb-seat-profile, D-063) | `GET /v1/lineages/{id}/profile` | Agent route. The caller's own lineage only (the seat reads its own profile and model candidates; main-agent.md §3.4.2) | — |
 | Edit Main's seat profile (identity, model candidates, effort, permission mode, skills) | `PUT /v1/lineages/{id}/profile` with `expectedRevision` | Safety. Delegation never widens authority: the profile holds the permission mode its next chapter launches with, so only an unnarrowed Human edits it; an Agent (the seat itself included) gets 403 `profile-human-only` (OA1, OA2) | — |
 
@@ -210,10 +210,10 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `instance create` | `POST /v1/instances`; `GET /v1/hosts` only for label or unplaced creates | Agent route, as "Create a session". With an explicit `--host` the CLI reads no host list; with `--labels` or no host it tries `GET /v1/hosts`, which is refused for Agent origin, and lets the Hub place (`crates/remuda/src/cmd/instance.rs`). A computer-use create needs the list and fails for Agent origin. `--permission-mode` follows "never beyond the creator" (OA1) | — |
-| `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
-| `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
+| `instance list` | `GET /v1/hosts` and `GET /v1/instances`, with `--watch` `GET /v1/follow`; for an Agent caller `GET /v1/caller` and `GET /v1/instances/{id}`, polled under `--watch` | Agent route. For an Agent caller the CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) lists the caller and its direct children, as `list_instances` in `crates/remuda/src/cmd/instance.rs` does, with `GET /v1/instances/{id}` (owned targets), without host labels: the host inventory `GET /v1/hosts` is operator-only and not admitted. `--watch` re-reads them every two seconds instead of opening the all-instances follow socket `GET /v1/follow`, which is not admitted | — |
+| `agents` | as `instance list` | Agent route. The same `agents::list` path as `instance list`, `--watch` included | — |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
-| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule; `--attach` names objects staged for an instance the caller owns (`ap-attachments`). The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
+| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule; `--attach` names objects staged for an instance the caller owns (`ap-attachments`). The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is admitted for an owned target, so a send whose reply was lost resolves to its ledger state; for a target the caller does not own (sent under the D-017 approval) the read is refused and the CLI prints the POST's own row, which stays `queued` | — |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
@@ -255,8 +255,8 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `task show` | `GET /v1/tasks/{id}` | Agent route. Project scope only, no grant | — |
 | `task split` | `POST /v1/tasks/{id}/split` | Agent route. `dispatch` and scope | — |
 | `task set-state` | `PATCH /v1/tasks/{id}` | Agent route. `dispatch` and scope | — |
-| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not.** `claim_own` calls `require_dispatch` (grant only) and then mutates the named task; unlike every other task mutation (`create_task`, `set_task_state`, `archive_task`, `split_task`, `add_placement`), it never calls `require_project_scope` (`crates/remuda-hub/src/tasks.rs`). An Agent with `dispatch` can therefore claim paths on a task in a project outside its scope | `ap-own-scope` |
-| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not**, exactly as for `own claim` (`release_own`). An Agent with `dispatch` can release another project's claims | `ap-own-scope` |
+| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. `dispatch`, and the target task must be in the caller's project scope, as for every other task mutation (`require_project_scope`); a task outside it is 403 `out-of-scope` and no claim changes (`claim_own` in `crates/remuda-hub/src/tasks.rs`) | — |
+| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. As `own claim`: `dispatch` and the target task's project scope (`release_own`) | — |
 | `own check` | `POST /v1/own/check` | Agent route. Project scope only, no grant | — |
 | `own list` | `GET /v1/own` | Agent route. Project scope only, no grant | — |
 
@@ -264,9 +264,9 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `gate <branch>` (verify) | `POST /v1/projects/{id}/gate`, then `GET /v1/projects/{id}/gate/jobs/{jobId}`; on failure `GET /v1/gate/logs/{id}` | Agent route for the enqueue (`dispatch` and scope) and the wait (scope). The failure log is refused (see `gate log`); without `--project` the project lookup reads `GET /v1/projects` (`dispatch`) | `ap-gate-reads` for the log |
-| `gate list` | `GET /v1/projects/{id}/gate` with `--project`; otherwise `GET /v1/gate/jobs` | Agent route with `--project` (scope). Gap without it: `/v1/gate/jobs` is not admitted for Agent origin, although the handler filters by scope | `ap-gate-reads` |
-| `gate log` | `GET /v1/gate/logs/{id}` | Gap. Not admitted for Agent origin. A seat that gates (main-agent.md §14.1, E2) needs it | `ap-gate-reads` |
+| `gate <branch>` (verify) | `POST /v1/projects/{id}/gate`, then `GET /v1/projects/{id}/gate/jobs/{jobId}`; on failure `GET /v1/gate/logs/{id}` | Agent route. The enqueue (`dispatch` and scope), the wait (scope) and the failure log (the job's project scope, see `gate log`); without `--project` the project lookup reads `GET /v1/projects` (`dispatch`) | — |
+| `gate list` | `GET /v1/projects/{id}/gate` with `--project`; otherwise `GET /v1/gate/jobs` | Agent route. With `--project`, that project's queue (scope); without it the cross-project list, which the handler filters to the caller's project scope | — |
+| `gate log` | `GET /v1/gate/logs/{id}` | Agent route. Checked against the job's project scope; a log from a project outside the caller's scope is 403 `out-of-scope`. A seat that gates (main-agent.md §14.1, E2) reads its failure log | — |
 | `gate cancel` | `POST /v1/projects/{id}/gate/jobs/{jobId}/cancel` | Agent route. `dispatch` for verify jobs, `land` for land jobs | — |
 | `land` | `POST /v1/projects/{id}/gate` (land mode) | Agent route. `land` and scope | — |
 
@@ -277,8 +277,8 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `dispatch` | `POST /v1/workers/dispatch` | Agent route. `dispatch` and project scope; `--permission-mode` follows "never beyond the creator" (OA1) and an omitted mode inherits the caller's own; another host or a shell-driver carrier needs the D-017 approval, decided before any name, port block or worktree is allocated (main-agent.md §4.2 items 2-4) | — |
-| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route for the worker part: `observe` is scope-wide under `dispatch`. Gap for the cross-project gate read, which is not admitted | `ap-gate-reads` |
-| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route for `GET /v1/workers` (scope-wide under `dispatch`). Gap without `--project`: the gate read is refused | `ap-gate-reads` |
+| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route. `observe` is scope-wide under `dispatch`; the gate read, with or without `--project`, is filtered to the caller's project scope | — |
+| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route. `GET /v1/workers` is scope-wide under `dispatch`; the gate queue, with or without `--project`, is filtered to the caller's project scope | — |
 | `retire` | `POST /v1/workers/{id}/retire` | Agent route. `dispatch`, project scope, and the worker in the caller's lineage subtree (main-agent.md §4.2 item 1) | — |
 | `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route. As `retire` | — |
 | `worker answer` | `POST /v1/workers/{id}/answer` | Agent route. As `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
@@ -408,13 +408,7 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 
 | Task | Closes |
 |---|---|
-| `ap-command-read` | a send's receipt, `instance send`'s follow-up read, and every command read (`GET /v1/instances/{id}/commands`, `GET /v1/instances/{id}/commands/{commandId}`) |
-| `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
-| `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
-| `ap-subagent-read` | a subagent's transcript |
-| `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |
-| `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |
 | `ap-supply-read` | `profile catalog`, `list`, `show`, `usage`, `probe`; the provider list; the model and supply catalog |
 | `ap-supply-event` | `profile event` |

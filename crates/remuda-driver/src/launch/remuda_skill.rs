@@ -613,8 +613,8 @@ pub fn render_section(context: &SkillContext) -> String {
 
     out.push_str(
         "Any seat:\n\
-         - the instances you own: `remuda instance read`, `remuda instance wait`, \
-         `remuda instance send`, `remuda instance stop`;\n\
+         - the instances you own: `remuda instance list`, `remuda instance read`, \
+         `remuda instance wait`, `remuda instance send`, `remuda instance stop`;\n\
          - their runtime config: `remuda instance config`, then \
          `remuda instance configure` for model, effort or ultracode with the generation you \
          read;\n\
@@ -645,13 +645,13 @@ pub fn render_section(context: &SkillContext) -> String {
              `remuda worker answer` types keys, so every use asks the owner first;\n\
              - resume an exited session you own that is not a worker: \
              `remuda instance resume`, under the same rules as a create;\n\
-             - follow them: `remuda watch`, `remuda report --project <id>`, \
-             `remuda hostcap <host>`;\n\
+             - follow them: `remuda watch`, `remuda report`, `remuda hostcap <host>`;\n\
              - the task ledger: `remuda task add`, `remuda task split`, \
              `remuda task set-state`, `remuda own claim`, `remuda own release`, \
              `remuda project list`, `remuda project show`;\n\
              - verify a branch through the Hub gate: `remuda gate <branch>`, \
-             `remuda gate list --project <id>`, `remuda gate cancel` for a verify job.\n\n",
+             `remuda gate list`, `remuda gate log <job>` for a failed run's log, \
+             `remuda gate cancel` for a verify job.\n\n",
         );
     } else {
         out.push_str(

@@ -3727,8 +3727,8 @@ async fn malformed_command_id_is_rejected_with_400() -> Result<()> {
 }
 
 /// G2: the command status endpoint returns the same row POST returned, hides
-/// other instances' rows behind 404, refuses Agent credentials, and requires
-/// authentication.
+/// other instances' rows behind 404, admits an Agent only for an instance it
+/// owns (ap-command-read), and requires authentication.
 #[tokio::test]
 async fn command_status_endpoint_returns_row_and_enforces_principals() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
@@ -3806,29 +3806,52 @@ async fn command_status_endpoint_returns_row_and_enforces_principals() -> Result
     .await?;
     assert_eq!(status, 404, "cross-instance command read must not leak");
 
-    // Agent credentials — bound to the target, to a sibling, or to an
-    // unrelated instance — cannot read commands. A commands detail path is not
-    // an Agent read route in the middleware, and the handler re-checks, so an
-    // Agent has no command-status visibility at all.
+    // ap-command-read: an Agent bound to the target reads its commands, like
+    // its journal; one bound to a sibling or an unrelated instance is refused
+    // by the middleware (`agent-route`), for the row and for the list.
     let instance_c = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let row_path = format!(
+        "/v1/instances/{instance_a}/commands/{}",
+        command_id.as_id().as_str()
+    );
+    let list_path = format!("/v1/instances/{instance_a}/commands");
     for bound in [&instance_a, &instance_b, &instance_c] {
         let name = format!("agent-{bound}");
         let token = hub.test_mint_agent_token(&name, bound).await?;
-        let (status, _, forbidden) = http(
+        let bearer = format!("Bearer {token}");
+        let (row_status, _, row) = http(
             hub.addr,
             "GET",
-            &format!(
-                "/v1/instances/{instance_a}/commands/{}",
-                command_id.as_id().as_str()
-            ),
-            &[("Authorization", &format!("Bearer {token}"))],
+            &row_path,
+            &[("Authorization", &bearer)],
             None,
         )
         .await?;
-        assert_eq!(
-            status, 403,
-            "agent bound to {bound} must not read: {forbidden}"
-        );
+        let (list_status, _, list) = http(
+            hub.addr,
+            "GET",
+            &list_path,
+            &[("Authorization", &bearer)],
+            None,
+        )
+        .await?;
+        if bound == &instance_a {
+            assert_eq!(row_status, 200, "the owner reads its command: {row}");
+            let row: Value = serde_json::from_str(row.trim())?;
+            assert_eq!(row, posted["command"], "the Agent sees the POSTed row");
+            assert_eq!(list_status, 200, "{list}");
+            let list: Value = serde_json::from_str(list.trim())?;
+            assert_eq!(
+                list["commands"][0]["commandId"],
+                posted["command"]["commandId"]
+            );
+        } else {
+            for (status, body) in [(row_status, row), (list_status, list)] {
+                assert_eq!(status, 403, "agent bound to {bound} must not read: {body}");
+                let body: Value = serde_json::from_str(body.trim())?;
+                assert_eq!(body["reason"], "agent-route", "{body}");
+            }
+        }
     }
 
     // A SECOND, separately authenticated Human device paired to the same owner

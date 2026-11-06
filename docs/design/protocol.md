@@ -2096,7 +2096,8 @@ GET    /v1/instances/{id}/memory-writes?afterId=<n>
                    turnSeq, writtenAt}], nextAfterId}
      one page of a writer chapter's append-only write log, oldest first within the
      page; without a cursor the NEWEST page; afterId is exclusive on the log row id
-     Human and Bot callers only; an Agent token gets 403
+     Human and Bot: any chapter; an Agent: a chapter of its own lineage
+     (ap-memory-writes), any other chapter 403
 
 MemoryEntry = {lineageId, slug, type, title, description, body, revision,
                origin: human|agent|hub, writerInstanceId, turnRef, sourceRefs,
@@ -2110,7 +2111,7 @@ turnRef     = {instanceId, seq} | null             turn of the latest write
 - Agent 写入只接受血缘当前章节：否则 409，`reason: "not-current-chapter"`；F 落地后改为既有的 `reason: "fenced"`（§9.1）。Agent 写 `about-me`：403，`reason: "owner-authored"`。已归档的血缘拒绝写入：409，`reason: "archived"`。
 - `origin`、`writerInstanceId` 与 `turnRef` 由 Hub 盖章，请求体里的同名字段被剥掉。Agent 写入的 `origin` 取自写入所在根回合的 `rootTurn.origin`（只有所有者的输入开启的回合才是 `human`，Hub 不知道回合时为 `agent`），条目另带 `rootTurn`，写入章节仍记在 `writerInstanceId`（cb-rootturn）。
 - **写入日志。** 每次成功写入在同一事务里追加一行 `memory_write_log`（`lineage_id, slug, revision, title, op, origin, writer_instance, turn_seq, written_at`）；consolidate 每个输入一行，另加目标一行。行不随条目改写或删除而消失，所以每个写过记忆的回合都能显示自己的行。`turnSeq` 是写者章节在写入时最近一条 `turn_started` 的 journal seq，由 Hub 记下，从不取自请求体；所有者的写入和章节首个回合之前的写入为 NULL。`turnRef` 取自最近一次写入。
-- **写入日志的读路由是已知缺口。** `GET /v1/instances/{id}/memory-writes` 只接受 Human 与 Bot，Agent 令牌得到 403；中间件同样不放行这条路径。设计没有为这条拒绝给出安全性质，所以能力台账把它记为 Gap 并挂上 `ap-memory-writes`（[main-agent.md §15.2](./main-agent.md#152-parity-follow-ups-agent-paritymd)），而不是一条安全限制。任务落地后，Agent 读到的将是它自己章节的行，与它已能读的条目同一个范围。
+- **写入日志的读路由（`ap-memory-writes`，[main-agent.md §15.2](./main-agent.md#152-parity-follow-ups-agent-paritymd)）。** Human 与 Bot 读任何章节的行。Agent 读它自己血缘的各章节（当前章节及其前后章节）的行，与它已能读的条目同一个范围：中间件放行它拥有的实例（`owns()`），handler 再收窄到自己的血缘；它的子会话或任何其他会话的写入日志属于那个会话自己的记忆，得到 403 `reason: "not-owner"`（不拥有的实例在中间件即得到 403 `agent-route`）。用 `x-remuda-instance-id` 收窄到章节的 Human 令牌按该章节的 Agent 判。
 - CLI：`remuda memory write|read|search|rm|consolidate`。超过软上限时打印实际数字。
 - **Phase 1 导入**（`cb-memory-guard`，main-agent.md §12.4）。只有所有者（Human）能调用，Agent 与 Bot 403。`remuda memory import --from <dir> [--dry-run]` 先读完目录里的每个文件再发请求：目录或文件「不存在」算空，其他读取错误（权限、IO）直接报错，什么也不发。Hub 在一个写事务里只做创建：条目带文件记录的 `origin`，不带写入章节与回合；slug 已存在时跳过（内容相同为 `same-entry`，不同为 `slug-exists`，保留原条目），正文相同（正文为空时比标题与描述）的条目在别的 slug 下已存在时跳过（`same-content`，给出那个 slug）。因此重跑什么也不改。每个条目先过校验与秘密 lint：凭据形状 422 `MEMORY_SECRET_REJECTED`，slug 重复、`origin` 不是 human 的 `about-me`、超过 512 条为 400，血缘不存在为 404；单个条目超过 8 KiB 与创建一样是 413 `MEMORY_ENTRY_TOO_LARGE`，请求体超过 25,694,208 字节（512 个条目、每条按上限且每个字节都按 JSON 转义成六个字节计——控制字符正是如此——再各加 1 KiB，加 4 KiB 信封）在解析前即 413。这些情况都什么也不存。
 

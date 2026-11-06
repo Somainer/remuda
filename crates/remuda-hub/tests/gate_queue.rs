@@ -1900,6 +1900,150 @@ async fn failed_job_persists_evidence_fields_and_a_fetchable_log_object() -> Res
     Ok(())
 }
 
+/// ap-gate-reads: an Agent reads the cross-project job list, filtered to its
+/// project scope, and a failure log of a job in its scope; a log from another
+/// project is `out-of-scope`. A Human token narrowed to the seat gets the
+/// seat's answers, and a plain Human is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_reads_gate_jobs_and_logs_inside_its_project_scope_only() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    ctx.scripts[0].script(
+        "wt/a/broken",
+        RunSpec {
+            delay_ms: 50,
+            status: "failed",
+            error: Some("gate failed or returned an incomplete step report"),
+            failed_step: Some("cargo-test"),
+            reason: Some("cargo-test failed"),
+            run_log: Some(json!({
+                "step": "cargo-test",
+                "kind": "failed",
+                "headline": "cargo-test failed",
+                "summary": ["boom"],
+            })),
+            steps: Some(json!([
+                {"name": "cargo-test", "status": "failed", "durationMs": 12, "error": "exit status 101"}
+            ])),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/broken","mode":"verify"}))
+        .await;
+    let job_id = job["id"].as_str().unwrap().to_owned();
+    let failed = ctx.wait_state(&job_id, &["failed"]).await;
+    let object_id = failed["logObjectId"].as_str().unwrap().to_owned();
+
+    // Another project, with no gate jobs.
+    let (status, other) = ctx
+        .request("POST", "/v1/projects", Some(json!({"name": "other"})))
+        .await;
+    assert_eq!(status, 200, "{other}");
+    let other = other["id"].as_str().unwrap().to_owned();
+
+    let seat = |project: &str| {
+        let project = remuda_protocol::ProjectId::try_from(project.to_owned()).unwrap();
+        remuda_hub::store_test_support::seat_delegation(
+            remuda_protocol::InstanceScope {
+                project_ids: vec![project],
+                ..Default::default()
+            },
+            vec!["dispatch".into()],
+        )
+    };
+    let mut seats = Vec::new();
+    for project in [&ctx.project, &other] {
+        let record = ctx
+            .hub
+            .store()
+            .unwrap()
+            .insert_instance_delegated(
+                ctx.hosts[0].clone(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({ "kind": "claude", "projectId": project }),
+                seat(project),
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+            )
+            .await?;
+        seats.push(record.instance_id);
+    }
+    let get = |token: String, narrow_to: Option<String>, path: String| {
+        let request = ctx
+            .http
+            .get(format!("{}{path}", ctx.base()))
+            .bearer_auth(token);
+        let request = match narrow_to {
+            Some(instance) => request.header("x-remuda-instance-id", instance),
+            None => request,
+        };
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            (
+                status,
+                response.json::<Value>().await.unwrap_or(json!(null)),
+            )
+        }
+    };
+    let job_ids = |body: &Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    for (seat, in_scope) in [(&seats[0], true), (&seats[1], false)] {
+        let agent = ctx
+            .hub
+            .test_mint_agent_token(&format!("gate-agent-{seat}"), seat)
+            .await?;
+        for (token, narrow_to, who) in [
+            (agent.clone(), None, "agent"),
+            (ctx.token.clone(), Some(seat.clone()), "narrowed human"),
+        ] {
+            let (status, jobs) =
+                get(token.clone(), narrow_to.clone(), "/v1/gate/jobs".into()).await;
+            assert_eq!(status, 200, "{who}: {jobs}");
+            assert_eq!(
+                job_ids(&jobs).contains(&job_id),
+                in_scope,
+                "{who} in scope {in_scope}: {jobs}"
+            );
+            for id in [&job_id, &object_id] {
+                let (status, log) = get(
+                    token.clone(),
+                    narrow_to.clone(),
+                    format!("/v1/gate/logs/{id}"),
+                )
+                .await;
+                if in_scope {
+                    assert_eq!(status, 200, "{who} {id}: {log}");
+                    assert_eq!(log["jobId"], job_id.as_str());
+                    assert_eq!(log["log"]["step"], "cargo-test");
+                } else {
+                    assert_eq!(status, 403, "{who} {id}: {log}");
+                    assert_eq!(log["reason"], "out-of-scope", "{log}");
+                    assert_eq!(log["next"]["action"], "ask-owner", "{log}");
+                    assert!(log.get("log").is_none(), "no evidence leaks: {log}");
+                }
+            }
+        }
+    }
+
+    // A plain Human sees every project's jobs and logs.
+    let (status, jobs) = get(ctx.token.clone(), None, "/v1/gate/jobs".into()).await;
+    assert_eq!(status, 200);
+    assert!(job_ids(&jobs).contains(&job_id), "{jobs}");
+    let (status, log) = get(ctx.token.clone(), None, format!("/v1/gate/logs/{job_id}")).await;
+    assert_eq!(status, 200, "{log}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_lane_and_bad_inputs_are_rejected() -> Result<()> {
     let ctx = Ctx::spawn(1).await?;

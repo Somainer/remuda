@@ -634,13 +634,13 @@ pub fn render_section(context: &SkillContext) -> String {
              `remuda worker nudge`, `remuda worker switch-model`, `remuda worker resume`, \
              `remuda worker replace`, `remuda worker stop`, `remuda retire`; \
              `remuda worker answer` types keys, so every use asks the owner first;\n\
-             - follow them: `remuda watch`, `remuda report --project <id>`, \
-             `remuda hostcap <host>`;\n\
+             - follow them: `remuda watch`, `remuda report`, `remuda hostcap <host>`;\n\
              - the task ledger: `remuda task add`, `remuda task split`, \
              `remuda task set-state`, `remuda own claim`, `remuda own release`, \
              `remuda project list`, `remuda project show`;\n\
              - verify a branch through the Hub gate: `remuda gate <branch>`, \
-             `remuda gate list --project <id>`, `remuda gate cancel` for a verify job.\n\n",
+             `remuda gate list`, `remuda gate log <job>` for a failed run's log, \
+             `remuda gate cancel` for a verify job.\n\n",
         );
     } else {
         out.push_str(

@@ -774,7 +774,9 @@ async fn list_project_jobs(
     Ok(Json(json!({ "items": jobs, "nextCursor": null })))
 }
 
-/// `GET /v1/gate/jobs[?active=1]` — cross-project view for `remuda watch`.
+/// `GET /v1/gate/jobs[?active=1]` — cross-project view for `remuda watch`,
+/// filtered to the caller's project scope (an Agent's stored scope; a Human or
+/// Bot sees every project).
 async fn list_all_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1646,7 +1648,8 @@ async fn resolve_job(
 
 /// `GET /v1/gate/logs/{id}` — bounded failure evidence for one gate run.
 /// Accepts either the `gjb_…` job id (resolves to its latest log) or the
-/// `obj_…` log object id; visible to any caller with project scope.
+/// `obj_…` log object id; visible to any caller with project scope, an Agent
+/// included (ap-gate-reads), and refused as `out-of-scope` otherwise.
 async fn get_gate_log(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1669,7 +1672,7 @@ async fn get_gate_log(
         return Err(HubError::NotFound);
     }
     if !scope.allows_project(&object.project_id) {
-        return Err(HubError::Forbidden);
+        return Err(HubError::out_of_scope());
     }
     let log: Value = serde_json::from_slice(&object.bytes)
         .map_err(|error| HubError::Internal(error.to_string()))?;

@@ -156,13 +156,13 @@
     {
       "method": "GET",
       "path": "/v1/gate/jobs",
-      "middleware": "refused",
+      "middleware": "admitted",
       "handler": "scope"
     },
     {
       "method": "GET",
       "path": "/v1/gate/logs/{id}",
-      "middleware": "refused",
+      "middleware": "admitted",
       "handler": "scope"
     },
     {

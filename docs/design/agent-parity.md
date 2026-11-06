@@ -247,9 +247,9 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
-| `gate <branch>` (verify) | `POST /v1/projects/{id}/gate`, then `GET /v1/projects/{id}/gate/jobs/{jobId}`; on failure `GET /v1/gate/logs/{id}` | Agent route for the enqueue (`dispatch` and scope) and the wait (scope). The failure log is refused (see `gate log`); without `--project` the project lookup reads `GET /v1/projects` (`dispatch`) | `ap-gate-reads` for the log |
-| `gate list` | `GET /v1/projects/{id}/gate` with `--project`; otherwise `GET /v1/gate/jobs` | Agent route with `--project` (scope). Gap without it: `/v1/gate/jobs` is not admitted for Agent origin, although the handler filters by scope | `ap-gate-reads` |
-| `gate log` | `GET /v1/gate/logs/{id}` | Gap. Not admitted for Agent origin. A seat that gates (main-agent.md §14.1, E2) needs it | `ap-gate-reads` |
+| `gate <branch>` (verify) | `POST /v1/projects/{id}/gate`, then `GET /v1/projects/{id}/gate/jobs/{jobId}`; on failure `GET /v1/gate/logs/{id}` | Agent route. The enqueue (`dispatch` and scope), the wait (scope) and the failure log (the job's project scope, see `gate log`); without `--project` the project lookup reads `GET /v1/projects` (`dispatch`) | — |
+| `gate list` | `GET /v1/projects/{id}/gate` with `--project`; otherwise `GET /v1/gate/jobs` | Agent route. With `--project`, that project's queue (scope); without it the cross-project list, which the handler filters to the caller's project scope | — |
+| `gate log` | `GET /v1/gate/logs/{id}` | Agent route. Checked against the job's project scope; a log from a project outside the caller's scope is 403 `out-of-scope`. A seat that gates (main-agent.md §14.1, E2) reads its failure log | — |
 | `gate cancel` | `POST /v1/projects/{id}/gate/jobs/{jobId}/cancel` | Agent route. `dispatch` for verify jobs, `land` for land jobs | — |
 | `land` | `POST /v1/projects/{id}/gate` (land mode) | Agent route. `land` and scope | — |
 
@@ -260,8 +260,8 @@ The worker subcommands send the worker's name or `wkr_…` id as given; the Hub 
 | Subcommand | Hub route | Today (origin/main) | Planned |
 |---|---|---|---|
 | `dispatch` | `POST /v1/workers/dispatch` | Agent route. `dispatch` and project scope; `--permission-mode` follows "never beyond the creator" (OA1) and an omitted mode inherits the caller's own; another host or a shell-driver carrier needs the D-017 approval, decided before any name, port block or worktree is allocated (main-agent.md §4.2 items 2-4) | — |
-| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route for the worker part: `observe` is scope-wide under `dispatch`. Gap for the cross-project gate read, which is not admitted | `ap-gate-reads` |
-| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route for `GET /v1/workers` (scope-wide under `dispatch`). Gap without `--project`: the gate read is refused | `ap-gate-reads` |
+| `watch` | `POST /v1/workers/observe`, `GET /v1/instances`, `GET /v1/gate/jobs` (active jobs) or `GET /v1/projects/{id}/gate` with `--project` | Agent route. `observe` is scope-wide under `dispatch`; the gate read, with or without `--project`, is filtered to the caller's project scope | — |
+| `report` | `GET /v1/workers`, and the gate queue: `GET /v1/projects/{id}/gate` with `--project`, otherwise `GET /v1/gate/jobs` | Agent route. `GET /v1/workers` is scope-wide under `dispatch`; the gate queue, with or without `--project`, is filtered to the caller's project scope | — |
 | `retire` | `POST /v1/workers/{id}/retire` | Agent route. `dispatch`, project scope, and the worker in the caller's lineage subtree (main-agent.md §4.2 item 1) | — |
 | `worker nudge` | `POST /v1/workers/{id}/nudge` | Agent route. As `retire` | — |
 | `worker answer` | `POST /v1/workers/{id}/answer` | Agent route. As `retire`. It writes keys, so every Agent use needs the D-017 approval (Safety, keystrokes) | — |
@@ -391,7 +391,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 
 | Task | Closes |
 |---|---|
-| `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure` | model, effort and ultracode changes |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |

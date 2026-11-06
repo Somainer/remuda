@@ -611,6 +611,13 @@ fn project_read_target(path: &str) -> bool {
     }
 }
 
+/// ap-gate-reads: `GET /v1/gate/jobs`, which the handler filters to the
+/// caller's project scope, and `GET /v1/gate/logs/{id}`, which the handler
+/// checks against the job's project scope.
+fn gate_read_target(path: &str) -> bool {
+    path == "/v1/gate/jobs" || path.strip_prefix("/v1/gate/logs/").is_some_and(one_segment)
+}
+
 /// `PATCH /v1/projects/{id}`, `POST|DELETE /v1/projects/{id}/members`, or the
 /// batch-6 gate-queue POSTs (enqueue/cancel).
 fn project_write_target(path: &str) -> bool {
@@ -1302,6 +1309,7 @@ pub fn agent_route_admission<'a>(
             // §2.4: coordinators list/read projects and instances
             // inside their scope; handlers re-check grants + scope.
             || project_read_target(path)
+            || gate_read_target(path)
             || task_read_target(method, path)
             || path == "/v1/instances"
             // D-057 §4.2 item 1: scope-wide worker reads; the
@@ -1540,6 +1548,26 @@ mod tests {
                 admission(Method::GET, path),
                 AgentRouteAdmission::Refused,
                 "{path}"
+            );
+        }
+        // ap-gate-reads: scope-wide reads; the handlers filter by scope.
+        for path in ["/v1/gate/jobs", "/v1/gate/logs/gjb_1"] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Admitted,
+                "{path}"
+            );
+        }
+        for (method, path) in [
+            (Method::GET, "/v1/gate/logs/"),
+            (Method::GET, "/v1/gate/logs/gjb_1/extra"),
+            (Method::GET, "/v1/gate/jobs/gjb_1"),
+            (Method::POST, "/v1/gate/jobs"),
+        ] {
+            assert_eq!(
+                admission(method.clone(), path),
+                AgentRouteAdmission::Refused,
+                "{method} {path}"
             );
         }
         assert_eq!(

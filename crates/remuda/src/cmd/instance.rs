@@ -70,6 +70,10 @@ pub(crate) enum InstanceCommand {
         /// `native-turn` or `task`.
         #[arg(long, default_value = "native-turn")]
         completion_scope: String,
+        /// Retry a send the owner approved (D-017: a shell-driver target asks
+        /// once per send) with the approval's interaction id.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
         /// Prompt words after the instance id.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -138,6 +142,39 @@ pub(crate) enum InstanceCommand {
         /// `on` or `off`.
         #[arg(long, value_parser = parse_on_off, value_name = "on|off")]
         auto_continue: Option<bool>,
+    },
+    /// Change the model, effort or ultracode (`instance.configure`). With
+    /// `--expected-generation` the change is refused (409) when someone else
+    /// changed the runtime config since you read it (`instance config`); a
+    /// change that can only take effect at a turn or chapter boundary
+    /// answers `deferred`.
+    Configure {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+        /// Model id.
+        #[arg(long)]
+        model: Option<String>,
+        /// Effort level (`low`, `medium`, `high`, `xhigh`, `max`).
+        #[arg(long)]
+        effort: Option<String>,
+        /// The ultracode switch, independent of the level.
+        #[arg(long, value_parser = parse_on_off, value_name = "on|off")]
+        ultracode: Option<bool>,
+        /// Permission mode (operator only).
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// The generation you read; a stale one is a conflict, not an overwrite.
+        #[arg(long)]
+        expected_generation: Option<u64>,
+        /// Retry with the interaction id of the owner's approval, when asked.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
+    },
+    /// Show the runtime config: the requested and effective values, the
+    /// generation and the changes not yet in effect.
+    Config {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
     },
     /// Close an instance (`instance.close`).
     Rm {
@@ -473,10 +510,12 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 file,
                 command_id,
                 completion_scope,
+                approval_id,
                 prompt,
             } => {
                 let text = load_send_text(text, file, prompt)?;
                 let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let client = client.clone().with_approval(approval_id, false);
                 let value = send(
                     &client,
                     &instance_id,
@@ -564,6 +603,38 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 }
                 let value = client
                     .patch(&format!("/v1/instances/{instance_id}"), &body)
+                    .await?;
+                print_json(&value)
+            }
+            InstanceCommand::Configure {
+                instance_id,
+                model,
+                effort,
+                ultracode,
+                permission_mode,
+                expected_generation,
+                approval_id,
+            } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let client = client.clone().with_approval(approval_id, false);
+                let value = configure(
+                    &client,
+                    &instance_id,
+                    ConfigureOpts {
+                        model,
+                        effort,
+                        ultracode,
+                        permission_mode,
+                        expected_generation,
+                    },
+                )
+                .await?;
+                print_json(&value)
+            }
+            InstanceCommand::Config { instance_id } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let value = client
+                    .get(&format!("/v1/instances/{instance_id}/config"))
                     .await?;
                 print_json(&value)
             }
@@ -823,6 +894,85 @@ async fn list_instance_items(client: &HubClient, host: Option<&str>) -> Result<V
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
+}
+
+/// `remuda instance configure` flags.
+#[derive(Debug, Default)]
+pub(crate) struct ConfigureOpts {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub ultracode: Option<bool>,
+    pub permission_mode: Option<String>,
+    pub expected_generation: Option<u64>,
+}
+
+/// The `instance.configure` payload for `opts`. An ultracode switch without a
+/// level keeps the requested level (`current`) and names the flag axis; a
+/// level change carries the switch as given (off when omitted). Every effort
+/// change carries a fresh `effortRequestId`, so its own edges (and its
+/// `deferred` state) can be followed.
+pub(crate) fn configure_payload(opts: &ConfigureOpts, current: Option<&str>) -> Result<Value> {
+    let mut payload = json!({});
+    if let Some(model) = &opts.model {
+        payload["model"] = json!(model);
+    }
+    let request_id = format!(
+        "effreq_{}",
+        remuda_protocol::CommandId::new()
+            .as_id()
+            .as_str()
+            .trim_start_matches("cmd_")
+    );
+    match (&opts.effort, opts.ultracode) {
+        (Some(name), ultracode) => {
+            payload["effort"] = json!({
+                "name": name,
+                "ultracode": ultracode.unwrap_or(false),
+                "axis": "tier",
+                "requestId": request_id,
+            });
+        }
+        (None, Some(on)) => {
+            let Some(name) = current else {
+                bail!("--ultracode needs a level: pass --effort as well");
+            };
+            payload["effort"] = json!({
+                "name": name, "ultracode": on, "axis": "flag", "requestId": request_id,
+            });
+        }
+        (None, None) => {}
+    }
+    if let Some(mode) = &opts.permission_mode {
+        payload["permissionMode"] = json!(mode);
+    }
+    if payload.as_object().is_some_and(serde_json::Map::is_empty) {
+        bail!("nothing to change: pass --model, --effort, --ultracode or --permission-mode");
+    }
+    if let Some(generation) = opts.expected_generation {
+        payload["expectedGeneration"] = json!(generation);
+    }
+    Ok(payload)
+}
+
+pub(crate) async fn configure(
+    client: &HubClient,
+    instance_id: &str,
+    opts: ConfigureOpts,
+) -> Result<Value> {
+    let current = if opts.effort.is_none() && opts.ultracode.is_some() {
+        client
+            .get(&format!("/v1/instances/{instance_id}/config"))
+            .await?
+            .pointer("/effort/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let payload = configure_payload(&opts, current.as_deref())?;
+    Ok(client
+        .post_command(instance_id, "instance.configure", payload, None)
+        .await?)
 }
 
 pub(crate) async fn send(
@@ -1865,6 +2015,64 @@ mod tests {
         assert_eq!(normalize_driver("pty"), "generic-pty");
         assert!(tty_attach_driver("pty"));
         assert!(!tty_attach_driver("claude-print"));
+    }
+
+    /// cb-command-queue: the configure payload carries what changes, a fresh
+    /// effort request id, and the generation the caller read.
+    #[test]
+    fn configure_payload_names_axes_and_the_expected_generation() {
+        let level = configure_payload(
+            &ConfigureOpts {
+                effort: Some("high".into()),
+                expected_generation: Some(3),
+                ..ConfigureOpts::default()
+            },
+            None,
+        )
+        .expect("level");
+        assert_eq!(level["effort"]["name"], "high");
+        assert_eq!(level["effort"]["ultracode"], false);
+        assert_eq!(level["effort"]["axis"], "tier");
+        assert!(
+            level["effort"]["requestId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("effreq_"))
+        );
+        assert_eq!(level["expectedGeneration"], 3);
+        let flag = configure_payload(
+            &ConfigureOpts {
+                ultracode: Some(true),
+                ..ConfigureOpts::default()
+            },
+            Some("xhigh"),
+        )
+        .expect("flag");
+        assert_eq!(
+            flag["effort"]["name"], "xhigh",
+            "the requested level is kept"
+        );
+        assert_eq!(flag["effort"]["axis"], "flag");
+        assert!(flag.get("expectedGeneration").is_none());
+        assert!(
+            configure_payload(
+                &ConfigureOpts {
+                    ultracode: Some(true),
+                    ..ConfigureOpts::default()
+                },
+                None
+            )
+            .is_err()
+        );
+        assert!(configure_payload(&ConfigureOpts::default(), None).is_err());
+        let model = configure_payload(
+            &ConfigureOpts {
+                model: Some("claude-opus-5-5".into()),
+                ..ConfigureOpts::default()
+            },
+            None,
+        )
+        .expect("model");
+        assert_eq!(model, serde_json::json!({ "model": "claude-opus-5-5" }));
     }
 
     #[test]

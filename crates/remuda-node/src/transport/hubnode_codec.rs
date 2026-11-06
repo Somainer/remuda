@@ -218,6 +218,10 @@ pub async fn dispatch_frame(
     frame: MethodFrame,
 ) -> Result<Value, NodeError> {
     crate::herdr_claim::refuse_non_human_write(node, method, &params)?;
+    // cb-command-queue: edit or withdraw a prompt a PTY queue still holds.
+    if DevNode::is_held_input_method(method) {
+        return node.held_input_rpc(method, &params);
+    }
     if method == remuda_protocol::METHOD_LINEAGE_FENCE {
         return node.apply_lineage_fence(&params).await;
     }
@@ -915,6 +919,7 @@ pub fn node_capabilities(host: Option<&Value>) -> Value {
         remuda_protocol::LINEAGE_FENCE_CAPABILITY: true,
         remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY: true,
         remuda_protocol::hubnode::SKILL_CONTEXT_CAPABILITY: true,
+        remuda_protocol::hubnode::HELD_INPUT_CAPABILITY: true,
     });
     if let Some(inventory) = host
         .and_then(|host| host.get("driverInventory"))
@@ -1137,7 +1142,7 @@ mod tests {
         // memory-context and skill-context support.
         assert_eq!(
             params["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true, "heldInput": true})
         );
     }
 

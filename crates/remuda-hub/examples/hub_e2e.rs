@@ -888,6 +888,9 @@ fn node_hello_frame(
                 // every non-route spec then hits api-via-unsupported exactly
                 // as a pre-D-048 Node would.
                 "apiRelay": std::env::var("HUB_E2E_API_ROUTE").as_deref() == Ok("1"),
+                // cb-command-queue: this fake answers command.withdraw and
+                // command.edit for the sends it holds (`__held__` prompts).
+                "heldInput": true,
                 // c-routedto: D-057 lineage fences, so a continuity seat may
                 // dispatch a child here (an Agent-origin create on a Node
                 // without them is 409 node-lacks-fence). Absent by default —
@@ -1145,6 +1148,9 @@ async fn fake_node(
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
     let mut instance_kinds: HashMap<String, String> = HashMap::new();
+    // cb-command-queue: sends this fake holds undelivered (a `__held__`
+    // prompt), by commandId, with the revision their edits reached.
+    let mut held_sends: HashMap<String, u64> = HashMap::new();
     // §9.1 model-sync: per-instance catalog ids remembered at launch so a
     // configure verdict can attribute the switch path (listed vs typed).
     let mut model_catalogs: HashMap<String, Vec<String>> = HashMap::new();
@@ -2177,6 +2183,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // cb-command-queue: `__held__…` models a PTY queue holding
+                    // the prompt behind a busy turn — accepted, never written,
+                    // never settled — so the session's 排队中 list shows it and
+                    // command.edit / command.withdraw reach this Node.
+                    if prompt.starts_with("__held__") {
+                        if let Some(cid) = command_id {
+                            held_sends.insert(cid.to_string(), 0);
+                            send_command_result_reply(&mut ws, id, cid, &instance_id).await?;
+                        } else {
+                            send_rpc_ok(&mut ws, id, json!({ "accepted": true })).await?;
+                        }
+                        continue;
+                    }
                     // c-reconnfu: `__gate_journal__` answers the send with the
                     // REAL typed CommandResult immediately (the shared
                     // send_command_result_reply builder — never a hand-built
@@ -2769,6 +2788,45 @@ async fn fake_node(
                     // The acceptance RPC was already sent by accept_instance_send
                     // above (durable user append → real CommandResult), before
                     // the turn output streamed — matching DevNode enqueue/accept.
+                }
+                // cb-command-queue: the held-input methods, first-wins against
+                // a delivery this fake never makes (a held send stays held).
+                "command.withdraw" => {
+                    let cid = params
+                        .get("commandId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let outcome = if held_sends.remove(cid).is_some() {
+                        "withdrawn"
+                    } else {
+                        "already-delivered"
+                    };
+                    send_rpc_ok(&mut ws, id, json!({ "commandId": cid, "outcome": outcome }))
+                        .await?;
+                }
+                "command.edit" => {
+                    let cid = params
+                        .get("commandId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let expected = params
+                        .get("expectedRevision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let (outcome, revision) = match held_sends.get_mut(cid) {
+                        Some(revision) if *revision == expected => {
+                            *revision = expected + 1;
+                            ("edited", *revision)
+                        }
+                        Some(revision) => ("revision-conflict", *revision),
+                        None => ("already-delivered", expected),
+                    };
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "commandId": cid, "outcome": outcome, "revision": revision }),
+                    )
+                    .await?;
                 }
                 "instance.cancel" => {
                     // §5.3: the turn ends but the instance keeps running.

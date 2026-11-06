@@ -192,6 +192,12 @@ pub fn strip_memory_context_block(text: &str) -> &str {
 /// advertises this.
 pub const SKILL_CONTEXT_CAPABILITY: &str = "skillContext";
 
+/// Hello `capabilities` key (cb-command-queue, protocol.md §7.2 2026-11-05):
+/// `true` when this Node answers `command.withdraw` and `command.edit` for the
+/// prompts its PTY queues hold. Without it the Hub treats every Node-held
+/// prompt as already delivered.
+pub const HELD_INPUT_CAPABILITY: &str = "heldInput";
+
 /// `skillContext` on forwarded `instance.create` / `instance.resume` params
 /// (ma-skill, D-060 item 5, main-agent.md §3.4.1): the launch facts the seat's
 /// capability section is generated from.

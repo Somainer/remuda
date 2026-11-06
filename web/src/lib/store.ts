@@ -5,7 +5,12 @@ import { nowMs } from "./clock";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
-import type { Command, CommandSettlementOutcome } from "../types/command";
+import type {
+  Command,
+  CommandResult,
+  CommandSettlementOutcome,
+  ConfigureBoundary,
+} from "../types/command";
 import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
@@ -74,6 +79,7 @@ import {
   type PasskeyAttestationBody,
   type PasskeyView,
   type PtyKey,
+  type QueuedCommand,
   type ResumeMode,
   type SeenView,
   type WorktreeCreateSpec,
@@ -248,6 +254,12 @@ export type EffortPending = {
   ultracode: boolean;
   /** True while the agent is working — it applies at the next idle. */
   queued: boolean;
+  /**
+   * cb-command-queue: the boundary the Hub said this change waits for
+   * (`deferred` on the configure answer); the chip reads 下一回合生效 /
+   * 下一章节生效 instead of predicting from activity.
+   */
+  deferred?: ConfigureBoundary;
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
   /**
@@ -457,6 +469,8 @@ const SCREEN_SKIP_LIFECYCLES: ReadonlySet<Instance["lifecycle"]> = new Set(["exi
 export type ModelPending = {
   id: string;
   queued: boolean;
+  /** cb-command-queue: the boundary the Hub said this switch waits for. */
+  deferred?: ConfigureBoundary;
   at: number;
 };
 
@@ -902,6 +916,16 @@ export type HubState = {
   modelCatalogs: Record<string, ModelCatalogView>;
   /** §9.1 a model switch in flight (切换中/排队中 until the verdict lands). */
   modelPending: Record<string, ModelPending>;
+  /**
+   * cb-command-queue: the caller's own undelivered sends per instance
+   * (`GET /v1/commands?mine=1&state=queued`), for the session's 排队中 list.
+   */
+  queuedCommands: Record<string, QueuedCommand[]>;
+  /**
+   * cb-command-queue: a change the Hub deferred to the next chapter (a
+   * carrier with no in-session channel for it); shown until the session ends.
+   */
+  configDeferred: Record<string, { boundary: ConfigureBoundary; at: number }>;
   compact: boolean;
   answering: Record<string, true>;
   screens: Record<string, ScreenEntry>;
@@ -963,6 +987,8 @@ const initial: HubState = {
   modelEffective: {},
   modelCatalogs: {},
   modelPending: {},
+  queuedCommands: {},
+  configDeferred: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
@@ -1244,6 +1270,11 @@ function classifyCommandLike(
   if (command.state === "settled" && command.settlement?.outcome === "rejected") {
     return "rejected";
   }
+  // cb-command-queue: withdrawn by its queuer (this device, another one, or
+  // the owner) — never delivered and never re-sent, so 未送达 · 已撤回.
+  if (command.state === "settled" && command.settlement?.outcome === "withdrawn") {
+    return "rejected";
+  }
   if (command.state === "queued" && !command.forwarded) {
     return "held";
   }
@@ -1256,8 +1287,21 @@ function classifyCommandLike(
   return "sent";
 }
 
+/** Stable empty list, so a session without queued sends never re-renders. */
+const EMPTY_QUEUED: QueuedCommand[] = [];
+
+/** The inline reason a 未送达 bubble shows for a settled command. */
+function rejectionReason(settlement?: { outcome?: string; reason?: string } | null): string {
+  if (settlement?.outcome === "withdrawn") return "已撤回";
+  return settlement?.reason ?? "rejected by node";
+}
+
 class HubStore {
   private state: HubState = initial;
+  /** cb-command-queue: this tab's configures still awaiting their answer. */
+  private configuresInFlight = new Map<Id, number>();
+  /** cb-command-queue: the newest generation a configure answer named. */
+  private configureGenerations = new Map<Id, number>();
   private listeners = new Set<Listener>();
   /**
    * home.md §8: refresh outcomes behind the home freshness rules. Kept OFF
@@ -5311,7 +5355,7 @@ class HubStore {
           state: "rejected",
           serverState: result?.state,
           gotResponse: true,
-          lastError: result?.settlement?.reason ?? "rejected by node",
+          lastError: rejectionReason(result?.settlement),
         }))) {
           return;
         }
@@ -5614,7 +5658,7 @@ class HubStore {
           state: "rejected",
           serverState: result.command.state,
           gotResponse: true,
-          lastError: result.command.settlement?.reason ?? "rejected by node",
+          lastError: rejectionReason(result.command.settlement),
         });
       } else if (classified === "held") {
         // Node offline: Hub holds the row; bounded same-id retry, no attempt
@@ -8264,7 +8308,7 @@ class HubStore {
           state: "rejected",
           serverState: record.state,
           gotResponse: true,
-          lastError: record.settlement?.reason ?? "rejected by node",
+          lastError: rejectionReason(record.settlement),
         });
       } else if (verdict === "sent") {
         await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
@@ -8439,7 +8483,7 @@ class HubStore {
           },
         }
       : extras;
-    await api.instanceConfigure(instanceId, permissionMode, wireExtras);
+    const result = await this.configureWithGeneration(instanceId, permissionMode, wireExtras);
     // c-effortui r2 item 2: a request's HTTP success lands AFTER the user
     // replaced it with a newer request must not overwrite the newer choice.
     // The effort post-emit is gated on the captured request nonce; the
@@ -8454,6 +8498,119 @@ class HubStore {
         : {}),
       ...(extras?.model ? { models: { ...this.state.models, [instanceId]: extras.model } } : {}),
     });
+    return result;
+  }
+
+  /**
+   * cb-command-queue: post a configure carrying the runtime-config generation
+   * it is based on (the newest a configure answer named, else the instance
+   * projection's `configureSeq`), so a write the owner or Main made since is
+   * a 409, not an overwrite. While another configure of THIS tab is still in
+   * flight for the instance its generation is not known yet, so the
+   * follow-up (a tier drag, then the ultracode switch) goes without one
+   * rather than conflicting with itself. On a 409 the current values are
+   * reloaded and the caller's own rollback runs.
+   */
+  private async configureWithGeneration(
+    instanceId: Id,
+    permissionMode: string,
+    extras: Parameters<typeof api.instanceConfigure>[2],
+  ): Promise<CommandResult | undefined> {
+    const inFlight = this.configuresInFlight.get(instanceId) ?? 0;
+    const known = this.configureGenerations.get(instanceId);
+    const projected = this.state.instances.find((row) => row.id === instanceId)?.configureSeq;
+    const based =
+      typeof known === "number" && typeof projected === "number"
+        ? Math.max(known, projected)
+        : (known ?? projected);
+    const expectedGeneration = inFlight === 0 ? based : undefined;
+    this.configuresInFlight.set(instanceId, inFlight + 1);
+    try {
+      const result = await api.instanceConfigure(instanceId, permissionMode, {
+        ...extras,
+        ...(typeof expectedGeneration === "number" ? { expectedGeneration } : {}),
+      });
+      if (typeof result?.generation === "number") {
+        this.configureGenerations.set(
+          instanceId,
+          Math.max(result.generation, this.configureGenerations.get(instanceId) ?? 0),
+        );
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof HubHttpError && error.code === "CONFIG_GENERATION_CONFLICT") {
+        // Re-seed from the current generation, so the user's next choice is
+        // again a CAS against what they were just shown.
+        const current = await api
+          .instanceConfig(instanceId)
+          .then((view) => view.generation, () => undefined);
+        if (typeof current === "number") this.configureGenerations.set(instanceId, current);
+        else this.configureGenerations.delete(instanceId);
+        await this.refresh().catch(() => undefined);
+        throw new HubHttpError(409, error.code, "配置已在别处被修改，已载入当前值，请按当前值重新选择");
+      }
+      throw error;
+    } finally {
+      const left = (this.configuresInFlight.get(instanceId) ?? 1) - 1;
+      if (left > 0) this.configuresInFlight.set(instanceId, left);
+      else this.configuresInFlight.delete(instanceId);
+    }
+  }
+
+  /** cb-command-queue: a next-chapter deferral for `instanceId`, if any. */
+  configDeferredOf(instanceId: Id): ConfigureBoundary | null {
+    return this.state.configDeferred[instanceId]?.boundary ?? null;
+  }
+
+  /** cb-command-queue: the caller's own undelivered sends to `instanceId`. */
+  queuedCommandsOf(instanceId: Id): QueuedCommand[] {
+    return this.state.queuedCommands[instanceId] ?? EMPTY_QUEUED;
+  }
+
+  /** cb-command-queue: re-read the caller's queued sends to `instanceId`. */
+  async loadQueuedCommands(instanceId: Id): Promise<void> {
+    if (api.mock) return;
+    try {
+      const rows = (await api.queuedCommands(instanceId)).filter(
+        (row) => row.operation === "instance.send",
+      );
+      const current = this.state.queuedCommands[instanceId];
+      if (current && structuralEqual(current, rows)) return;
+      if (!current && rows.length === 0) return;
+      this.emit({ queuedCommands: { ...this.state.queuedCommands, [instanceId]: rows } });
+    } catch {
+      // Best effort: the list is a convenience over the transcript's own
+      // bubbles; the next read retries.
+    }
+  }
+
+  /**
+   * cb-command-queue: replace a queued send's text (same commandId, revision
+   * CAS). The outbox row and its bubble follow, so a later same-id replay and
+   * the transcript both carry the edited text.
+   */
+  async editQueuedCommand(instanceId: Id, row: QueuedCommand, text: string): Promise<void> {
+    const commandId = row.commandId as Id;
+    try {
+      await api.editQueuedCommand(commandId, row.revision ?? 0, text);
+      if (this.outbox?.get(commandId)) await this.outbox.patch(commandId, { prompt: text });
+    } finally {
+      await this.loadQueuedCommands(instanceId);
+    }
+  }
+
+  /**
+   * cb-command-queue: withdraw a queued send. It is never delivered; the
+   * outbox row is dropped so nothing re-sends it.
+   */
+  async withdrawQueuedCommand(instanceId: Id, row: QueuedCommand): Promise<void> {
+    const commandId = row.commandId as Id;
+    try {
+      await api.withdrawQueuedCommand(commandId);
+      if (this.outbox?.get(commandId)) await this.outbox.remove(commandId);
+    } finally {
+      await this.loadQueuedCommands(instanceId);
+    }
   }
 
   /** §9.1: pending effort push-down for an instance, if any. */
@@ -8706,12 +8863,35 @@ class HubStore {
       effort: { ...this.state.effort, [instanceId]: effort },
     });
     try {
-      await this.configure(
+      const result = await this.configure(
         instanceId,
         this.permissionModeOf(instanceId),
         { effort, effortAxis: axis, effortRequestId: requestId },
         { effortNonce: nonce },
       );
+      // cb-command-queue: the Hub names the boundary a deferred change waits
+      // for; a next-chapter one has no in-session read-back to wait on.
+      const boundary = result?.command?.deferred?.boundary;
+      if (boundary && this.state.effortPending[instanceId]?.nonce === nonce) {
+        if (boundary === "next-chapter") {
+          const nextPending = { ...this.state.effortPending };
+          delete nextPending[instanceId];
+          this.emit({
+            effortPending: nextPending,
+            configDeferred: {
+              ...this.state.configDeferred,
+              [instanceId]: { boundary, at: Date.now() },
+            },
+          });
+          return;
+        }
+        this.emit({
+          effortPending: {
+            ...this.state.effortPending,
+            [instanceId]: { ...this.state.effortPending[instanceId], deferred: boundary, queued: true },
+          },
+        });
+      }
       // Re-request authoritative state once the command is accepted. The
       // driver projects the read-back before acking, so folding the durable
       // record settles the chip from the Hub even when this client's live
@@ -8855,7 +9035,17 @@ class HubStore {
       },
     });
     try {
-      await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
+      const result = await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
+      const boundary = result?.command?.deferred?.boundary;
+      const current = this.state.modelPending[instanceId];
+      if (boundary && current?.id === model) {
+        this.emit({
+          modelPending: {
+            ...this.state.modelPending,
+            [instanceId]: { ...current, deferred: boundary, queued: true },
+          },
+        });
+      }
     } catch (error) {
       // A post the Hub/Node refused (offline node, 4xx, network) must be
       // pixel-distinguishable from a switch that worked: clear pending,
@@ -8914,8 +9104,9 @@ class HubStore {
     try {
       // Configure with permission only (no effort/model): the Node forwards it
       // as a ModelSwitch carrying permissionMode, which the PTY driver turns
-      // into a shift+tab wheel walk.
-      await api.instanceConfigure(instanceId, this.permissionModeOf(instanceId), {
+      // into a shift+tab wheel walk. It is a configure like any other, so it
+      // carries and records the runtime-config generation (cb-command-queue).
+      await this.configureWithGeneration(instanceId, this.permissionModeOf(instanceId), {
         permissionMode: mode,
       });
     } catch (error) {

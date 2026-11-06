@@ -615,6 +615,12 @@ pub fn render_section(context: &SkillContext) -> String {
         "Any seat:\n\
          - the instances you own: `remuda instance read`, `remuda instance wait`, \
          `remuda instance send`, `remuda instance stop`;\n\
+         - their runtime config: `remuda instance config`, then \
+         `remuda instance configure` for model, effort or ultracode with the generation you \
+         read;\n\
+         - the commands you queued that have not been delivered: `remuda cmd ls`, \
+         `remuda cmd edit`, `remuda cmd withdraw`, and `remuda cmd deliver` once the host is \
+         back;\n\
          - the board inside your scope: `remuda task list`, `remuda task show`, \
          `remuda own check`, `remuda own list`.\n\n",
     );

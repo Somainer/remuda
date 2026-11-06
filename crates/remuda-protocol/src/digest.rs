@@ -83,15 +83,19 @@ pub struct DigestEffort {
     pub effective: Option<String>,
 }
 
-/// An `instance.configure` command that has not settled.
+/// An `instance.configure` command that is not in effect yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DigestConfigure {
-    /// Command state: `queued` or `accepted`.
+    /// `queued` (the Hub has not forwarded it), `accepted`, or `deferred`
+    /// (it waits for a turn or chapter boundary; cb-command-queue).
     pub state: String,
     /// The per-request id the effort switch carries, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// For `deferred`: `next-turn` or `next-chapter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
 }
 
 /// Requested vs effective model, with effort and a pending configure nested in.
@@ -106,7 +110,11 @@ pub struct DigestModel {
     pub effective: Option<String>,
     /// Requested vs effective effort.
     pub effort: DigestEffort,
-    /// An unsettled `instance.configure`.
+    /// The runtime-config generation (`configureSeq`): a configure carrying
+    /// `expectedGeneration` must name it (cb-command-queue).
+    #[serde(default)]
+    pub generation: u64,
+    /// The newest `instance.configure` not in effect yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configure: Option<DigestConfigure>,
 }

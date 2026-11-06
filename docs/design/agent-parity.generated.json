@@ -268,7 +268,8 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/memory-writes",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {

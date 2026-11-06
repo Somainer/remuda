@@ -81,7 +81,7 @@ Two limits recur below:
 | Read the transcript; load earlier; the events tab | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | Follow the session live | `GET /v1/follow` (WebSocket) | Agent route by another path: the socket is not admitted for Agent origin, and an agent reads the same journal by cursor (`remuda instance read`, `remuda instance wait`) | Phase 2 facts push changes to the parent (`cb-inbox-facts`, `cb-inbox-deliver`) |
 | See usage and context | `GET /v1/instances/{id}` (the projection's `usageRollup`) | Agent route. Owned targets | — |
-| See what the session remembered (`已记住` receipts, the transcript's write rows) | `GET /v1/instances/{id}/memory-writes` | Gap. Not admitted for Agent origin (`restrict_agent_routes` has no shape for it), although the rows are one writer chapter's own writes; the handler admits Human and Bot (`crates/remuda-hub/src/memory.rs`). An agent reads the entries themselves through the memory routes below | `ap-memory-writes` |
+| See what the session remembered (`已记住` receipts, the transcript's write rows) | `GET /v1/instances/{id}/memory-writes` | Agent route. Owned targets (`owns()`), narrowed by the handler to the chapters of the caller's own lineage, the same scope as the entries it reads through the memory routes below: a child's or any other seat's write log is that seat's memory and is refused with 403 `not-owner` (`crates/remuda-hub/src/memory.rs`) | — |
 | Mark the session seen on this device | `POST /v1/instances/{id}/seen` | Safety. Records are truthful: the seen mark records what the owner looked at (D-060 `seen-hub`); only a Human device credential may advance it (`crates/remuda-hub/src/instances.rs`) | — |
 | Send a new turn | commands, `instance.send` | Agent route. The send rule | — |
 | Queue a prompt while the session works | held in the browser, then `instance.send` in queue mode | Agent route. The send rule | — |
@@ -396,7 +396,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
-| `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |
 | `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |
 | `ap-supply-read` | `profile catalog`, `list`, `show`, `usage`, `probe`; the provider list; the model and supply catalog |

@@ -346,6 +346,9 @@ fn read_target(path: &str) -> Option<&str> {
         // ap-command-read: the command ledger, so an Agent reconciles a send
         // by its commandId (D-055) instead of re-sending it.
         Some("commands") => true,
+        // ap-memory-writes: the handler narrows this to the caller's own
+        // lineage's chapters.
+        Some("memory-writes") => true,
         Some(suffix) => {
             suffix.strip_prefix("commands/").is_some_and(one_segment)
                 // ap-subagent-read: a subagent's transcript.
@@ -569,6 +572,24 @@ pub async fn require_worker_owned(
     } else {
         Err(HubError::not_owner())
     }
+}
+
+/// Whether `instance_id` is a chapter of the Agent device's own lineage: the
+/// bound chapter itself, or a predecessor or successor of it, never a child.
+pub(crate) async fn is_own_chapter(
+    state: &AppState,
+    device: &Device,
+    instance_id: &str,
+) -> Result<bool, HubError> {
+    let Some(lineage) = state
+        .store
+        .lineage_id_for_instance(instance_id.to_string())
+        .await
+        .map_err(crate::http::map_store)?
+    else {
+        return Ok(false);
+    };
+    agent_owns_lineage(state, device, &lineage).await
 }
 
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
@@ -1593,6 +1614,16 @@ mod tests {
                 "{path}"
             );
         }
+        // ap-memory-writes: an owned instance; the handler narrows it to the
+        // caller's own lineage.
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/memory-writes"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/memory-writes/x"),
+            AgentRouteAdmission::Refused
+        );
         assert_eq!(
             admission(Method::GET, "/v1/login"),
             AgentRouteAdmission::MiddlewareSkipped

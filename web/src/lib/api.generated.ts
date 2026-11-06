@@ -233,6 +233,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/bot/card-tickets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Open card tickets for dispatcher restart hydration
+         * @description Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Lists this bot device's open tickets that are not yet due at `nowMs`.
+         */
+        get: operations["botCardTicketList"];
+        put?: never;
+        /**
+         * Upsert one card ticket, stamped with the bot device
+         * @description Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. A blank id, session key or request, or `expiresAtMs` not after `createdAtMs`, is a 400.
+         */
+        post: operations["botCardTicketUpsert"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/bot/card-tickets/expire-session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Expire every open ticket of one chat session (`/new`, `/stop`)
+         * @description Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it.
+         */
+        post: operations["botCardTicketsExpireSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/bot/card-tickets/{id}/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Set a card ticket's state
+         * @description Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Only this bot device's ticket is changed.
+         */
+        post: operations["botCardTicketSetState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/bot/owner-allowlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replace the owner open_id allowlist the dispatcher relays for
+         * @description Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Replaces the previous list; ids are sorted and deduplicated. An empty list is allowed and fails closed: every relayed answer is then refused. A blank id is a 400.
+         */
+        post: operations["botOwnerAllowlistSet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/caller": {
         parameters: {
             query?: never;
@@ -2393,6 +2477,64 @@ export interface components {
             columns: components["schemas"]["BoardColumns"];
             /** @description Project slice the board was projected for; null for every project in scope. */
             project?: string | null;
+        };
+        BotCardTicket: {
+            cardMessageId: string | null;
+            createdAtMs: number;
+            expiresAtMs: number;
+            instanceId: string;
+            interactionId: string;
+            processGeneration: string;
+            requestJson: string;
+            requestVersion: string;
+            sessionKey: string;
+            state: string;
+            ticketId: string;
+        };
+        BotCardTicketPage: {
+            tickets: components["schemas"]["BotCardTicket"][];
+        };
+        /** @description A Feishu card ↔ interaction ticket, persisted so a dispatcher restart keeps open cards answerable. */
+        BotCardTicketRequest: {
+            cardMessageId?: string | null;
+            createdAtMs: number;
+            /** @description Must be after `createdAtMs`. */
+            expiresAtMs: number;
+            instanceId: string;
+            interactionId: string;
+            processGeneration: string;
+            requestJson: string;
+            requestVersion: string;
+            sessionKey: string;
+            /**
+             * @description Defaults to `open`.
+             * @enum {string}
+             */
+            state?: "open" | "answered" | "expired";
+            ticketId: string;
+        };
+        BotCardTicketStateRequest: {
+            cardMessageId?: string | null;
+            /** @enum {string} */
+            state: "open" | "answered" | "expired";
+        };
+        BotExpireSessionRequest: {
+            sessionKey: string;
+        };
+        BotExpiredTickets: {
+            expiredTicketIds: string[];
+        };
+        BotOk: {
+            /** @constant */
+            ok: true;
+        };
+        BotOwnerAllowlist: {
+            deviceId: string;
+            ownerOpenIds: string[];
+        };
+        BotOwnerAllowlistRequest: {
+            /** @description Feishu `open_id`s the dispatcher may answer on behalf of. */
+            ownerOpenIds: string[];
         };
         CallerContext: {
             /** @description Direct children created by this instance; descendants do not inherit scope. */
@@ -5234,6 +5376,141 @@ export interface operations {
                     "application/json": components["schemas"]["BoardView"];
                 };
             };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    botCardTicketList: {
+        parameters: {
+            query?: {
+                /** @description Hydration cursor (unix ms); tickets due by then are excluded. Defaults to the Hub's clock. */
+                nowMs?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Open tickets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BotCardTicketPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    botCardTicketUpsert: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BotCardTicketRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored ticket */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BotCardTicket"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    botCardTicketsExpireSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BotExpireSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Expired ticket ids */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BotExpiredTickets"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    botCardTicketSetState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BotCardTicketStateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BotOk"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    botOwnerAllowlistSet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BotOwnerAllowlistRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BotOwnerAllowlist"];
+                };
+            };
+            400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
         };

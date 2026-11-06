@@ -1297,25 +1297,40 @@ impl GateRegistry {
             return Ok(());
         };
         fault.entered.notify_one();
-        let mut guard = fault
-            .release
-            .0
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        while !*guard {
-            let (next, wait) = fault
+        let park = || {
+            let mut guard = fault
                 .release
-                .1
-                .wait_timeout(guard, Duration::from_secs(30))
+                .0
+                .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            guard = next;
-            if wait.timed_out() {
-                return Err(std::io::Error::other(
-                    "test land-fence persistence hold was never released",
-                ));
+            while !*guard {
+                let (next, wait) = fault
+                    .release
+                    .1
+                    .wait_timeout(guard, Duration::from_secs(30))
+                    .unwrap_or_else(|poison| poison.into_inner());
+                guard = next;
+                if wait.timed_out() {
+                    return Err(std::io::Error::other(
+                        "test land-fence persistence hold was never released",
+                    ));
+                }
             }
+            Ok(())
+        };
+        // The park blocks this worker thread. If the worker was the one
+        // driving the runtime's timer, no other worker takes that over, so
+        // every tokio sleep (the abortLanding handler's wait among them)
+        // stalls until the watchdog fires. block_in_place hands the worker's
+        // core, driver duty included, to another thread first.
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if multi_thread {
+            tokio::task::block_in_place(park)?;
+        } else {
+            park()?;
         }
-        drop(guard);
         if fault.fail {
             Err(std::io::Error::other(
                 "injected land fence persistence failure",
@@ -7675,16 +7690,34 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             std::thread::sleep(Duration::from_millis(10));
         }
         // Deliver the abort as a MESSAGE (the handler under test) while the
-        // child is parked and the run is still in flight.
+        // child is parked and the run is still in flight. The handler latches
+        // the message, then waits for the owner to unregister, which cannot
+        // happen until the hold is released: release it as soon as the run's
+        // land-abort latch is observed, never after a fixed wait.
+        let mut latched = {
+            let table = fixture.node.gate_registry().runs.lock().await;
+            table
+                .runs
+                .get("gjb_abort_msg")
+                .expect("the parked run is registered")
+                .land_abort
+                .subscribe()
+        };
         let abort_params = serde_json::json!({
             "jobId": "gjb_abort_msg",
             "generation": 1u32,
         });
-        fixture
-            .node
-            .abort_gate_landing(&abort_params)
-            .await
-            .expect("abortLanding accepted");
+        let abort = fixture.node.abort_gate_landing(&abort_params);
+        tokio::pin!(abort);
+        tokio::select! {
+            biased;
+            answered = &mut abort => panic!(
+                "abortLanding returned while the owner was parked: {answered:?}"
+            ),
+            seen = latched.wait_for(|aborted| *aborted) => {
+                seen.expect("the land-abort latch is set");
+            }
+        }
         assert!(
             !run.is_finished(),
             "the parked child keeps the run alive until released"
@@ -7697,6 +7730,7 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             *done = true;
             cvar.notify_one();
         }
+        abort.await.expect("abortLanding accepted");
         let result = tokio::time::timeout(Duration::from_secs(30), run)
             .await
             .expect("run finished")

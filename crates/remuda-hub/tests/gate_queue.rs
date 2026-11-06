@@ -19,6 +19,10 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 struct RunSpec {
     delay_ms: u64,
     wait_cancel: bool,
+    /// When set, the run holds (instead of `delay_ms`) until the test calls
+    /// `notify_one` — so a test can observe the job Running for as long as it
+    /// needs, however slowly its polls land.
+    release: Option<Arc<Notify>>,
     events: Vec<Value>,
     status: &'static str,
     merge_sha: Option<&'static str>,
@@ -60,6 +64,7 @@ impl Default for RunSpec {
         Self {
             delay_ms: 20,
             wait_cancel: false,
+            release: None,
             events: Vec::new(),
             status: "passed",
             merge_sha: None,
@@ -422,10 +427,16 @@ async fn run_one_inline(
     }
 
     // Wait, pumping inbound RPCs (notably gate.cancel) the whole time.
-    let deadline = (!spec.wait_cancel).then(|| Duration::from_millis(spec.delay_ms));
+    let deadline =
+        (!spec.wait_cancel && spec.release.is_none()).then(|| Duration::from_millis(spec.delay_ms));
     loop {
         tokio::select! {
             _ = tokio::time::sleep(deadline.unwrap_or(Duration::MAX)), if deadline.is_some() => {
+                break;
+            }
+            () = async { spec.release.as_ref().expect("guarded").notified().await },
+                if spec.release.is_some() =>
+            {
                 break;
             }
             frame = node.next() => {
@@ -1245,13 +1256,16 @@ async fn land_losing_the_cas_is_reverified_onto_new_main_then_lands() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
     let ctx = Ctx::spawn(1).await?;
-    // A lingers; B and C must queue behind it in that order. B holds until
-    // canceled (rather than racing a fixed delay) so the "C still queued
-    // behind a running B" assertion is deterministic under host load.
+    // A holds until released and B until canceled (rather than racing fixed
+    // delays), so B and C must queue behind a Running A, and the "C still
+    // queued behind a running B" assertion is deterministic under host load.
+    // A fixed 1500 ms run for A was shorter than enqueueing B and C plus the
+    // first poll on a loaded host: A had already passed when it was polled.
+    let release_a = Arc::new(Notify::new());
     ctx.scripts[0].script(
         "wt/a/fifo",
         RunSpec {
-            delay_ms: 1500,
+            release: Some(release_a.clone()),
             ..RunSpec::default()
         },
     );
@@ -1279,6 +1293,7 @@ async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(ctx.job(b["id"].as_str().unwrap()).await["state"], "queued");
     assert_eq!(ctx.job(c["id"].as_str().unwrap()).await["state"], "queued");
+    release_a.notify_one();
     let _ = ctx.wait_state(a["id"].as_str().unwrap(), &["passed"]).await;
     // B must be running while C is still queued — B holds until canceled, so
     // this ordering cannot be missed between two scheduler polls.

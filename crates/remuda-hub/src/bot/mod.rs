@@ -5,9 +5,9 @@
 //! relays are restricted to, and persisting card ↔ interaction tickets so a
 //! dispatcher restart keeps open cards answerable.
 //!
-//! They are deliberately absent from `openapi/openapi.json`: the web client
-//! never calls them and they sit beside Node RPC as internal Hub machinery.
-//! Everything here fails closed — a missing allowlist entry is a 403, never a
+//! The web client never calls them; they sit beside Node RPC as internal Hub
+//! machinery, and `openapi/openapi.json` documents them under the `bot` tag
+//! like every other registered route. Everything here fails closed — a missing allowlist entry is a 403, never a
 //! silent allow, and the bot can never bypass approvals (D-005/D-011).
 
 use crate::AppState;

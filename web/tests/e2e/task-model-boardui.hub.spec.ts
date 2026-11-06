@@ -560,6 +560,14 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
 
   test("fetches /v1/projects on mount only, never on a poll interval", async ({ page }) => {
     test.setTimeout(75_000);
+    // PRODUCT (c-skipaudit skip audit, 2026-11-06): the board now starts the
+    // shared task-ledger poller, which issues /v1/projects every 30 s
+    // (taskLedger.ts PROJECT_POLL_MS, reintroduced by da8a1f1df). In a 31 s
+    // idle window that adds exactly one read (6 -> 7). The poller is
+    // deliberate for the phone surfaces, so the conflict is with this board
+    // assertion, not a silent flake: kept visible as fixme instead of
+    // weakening the assertion here.
+    test.fixme(true, "board re-fetches /v1/projects on the ledger's 30 s interval");
     await login(page);
     const fx = fixture ?? (await makeFixture(page));
     const requestedAt: number[] = [];

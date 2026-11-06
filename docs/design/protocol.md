@@ -2276,10 +2276,10 @@ JournalSearchHit = {instanceId, lineageId, seq, observedAt,
 ~~~
 
 - **范围就是 journal 读谓词，原样照搬。** 某个实例的命中只在调用方今天能读它的 journal 时返回（`require_instance_read`、`owns()`）：Agent 读自己血缘的各章节，以及父实例属于自己血缘的实例（它的 worker），与 `lineage_owns_conn` 同一条边；Human 与 Bot 设备读 Hub 上的全部实例。用 `x-remuda-instance-id` 收窄的 Human 设备就是那个实例的 Agent。谓词写在 SQL 里，与 FTS 结果连接后再排序截断，不是对已截断的一页做后过滤，所以别人的命中既挤不掉你的命中，也不出现在任何计数里。`instance`、`lineage`、`since` 只能再收窄：范围外的实例或血缘得到零命中，不报 403。
-- **索引什么。** 每条 journal 事件的可检索文本：用户与助手消息的正文（`message`，只取完整文本的 `open`/`replace`/`close`，不取 `append` 增量；单条至多 32 KiB）、工具名与工具输入（`tool_call`，输入至多 2 KiB）、工具最终结果（`tool_result`，`stage: final`，至多 2 KiB）。思考、生命周期、用量等事件不进索引。同一消息或工具节点只保留 seq 最大的那一版，所以流式消息只命中一次。文本先过 `digest::redact_secrets` 再入索引，被脱敏的凭据形状在索引里根本不存在，因此搜不到；片段从脱敏后的文本截取。索引只含调用方本来就能经 journal 读到的内容的一个子集。
+- **索引什么。** journal 里带可检索文本的每一行：用户与助手消息的正文（`message`）、工具名与工具输入（`tool_call`）、工具最终结果（`tool_result`，`stage: final`）。思考、生命周期、用量等事件不进索引。一个节点按 `(实例, kind, 节点 id)` 归并成文档：`open` 加上之后的每个 `append` 增量再加 `close` 拼成一篇（流式载体的消息大多以增量送达，`close` 有时只带最后一段）；工具调用的完整输入取代流式输入；`replace` 若只是延长已有文本则并入同一篇，文本不同（例如提示关联的改写）则另起一篇，旧文本照样能搜到。调用与结果在某些载体上共用节点 id，按 kind 区分，互不覆盖。消息每篇至多 32 KiB，工具输入与结果至多 2 KiB。索引的文本是整篇拼接后的文本过 `digest::redact_secrets` 的结果，所以跨两个增量的凭据也会被脱敏；被脱敏的凭据形状不在 FTS 表里，因此搜不到，片段也从脱敏后的文本截取。拼接后的原文另存一列（就是 journal 自己的文本，随行删除），从不检索、从不返回。实时追加与回填调用同一个归并函数，同样的行得到同样的文档。命中的 seq 是该篇文档最后归并进来的那一行。
 - **查询。** FTS5 `MATCH`，每个词按 memory 同一套引号规则包成短语（查询里的 FTS 语法只是字面文本），bm25 排序。查询含非 ASCII 字符或有少于 3 个字符的词，且 FTS 命中不足 `limit` 时，再跑一遍 `LIKE` 子串匹配补足，最新的在前：`unicode61` 把一串汉字当成一个词，两个字的中文查询只能靠子串命中。一次查询有时间预算（1.5 秒），超时返回已得到的命中并置 `partial: true`。q 超过 8 个词或 256 个字符、`since` 不是 RFC 3339：400。
 - **迁移不阻塞启动。** `user_version` 7 只建表与触发器，不写任何行。已有的 journal 行由后台回填任务按主键顺序分批写入（每批至多 2000 行一个写事务，批间让出写线程），高水位存在 `journal_search_backfill`，崩溃或重启后从高水位继续；回填完成前 `indexComplete` 为 false，较早的历史可能还搜不到。新行在追加 journal 的同一事务里写入索引，立即可搜。
-- **保留。** journal 行删除时（删除或清除实例）一个触发器在同一事务里删掉它的索引行，所以索引里永远没有 journal 已经不再持有的文本。`scripts/hub-backup.sh` 整个拷贝 `hub.sqlite`，索引、回填高水位与 journal 一起备份、一起恢复，恢复后不需要重建。
+- **保留。** journal 行删除时（删除或清除实例）一个触发器在同一事务里删掉它的记录，以及行范围包含它的每篇文档，所以索引里永远没有 journal 已经不再持有的文本。`scripts/hub-backup.sh` 整个拷贝 `hub.sqlite`，索引、回填高水位与 journal 一起备份、一起恢复，恢复后不需要重建。
 - **日志** 只记计数与耗时，从不记查询词与片段。
 - CLI：`remuda search <q> [--instance …] [--lineage …] [--since …] [--limit N] [--json]` 与 `remuda search --status`。`--since` 也接受 `30m`、`2h`、`3d` 这样的相对时长。
 

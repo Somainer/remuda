@@ -59,6 +59,38 @@ fn tool_result(node: &str, stage: &str, text: &str) -> Value {
     })
 }
 
+fn thought(node: &str, text: &str) -> Value {
+    let mut event = message(node, "append", "assistant", text);
+    event["kind"] = json!("thought");
+    event
+}
+
+/// A PTY/print-shaped message row: one text block, appends target block 0.
+fn streamed(node: &str, operation: &str, text: &str) -> Value {
+    json!({
+        "kind": "message",
+        "payload": {
+            "nodeId": node, "operation": operation, "messageId": node,
+            "role": "assistant", "phase": "final", "targetBlock": 0,
+            "blocks": [{"type": "text", "text": text}],
+        },
+    })
+}
+
+/// A call row whose input is still streaming (`inputTextDelta`).
+fn call_delta(node: &str, operation: &str, name: &str, delta: &str) -> Value {
+    json!({
+        "kind": "tool_call",
+        "payload": {
+            "nodeId": node, "operation": operation, "toolCallId": node,
+            "toolName": {"state": "known", "value": name},
+            "displayTitle": {"state": "known", "value": name},
+            "input": {"state": "unknown", "reason": "streaming-input"},
+            "inputTextDelta": delta,
+        },
+    })
+}
+
 fn human() -> SearchScope {
     SearchScope::default()
 }
@@ -147,6 +179,16 @@ impl Fixture {
             .unwrap()
     }
 
+    fn doc_texts(&self) -> Vec<(String, String)> {
+        self.db()
+            .prepare("SELECT kind, text FROM journal_search_docs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     /// A journal row written the way rows older than the index were: straight
     /// into the table, never through the append path that indexes it.
     fn raw_row(&self, db: &Connection, instance: &str, seq: i64, event: &Value) {
@@ -173,15 +215,18 @@ fn seqs(result: &JournalSearchResult) -> Vec<(String, u64)> {
 }
 
 #[test]
-fn extract_takes_complete_text_and_skips_deltas_thoughts_and_progress() {
-    let doc = extract(&message("n1", "replace", "assistant", "the full reply")).unwrap();
-    assert_eq!(doc.kind, JournalSearchKind::Message);
-    assert_eq!(doc.role.as_deref(), Some("assistant"));
-    assert_eq!(doc.text, "the full reply");
-    assert_eq!(doc.node_id, "n1");
-    // A streamed delta, a thought, a non-final result and a system message
-    // carry nothing to index.
-    assert!(extract(&message("n1", "append", "assistant", "the")).is_none());
+fn extract_reads_each_rows_text_and_skips_thoughts_and_progress() {
+    let piece = extract(&message("n1", "replace", "assistant", "the full reply")).unwrap();
+    assert_eq!(piece.kind, JournalSearchKind::Message);
+    assert_eq!(piece.mode, PieceMode::Snapshot);
+    assert_eq!(piece.role.as_deref(), Some("assistant"));
+    assert_eq!(piece.text, "the full reply");
+    assert_eq!(piece.node_id, "n1");
+    // A delta is a piece too: streaming carriers send most text that way.
+    let delta = extract(&message("n1", "append", "assistant", " more")).unwrap();
+    assert_eq!(delta.mode, PieceMode::Delta);
+    assert_eq!(delta.text, " more");
+    // A thought, a non-final result and a system message carry nothing.
     assert!(extract(&message("n2", "close", "system", "boot")).is_none());
     let mut thought = message("n3", "close", "assistant", "pondering");
     thought["kind"] = json!("thought");
@@ -189,14 +234,18 @@ fn extract_takes_complete_text_and_skips_deltas_thoughts_and_progress() {
     assert!(extract(&tool_result("r1", "progress", "50%")).is_none());
     let result = extract(&tool_result("r1", "final", "added wak_1 (rc-wake)")).unwrap();
     assert_eq!(result.kind, JournalSearchKind::ToolResult);
-    // The tool name and the input's values, not its keys.
+    // A call: its name, and the input's values, not its keys.
     let call = extract(&tool_call(
         "t1",
         "Bash",
         json!({"command": "remuda wake add --name rc", "description": "Add a wake"}),
     ))
     .unwrap();
-    assert_eq!(call.text, "Bash remuda wake add --name rc Add a wake");
+    assert_eq!(call.head.as_deref(), Some("Bash"));
+    assert_eq!(
+        call.input.as_deref(),
+        Some("remuda wake add --name rc Add a wake")
+    );
     // The Hub's agent-to-agent record carries `text`, not blocks.
     let hub = extract(&json!({
         "kind": "message", "origin": "hub",
@@ -207,64 +256,172 @@ fn extract_takes_complete_text_and_skips_deltas_thoughts_and_progress() {
     assert_eq!(hub.node_id, "");
 }
 
-#[test]
-fn extract_bounds_tool_inputs_and_results() {
-    let long = "word ".repeat(5000);
-    let call = extract(&tool_call("t1", "Bash", json!({"command": long}))).unwrap();
-    assert!(
-        call.text.len() <= TOOL_TEXT_BYTES + "Bash ".len(),
-        "{}",
-        call.text.len()
-    );
-    let result = extract(&tool_result("r1", "final", &long)).unwrap();
-    assert!(
-        result.text.len() <= TOOL_TEXT_BYTES,
-        "{}",
-        result.text.len()
-    );
-    let message = extract(&message("m1", "close", "user", &"字".repeat(20_000))).unwrap();
-    assert!(message.text.len() <= MESSAGE_TEXT_BYTES);
-    assert!(message.text.is_char_boundary(message.text.len()));
-}
-
 #[tokio::test]
-async fn a_streamed_message_is_one_hit_at_its_newest_revision() {
+async fn documents_are_bounded() {
     let fx = fixture().await;
     let ins = fx.instance().await;
-    fx.append(&ins, message("m1", "open", "assistant", "Rolling"))
+    let long = "word ".repeat(5000);
+    fx.append(&ins, tool_call("t1", "Bash", json!({"command": long})))
         .await;
-    fx.append(&ins, message("m1", "append", "assistant", " back"))
+    fx.append(&ins, tool_result("r1", "final", &long)).await;
+    fx.append(&ins, message("m1", "close", "user", &"字".repeat(20_000)))
         .await;
-    let replace = fx
-        .append(
-            &ins,
-            message("m1", "replace", "assistant", "Rolling back the migration"),
-        )
+    // A stream of deltas is bounded the same way.
+    fx.append(&ins, message("m2", "open", "assistant", "start"))
         .await;
-    let close = fx
-        .append(
-            &ins,
-            message("m1", "close", "assistant", "Rolling back the migration"),
-        )
+    for _ in 0..200 {
+        fx.append(&ins, message("m2", "append", "assistant", &"x".repeat(400)))
+            .await;
+    }
+    for (kind, text) in fx.doc_texts() {
+        let cap = match kind.as_str() {
+            "message" => MESSAGE_TEXT_BYTES,
+            _ => TOOL_TEXT_BYTES + "Bash ".len(),
+        };
+        assert!(text.len() <= cap, "{kind}: {}", text.len());
+        assert!(text.is_char_boundary(text.len()));
+    }
+}
+
+/// A claude-pty-shaped stream: the PTY message fold sends the first chunk
+/// as `open` and every later one, the last included, as an `append` that
+/// carries only its own delta.
+#[tokio::test]
+async fn a_pty_stream_is_found_by_a_word_from_its_last_delta() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    fx.append(&ins, streamed("m1", "open", "I'll ")).await;
+    fx.append(&ins, streamed("m1", "append", "check the "))
         .await;
-    assert!(close > replace);
-    let found = fx.search(human(), "rolling").await;
+    let last = fx
+        .append(&ins, streamed("m1", "append", "rollback of migration 0042"))
+        .await;
+    let found = fx.search(human(), "rollback 0042").await;
+    assert_eq!(seqs(&found), vec![(ins.clone(), last as u64)]);
+    assert_eq!(
+        found.hits[0].snippet,
+        "I'll check the rollback of migration 0042"
+    );
+    // A phrase across two deltas is one document's text.
+    assert_eq!(fx.search(human(), "the rollback").await.hits.len(), 1);
+    assert_eq!(fx.docs(), 1);
+}
+
+/// claude-print partial streaming: the first delta opens, the rest append,
+/// and the block's `close` carries only its last delta.
+#[tokio::test]
+async fn a_print_stream_is_one_document_and_its_close_adds_no_copy() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    fx.append(&ins, streamed("m1", "open", "Rolling")).await;
+    for delta in [" back", " the", " quartermaster", " ledger"] {
+        fx.append(&ins, streamed("m1", "append", delta)).await;
+    }
+    let close = fx.append(&ins, streamed("m1", "close", " ledger")).await;
+    let found = fx.search(human(), "quartermaster").await;
     assert_eq!(seqs(&found), vec![(ins.clone(), close as u64)]);
-    assert_eq!(found.hits[0].matched_by, JournalSearchMatch::Fts);
-    assert_eq!(found.hits[0].snippet, "Rolling back the migration");
-    // A late older revision (a replay below the close) never replaces it.
-    let db = fx.db();
-    assert!(
-        !index_event(
-            &db,
-            &ins,
-            replace,
-            &message("m1", "replace", "assistant", "Rolling"),
-            "2026-11-01T00:00:00.000Z"
-        )
-        .unwrap()
+    assert_eq!(
+        found.hits[0].snippet,
+        "Rolling back the quartermaster ledger"
     );
     assert_eq!(fx.docs(), 1);
+    // A close that re-emits the whole text adds nothing either.
+    fx.append(
+        &ins,
+        streamed("m1", "close", "Rolling back the quartermaster ledger"),
+    )
+    .await;
+    assert_eq!(fx.docs(), 1);
+}
+
+/// A prompt-correlation restamp replaces a node's text with different
+/// text: the journal still returns both rows, so both stay findable.
+#[tokio::test]
+async fn a_replace_with_different_text_keeps_the_old_text_findable() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    let opened = fx
+        .append(
+            &ins,
+            message("u1", "open", "user", "please revert migration 0042"),
+        )
+        .await;
+    let replaced = fx
+        .append(
+            &ins,
+            message("u1", "replace", "user", "please revert migration 0099"),
+        )
+        .await;
+    assert_eq!(
+        seqs(&fx.search(human(), "0042").await),
+        vec![(ins.clone(), opened as u64)]
+    );
+    assert_eq!(
+        seqs(&fx.search(human(), "0099").await),
+        vec![(ins.clone(), replaced as u64)]
+    );
+    // A replace that only extends the text is the same document.
+    let extended = fx
+        .append(
+            &ins,
+            message(
+                "u1",
+                "replace",
+                "user",
+                "please revert migration 0099 today",
+            ),
+        )
+        .await;
+    assert_eq!(
+        seqs(&fx.search(human(), "today").await),
+        vec![(ins.clone(), extended as u64)]
+    );
+    assert_eq!(fx.docs(), 2);
+}
+
+/// codex and grok stamp a call's result with the call's node id: the call's
+/// name and input and the result's text are each findable.
+#[tokio::test]
+async fn a_call_and_its_result_sharing_a_node_id_are_both_findable() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    let call = fx
+        .append(
+            &ins,
+            tool_call("item_7", "shell", json!({"command": "git status --short"})),
+        )
+        .await;
+    let result = fx
+        .append(
+            &ins,
+            tool_result("item_7", "final", "nothing to commit, working tree clean"),
+        )
+        .await;
+    assert_eq!(
+        seqs(&fx.search(human(), "git status").await),
+        vec![(ins.clone(), call as u64)]
+    );
+    assert_eq!(
+        seqs(&fx.search(human(), "working tree clean").await),
+        vec![(ins.clone(), result as u64)]
+    );
+    // A streamed call's input deltas give way to its complete input.
+    fx.append(&ins, call_delta("item_9", "open", "Bash", ""))
+        .await;
+    fx.append(
+        &ins,
+        call_delta("item_9", "append", "Bash", "{\"command\": \"cargo"),
+    )
+    .await;
+    let closed = fx
+        .append(
+            &ins,
+            tool_call("item_9", "Bash", json!({"command": "cargo test -p remuda"})),
+        )
+        .await;
+    let found = fx.search(human(), "cargo").await;
+    assert_eq!(seqs(&found), vec![(ins.clone(), closed as u64)]);
+    assert_eq!(found.hits[0].snippet, "Bash cargo test -p remuda");
 }
 
 #[tokio::test]
@@ -328,6 +485,34 @@ async fn a_two_character_chinese_query_hits_through_like() {
     // LIKE wildcards in the query are literal too.
     assert!(fx.search(human(), "边%").await.hits.is_empty());
     assert!(fx.search(human(), "保_").await.hits.is_empty());
+}
+
+#[tokio::test]
+async fn a_secret_split_across_two_deltas_is_never_findable() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    // Neither delta is credential-shaped; their concatenation is.
+    fx.append(&ins, streamed("m1", "open", "the key is sk"))
+        .await;
+    fx.append(
+        &ins,
+        streamed(
+            "m1",
+            "append",
+            &secret(&["-ant-api03-", "BBBBBBBBBBBBBBBBBBBBQQ"]),
+        ),
+    )
+    .await;
+    fx.append(&ins, streamed("m1", "append", " keep it safe"))
+        .await;
+    for query in ["BBBBBBBBBBBBBBBBBBBBQQ", "api03", "BBBB"] {
+        let result = fx.search(human(), query).await;
+        assert!(result.hits.is_empty(), "{query}: {:?}", seqs(&result));
+    }
+    assert_eq!(fx.search(human(), "safe").await.hits.len(), 1);
+    for (_, text) in fx.doc_texts() {
+        assert!(!text.contains("BBBBBBBBBBBBBBBBBBBB"), "{text}");
+    }
 }
 
 #[tokio::test]
@@ -592,13 +777,8 @@ async fn backfill_indexes_old_rows_in_resumable_batches_and_boot_adds_none() {
                     &format!("legacy note {seq}"),
                 ),
             );
-            // Deltas and thoughts are read but contribute nothing.
-            fx.raw_row(
-                &db,
-                &b,
-                seq * 2 - 1,
-                &message("b", "append", "assistant", "legacy"),
-            );
+            // Thoughts are read but contribute nothing.
+            fx.raw_row(&db, &b, seq * 2 - 1, &thought("b", "legacy"));
             fx.raw_row(
                 &db,
                 &b,
@@ -626,6 +806,7 @@ async fn backfill_indexes_old_rows_in_resumable_batches_and_boot_adds_none() {
              DROP TRIGGER journal_search_purge;
              DROP TABLE journal_fts;
              DROP TABLE journal_search_docs;
+             DROP TABLE journal_search_rows;
              PRAGMA user_version = 6;",
         )
         .unwrap();
@@ -775,6 +956,185 @@ fn snippets_are_bounded_and_centred_on_the_match() {
         "short 边界 text"
     );
     assert_eq!(clip_chars(&"x".repeat(500), 200).chars().count(), 200);
+}
+
+/// Rows covering every fold rule, in journal order: a PTY stream, a print
+/// stream closed with its last delta, a restamped prompt, a call and its
+/// result on one node id, a streamed call, two Hub text rows (no node), a
+/// thought, and interleaving between nodes.
+fn mixed_rows() -> Vec<Value> {
+    vec![
+        message("u1", "open", "user", "please revert migration 0042"),
+        streamed("a1", "open", "I'll "),
+        streamed("a1", "append", "check "),
+        call_delta("c1", "open", "Bash", ""),
+        streamed("a1", "append", "the rollback"),
+        call_delta("c1", "append", "Bash", "{\"command\": \"git"),
+        message("u1", "replace", "user", "please revert migration 0099"),
+        tool_call("c1", "Bash", json!({"command": "git log --oneline"})),
+        tool_result("c1", "final", "abc123 revert 0042"),
+        json!({"kind": "message", "origin": "hub",
+               "payload": {"role": "user", "origin": "agent", "text": "hub note one"}}),
+        streamed("a2", "open", "Done"),
+        streamed("a2", "append", " with the"),
+        thought("t1", "pondering"),
+        streamed("a2", "append", " ledger"),
+        streamed("a2", "close", " ledger"),
+        json!({"kind": "message", "origin": "hub",
+               "payload": {"role": "user", "origin": "agent", "text": "hub note two"}}),
+        message("u1", "replace", "user", "please revert migration 0099 now"),
+        streamed("a1", "close", "I'll check the rollback"),
+    ]
+}
+
+/// A node's documents as comparable values (no ids, no instance).
+type DocKey = (
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+);
+
+impl Fixture {
+    fn docs_of(&self, instance: &str) -> Vec<DocKey> {
+        self.db()
+            .prepare(
+                "SELECT kind, node_id, first_seq, seq, role, head, raw, indexed_len, text
+                   FROM journal_search_docs WHERE instance_id = ?1
+                  ORDER BY kind, node_id, first_seq",
+            )
+            .unwrap()
+            .query_map([instance], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+}
+
+/// The append path and the backfill build the same documents from the same
+/// rows, and so does a mix: rows written before the index existed, then
+/// rows appended live, then the backfill meeting both (a node that straddles
+/// the migration is rebuilt in seq order).
+#[tokio::test]
+async fn the_append_path_and_the_backfill_build_identical_documents() {
+    let fx = fixture().await;
+    let rows = mixed_rows();
+    let observed = |seq: usize| format!("2026-11-01T00:00:{:02}.000Z", seq);
+    // Live: every row through the append path.
+    let live = fx.instance().await;
+    for event in &rows {
+        fx.append(&live, event.clone()).await;
+    }
+    let db = fx.db();
+    // Normalise observed_at, which the append path stamps with the clock.
+    for (n, _) in rows.iter().enumerate() {
+        db.execute(
+            "UPDATE journal SET observed_at = ?1 WHERE instance_id = ?2 AND seq = ?3",
+            params![observed(n + 1), live, (n + 1) as i64],
+        )
+        .unwrap();
+    }
+    // Backfill: every row written raw, indexed by the backfill.
+    let backfilled = fx.instance().await;
+    // Straddle: the first half raw, the rest through the append path.
+    let straddled = fx.instance().await;
+    let half = rows.len() / 2;
+    for (n, event) in rows.iter().enumerate() {
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                backfilled,
+                (n + 1) as i64,
+                format!("evt-b-{n}"),
+                event.to_string(),
+                observed(n + 1)
+            ],
+        )
+        .unwrap();
+        if n < half {
+            db.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    straddled,
+                    (n + 1) as i64,
+                    format!("evt-s-{n}"),
+                    event.to_string(),
+                    observed(n + 1)
+                ],
+            )
+            .unwrap();
+        }
+    }
+    db.execute(
+        "UPDATE instances SET durable_seq = ?1 WHERE id = ?2",
+        params![half as i64, straddled],
+    )
+    .unwrap();
+    for event in &rows[half..] {
+        fx.append(&straddled, event.clone()).await;
+    }
+    for n in half..rows.len() {
+        db.execute(
+            "UPDATE journal SET observed_at = ?1 WHERE instance_id = ?2 AND seq = ?3",
+            params![observed(n + 1), straddled, (n + 1) as i64],
+        )
+        .unwrap();
+    }
+    // The live documents were built with the clock's observed_at; rebuild
+    // them from the normalised rows by replaying the same path on a copy.
+    db.execute_batch("DELETE FROM journal_search_docs; DELETE FROM journal_search_rows;")
+        .unwrap();
+    for (n, event) in rows.iter().enumerate() {
+        index_event(&db, &live, (n + 1) as i64, event, &observed(n + 1)).unwrap();
+    }
+    for (n, event) in rows.iter().enumerate().skip(half) {
+        index_event(&db, &straddled, (n + 1) as i64, event, &observed(n + 1)).unwrap();
+    }
+    drop(db);
+    let mut db = fx.db();
+    loop {
+        if backfill_batch(&mut db, 4).unwrap().done {
+            break;
+        }
+    }
+    let want = fx.docs_of(&live);
+    assert!(want.len() >= 8, "{want:?}");
+    assert_eq!(fx.docs_of(&backfilled), want);
+    assert_eq!(fx.docs_of(&straddled), want);
+    // And the documents say what the fold rules say.
+    let texts: Vec<&str> = want.iter().map(|doc| doc.8.as_str()).collect();
+    for text in [
+        "please revert migration 0042",
+        "please revert migration 0099 now",
+        "I'll check the rollback",
+        "Bash git log --oneline",
+        "abc123 revert 0042",
+        "Done with the ledger",
+        "hub note one",
+        "hub note two",
+    ] {
+        assert!(texts.contains(&text), "{text}: {texts:?}");
+    }
+    assert_eq!(texts.len(), 8, "{texts:?}");
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {

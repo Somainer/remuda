@@ -1,16 +1,23 @@
 //! cb-search: `GET /v1/search`, FTS5 over journal text, scoped exactly like
 //! journal reads (protocol.md §8.4, main-agent.md §12.7).
 //!
-//! - **What is indexed.** One row of `journal_search_docs` per journal event
-//!   that carries searchable text: user and assistant message text (the
-//!   complete forms `open`/`replace`/`close`, never the `append` deltas),
-//!   tool names and inputs, and final tool results. Inputs and results are
+//! - **What is indexed.** The text of every journal row that carries it:
+//!   user and assistant message text, tool names and inputs, and final tool
+//!   results. A node's rows fold into documents ([`step`]): `open` plus its
+//!   `append` deltas plus `close` are one document (streaming carriers send
+//!   most of a message as deltas), a tool call's complete input replaces its
+//!   streamed input, and a `replace` with different text starts a second
+//!   document so the first text stays findable. A node is keyed by
+//!   `(instance, kind, node id)`: a call and its result share a node id on
+//!   some carriers and never evict each other. Inputs and results are
 //!   bounded ([`TOOL_TEXT_BYTES`]), messages too ([`MESSAGE_TEXT_BYTES`]).
-//!   One message or tool node keeps only its newest row, so a streamed
-//!   message is one hit. The text is redacted
-//!   ([`crate::digest::redact_secrets`]) before it is stored: a credential
-//!   shape is never in the index, so it cannot be found, and every snippet
-//!   is cut from the redacted text.
+//!   The indexed text is the redacted concatenation
+//!   ([`crate::digest::redact_secrets`] over the whole document, so a
+//!   credential split across two deltas is still caught): a credential shape
+//!   is never in the FTS table, so it cannot be found, and every snippet is
+//!   cut from the redacted text. The raw concatenation is kept beside it
+//!   (the journal's own text, dropped with its rows), never searched or
+//!   returned.
 //! - **Scope is the journal read predicate.** A hit is returned only when the
 //!   caller may read that instance's journal: an Agent reads its own
 //!   lineage's chapters and the instances whose parent is one of them
@@ -23,10 +30,13 @@
 //!   existing journal in primary-key order, [`BACKFILL_BATCH_ROWS`] rows per
 //!   writer job, and records its high-water mark in the same transaction, so
 //!   a crash or restart resumes where it stopped. Rows appended after the
-//!   migration are indexed in their append transaction ([`index_event`]).
-//! - **Retention.** A trigger on `journal` deletes a row's index entry in the
-//!   same transaction as the row, so the index never holds text the journal
-//!   no longer holds. The index lives in `hub.sqlite`, which
+//!   migration are indexed in their append transaction. Both paths call
+//!   [`index_event`], and a row that arrives below rows already folded
+//!   rebuilds its node, so the documents never depend on which path met a
+//!   row first.
+//! - **Retention.** A trigger on `journal` deletes a row's record and every
+//!   document whose rows include it, in the same transaction as the row, so
+//!   the index never holds text the journal no longer holds. The index lives in `hub.sqlite`, which
 //!   `scripts/hub-backup.sh` copies whole.
 //! - **Logs** carry counts and timings, never the query or a snippet.
 
@@ -76,29 +86,49 @@ const SNIPPET_LEAD_CHARS: usize = 60;
 
 // ─── Migration ─────────────────────────────────────────────────────────────
 
-/// `user_version` 7: the index rows, their FTS5 table and its sync triggers,
-/// the journal purge trigger and the backfill's high-water mark. No rows.
+/// `user_version` 7: the index documents, their FTS5 table and its sync
+/// triggers, the per-row record, the journal purge trigger and the
+/// backfill's high-water mark. No rows.
 ///
-/// `journal_search_docs.id` is an INTEGER PRIMARY KEY, so the FTS rowid
-/// survives VACUUM, and AUTOINCREMENT, so an id is never reused. `node_id` is
-/// the message or tool node the text belongs to ('' for a row without one):
-/// a node keeps only its newest row. The FTS table is external-content over
-/// the docs table, tokenized like memory (`porter unicode61`).
+/// - `journal_search_rows` records every journal row that carries
+///   searchable text, keyed like the journal, with the node it belongs to.
+///   It makes indexing idempotent and lets a node be rebuilt from its rows.
+/// - `journal_search_docs` holds one document per run of a node's rows
+///   ([`step`]): the rows `first_seq..=seq` of `(instance_id, kind,
+///   node_id)`. `raw` is the concatenated journal text, never searched or
+///   returned; `text` is its redacted, bounded form, the only column the FTS
+///   table indexes. `id` is an INTEGER PRIMARY KEY (the FTS rowid survives
+///   VACUUM) and AUTOINCREMENT (an id is never reused).
+/// - Deleting a journal row deletes its record and every document whose
+///   row range covers it, in the same transaction.
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS journal_search_docs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        "CREATE TABLE IF NOT EXISTS journal_search_rows (
             instance_id TEXT NOT NULL,
             seq INTEGER NOT NULL,
-            node_id TEXT NOT NULL,
             kind TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            PRIMARY KEY (instance_id, seq)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS journal_search_rows_node
+            ON journal_search_rows (instance_id, kind, node_id, seq);
+        CREATE TABLE IF NOT EXISTS journal_search_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            first_seq INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
             role TEXT,
             observed_at TEXT NOT NULL,
-            text TEXT NOT NULL,
-            UNIQUE (instance_id, seq)
+            block INTEGER,
+            head TEXT NOT NULL,
+            raw TEXT NOT NULL,
+            indexed_len INTEGER NOT NULL,
+            text TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS journal_search_docs_node
-            ON journal_search_docs (instance_id, node_id);
+            ON journal_search_docs (instance_id, kind, node_id, seq);
         CREATE VIRTUAL TABLE IF NOT EXISTS journal_fts USING fts5(
             text,
             content = 'journal_search_docs', content_rowid = 'id',
@@ -113,10 +143,19 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             INSERT INTO journal_fts (journal_fts, rowid, text)
             VALUES ('delete', old.id, old.text);
         END;
+        CREATE TRIGGER IF NOT EXISTS journal_search_docs_fts_update
+        AFTER UPDATE OF text ON journal_search_docs BEGIN
+            INSERT INTO journal_fts (journal_fts, rowid, text)
+            VALUES ('delete', old.id, old.text);
+            INSERT INTO journal_fts (rowid, text) VALUES (new.id, new.text);
+        END;
         CREATE TRIGGER IF NOT EXISTS journal_search_purge
         AFTER DELETE ON journal BEGIN
-            DELETE FROM journal_search_docs
+            DELETE FROM journal_search_rows
              WHERE instance_id = old.instance_id AND seq = old.seq;
+            DELETE FROM journal_search_docs
+             WHERE instance_id = old.instance_id
+               AND old.seq BETWEEN first_seq AND seq;
         END;
         CREATE TABLE IF NOT EXISTS journal_search_backfill (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -131,15 +170,36 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-// ─── What a journal event contributes ─────────────────────────────────────
+// ─── What a journal row contributes ───────────────────────────────────────
 
-/// The indexed form of one journal event.
+/// How a row's text joins its node's document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PieceMode {
+    /// An `append`: the text continues the document.
+    Delta,
+    /// `open`, `replace` or `close`: the text is the node's whole text (or,
+    /// for some carriers, only its last chunk).
+    Snapshot,
+}
+
+/// The searchable part of one journal row.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Doc {
-    node_id: String,
-    kind: JournalSearchKind,
-    role: Option<String>,
-    text: String,
+pub(crate) struct Piece {
+    pub(crate) kind: JournalSearchKind,
+    /// The node the row mutates; `""` for a row without one (each such row
+    /// is a document of its own).
+    pub(crate) node_id: String,
+    pub(crate) mode: PieceMode,
+    pub(crate) role: Option<String>,
+    /// The message block an `append` targets.
+    pub(crate) block: Option<i64>,
+    /// A tool call's name (and title, when it differs).
+    pub(crate) head: Option<String>,
+    /// For a tool call: the complete input, which replaces the streamed one.
+    pub(crate) input: Option<String>,
+    /// The row's raw text (a message's or result's text, a call's input
+    /// delta), bounded.
+    pub(crate) text: String,
 }
 
 /// `{"state":"known","value":…}` → the value; a bare value passes through.
@@ -204,26 +264,44 @@ fn clip_bytes(text: &str, cap: usize) -> &str {
     &text[..end]
 }
 
-/// Redact, then bound: the redactor sees `cap` plus slack of raw text, and
-/// the redacted result is cut to `cap`.
-fn bounded(raw: &str, cap: usize) -> String {
-    let redacted = crate::digest::redact_secrets(clip_bytes(raw, cap + REDACT_SLACK_BYTES));
-    clip_bytes(&redacted, cap).to_string()
+/// Raw text a document keeps for `kind`: its cap plus slack, so a credential
+/// the cap would cut in half is still whole when the redactor sees it.
+fn raw_cap(kind: JournalSearchKind) -> usize {
+    text_cap(kind) + REDACT_SLACK_BYTES
+}
+
+/// Indexed text a document keeps for `kind`.
+fn text_cap(kind: JournalSearchKind) -> usize {
+    match kind {
+        JournalSearchKind::Message => MESSAGE_TEXT_BYTES,
+        JournalSearchKind::ToolCall | JournalSearchKind::ToolResult => TOOL_TEXT_BYTES,
+    }
 }
 
 /// What `event` contributes to the index, if anything.
-pub(crate) fn extract(event: &Value) -> Option<Doc> {
+pub(crate) fn extract(event: &Value) -> Option<Piece> {
     let payload = event.get("payload")?;
-    // A streamed delta is a fragment; its node's complete form is indexed.
-    if payload.get("operation").and_then(Value::as_str) == Some("append") {
-        return None;
-    }
+    let mode = match payload.get("operation").and_then(Value::as_str) {
+        Some("append") => PieceMode::Delta,
+        _ => PieceMode::Snapshot,
+    };
     let node_id = payload
         .get("nodeId")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let (kind, role, text) = match journal_event_kind(event) {
+    let block = payload.get("targetBlock").and_then(Value::as_i64);
+    let piece = |kind, role, head, input, text: String| Piece {
+        kind,
+        node_id: node_id.clone(),
+        mode,
+        role,
+        block,
+        head,
+        input,
+        text: clip_bytes(&text, raw_cap(kind)).to_string(),
+    };
+    let piece = match journal_event_kind(event) {
         "message" => {
             let role = payload.get("role").and_then(Value::as_str)?;
             if role != "user" && role != "assistant" {
@@ -231,21 +309,21 @@ pub(crate) fn extract(event: &Value) -> Option<Doc> {
             }
             // Node messages carry blocks; the Hub's agent-to-agent records
             // carry `text`.
-            let mut raw = blocks_text(
-                payload.get("blocks"),
-                MESSAGE_TEXT_BYTES + REDACT_SLACK_BYTES,
-            );
-            if raw.is_empty() {
-                raw = payload
+            let cap = raw_cap(JournalSearchKind::Message);
+            let mut text = blocks_text(payload.get("blocks"), cap);
+            if text.is_empty() {
+                text = payload
                     .get("text")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                    .map(|text| clip_bytes(text, cap).to_string())
+                    .unwrap_or_default();
             }
-            (
+            piece(
                 JournalSearchKind::Message,
                 Some(role.to_string()),
-                bounded(&raw, MESSAGE_TEXT_BYTES),
+                None,
+                None,
+                text,
             )
         }
         "tool_call" => {
@@ -260,46 +338,51 @@ pub(crate) fn extract(event: &Value) -> Option<Doc> {
                 .and_then(Value::as_str)
                 .filter(|title| *title != name)
                 .unwrap_or("");
-            let mut input = String::new();
-            if let Some(value) = payload.get("input").and_then(known) {
-                input_leaves(value, TOOL_TEXT_BYTES + REDACT_SLACK_BYTES, &mut input);
-            }
             let head = [name, title]
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let input = bounded(&input, TOOL_TEXT_BYTES);
-            let text = if input.is_empty() {
-                crate::digest::redact_secrets(&head)
-            } else {
-                format!("{} {input}", crate::digest::redact_secrets(&head))
-            };
-            (JournalSearchKind::ToolCall, None, text)
+            let input = payload.get("input").and_then(known).map(|value| {
+                let mut out = String::new();
+                input_leaves(value, raw_cap(JournalSearchKind::ToolCall), &mut out);
+                out
+            });
+            let delta = payload
+                .get("inputTextDelta")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            piece(
+                JournalSearchKind::ToolCall,
+                None,
+                (!head.is_empty()).then_some(head),
+                input,
+                delta,
+            )
         }
         "tool_result" => {
             if payload.get("stage").and_then(Value::as_str) != Some("final") {
                 return None;
             }
-            let raw = blocks_text(payload.get("blocks"), TOOL_TEXT_BYTES + REDACT_SLACK_BYTES);
-            (
-                JournalSearchKind::ToolResult,
-                None,
-                bounded(&raw, TOOL_TEXT_BYTES),
-            )
+            let text = blocks_text(
+                payload.get("blocks"),
+                raw_cap(JournalSearchKind::ToolResult),
+            );
+            piece(JournalSearchKind::ToolResult, None, None, None, text)
         }
         _ => return None,
     };
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return None;
-    }
-    Some(Doc {
-        node_id,
-        kind,
-        role,
-        text,
-    })
+    let empty = piece.text.trim().is_empty()
+        && piece
+            .head
+            .as_deref()
+            .is_none_or(|head| head.trim().is_empty())
+        && piece
+            .input
+            .as_deref()
+            .is_none_or(|input| input.trim().is_empty());
+    (!empty).then_some(piece)
 }
 
 fn kind_wire(kind: JournalSearchKind) -> &'static str {
@@ -318,10 +401,281 @@ fn kind_from_wire(raw: &str) -> JournalSearchKind {
     }
 }
 
-/// Index one journal row, inside the caller's transaction. Returns whether a
-/// row was written. A node keeps only its newest row: an older revision of a
-/// node already indexed at a later seq is skipped, a newer one replaces it.
-/// Idempotent, so the backfill may meet a row the append path indexed.
+// ─── The fold: a node's rows into its documents ──────────────────────────
+
+/// Below this many raw bytes a document's indexed text is recomputed on
+/// every row; above it, every [`REINDEX_STEP_BYTES`] of growth and on every
+/// snapshot. Redaction runs over the whole concatenation (a credential split
+/// across two deltas is still one credential), so recomputing it on every
+/// token-sized delta of a long message would be quadratic.
+const REINDEX_EVERY_ROW_BYTES: usize = 8 * 1024;
+const REINDEX_STEP_BYTES: usize = 1024;
+
+/// One document of a node: its rows `first_seq..=seq`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocState {
+    pub(crate) first_seq: i64,
+    pub(crate) seq: i64,
+    pub(crate) observed_at: String,
+    pub(crate) role: Option<String>,
+    pub(crate) block: Option<i64>,
+    pub(crate) head: String,
+    pub(crate) raw: String,
+    /// `raw.len()` when `text` was last computed.
+    pub(crate) indexed_len: usize,
+    pub(crate) text: String,
+}
+
+/// What one row did to its node.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Step {
+    /// The row continued (or added nothing to) the held document.
+    Same(DocState),
+    /// The row's text is not a continuation: a new document starts; the
+    /// held one stays as it was.
+    New(DocState),
+}
+
+fn render(kind: JournalSearchKind, head: &str, raw: &str) -> String {
+    let source = if kind == JournalSearchKind::ToolCall && !head.is_empty() {
+        if raw.is_empty() {
+            head.to_string()
+        } else {
+            format!("{head} {raw}")
+        }
+    } else {
+        raw.to_string()
+    };
+    let cap = text_cap(kind)
+        + if kind == JournalSearchKind::ToolCall {
+            head.len()
+        } else {
+            0
+        };
+    clip_bytes(crate::digest::redact_secrets(&source).trim(), cap).to_string()
+}
+
+fn push_bounded(raw: &mut String, text: &str, cap: usize) {
+    if raw.len() < cap {
+        raw.push_str(clip_bytes(text, cap - raw.len()));
+    }
+}
+
+/// Fold one row into its node. `held` is the node's newest document, when
+/// there is one; the row's seq is above it. The ONE function both the
+/// append path and the backfill use (through [`index_event`]), so the same
+/// rows always make the same documents.
+///
+/// - An `append` continues the held document (a new message block starts on
+///   a new line).
+/// - A tool call's complete input replaces its streamed input: the call is
+///   one document.
+/// - Any other snapshot (`open`, `replace`, `close`) that the held text
+///   already contains adds nothing (a carrier that closes with its last
+///   chunk); one that extends the held text replaces it (the complete form
+///   after the deltas); anything else is different text, and starts a new
+///   document so the old text stays findable (a correlation restamp).
+pub(crate) fn step(
+    kind: JournalSearchKind,
+    held: Option<&DocState>,
+    piece: &Piece,
+    seq: i64,
+    observed_at: &str,
+) -> Step {
+    let cap = raw_cap(kind);
+    let fresh = |raw: String| DocState {
+        first_seq: seq,
+        seq,
+        observed_at: observed_at.to_string(),
+        role: piece.role.clone(),
+        block: piece.block,
+        head: piece.head.clone().unwrap_or_default(),
+        raw,
+        indexed_len: 0,
+        text: String::new(),
+    };
+    let (mut doc, new) = match held {
+        None => (
+            fresh(match kind {
+                JournalSearchKind::ToolCall => {
+                    piece.input.clone().unwrap_or_else(|| piece.text.clone())
+                }
+                _ => piece.text.clone(),
+            }),
+            true,
+        ),
+        Some(held) => {
+            let mut doc = held.clone();
+            doc.seq = seq;
+            doc.observed_at = observed_at.to_string();
+            if let Some(head) = &piece.head {
+                doc.head = head.clone();
+            }
+            if doc.role.is_none() {
+                doc.role = piece.role.clone();
+            }
+            match (kind, piece.mode) {
+                (JournalSearchKind::ToolCall, _) if piece.input.is_some() => {
+                    doc.raw = piece.input.clone().unwrap_or_default();
+                    (doc, false)
+                }
+                (_, PieceMode::Delta) => {
+                    if !doc.raw.is_empty()
+                        && piece.block.is_some()
+                        && doc.block.is_some()
+                        && piece.block != doc.block
+                    {
+                        push_bounded(&mut doc.raw, "\n", cap);
+                    }
+                    push_bounded(&mut doc.raw, &piece.text, cap);
+                    if piece.block.is_some() {
+                        doc.block = piece.block;
+                    }
+                    (doc, false)
+                }
+                (_, PieceMode::Snapshot) => {
+                    if piece.text.is_empty() || doc.raw.contains(piece.text.as_str()) {
+                        (doc, false)
+                    } else if piece.text.starts_with(doc.raw.as_str()) {
+                        doc.raw = piece.text.clone();
+                        (doc, false)
+                    } else {
+                        (fresh(piece.text.clone()), true)
+                    }
+                }
+            }
+        }
+    };
+    let grown = doc.raw.len().saturating_sub(doc.indexed_len);
+    if new
+        || piece.mode == PieceMode::Snapshot
+        || doc.raw.len() <= REINDEX_EVERY_ROW_BYTES
+        || grown >= REINDEX_STEP_BYTES
+        || doc.text.is_empty()
+    {
+        doc.text = render(kind, &doc.head, &doc.raw);
+        doc.indexed_len = doc.raw.len();
+    }
+    if new { Step::New(doc) } else { Step::Same(doc) }
+}
+
+/// Fold a node's rows, in seq order, into its documents.
+pub(crate) fn fold_node(kind: JournalSearchKind, rows: &[(i64, String, Piece)]) -> Vec<DocState> {
+    let mut docs: Vec<DocState> = Vec::new();
+    for (seq, observed_at, piece) in rows {
+        let held = if piece.node_id.is_empty() {
+            None
+        } else {
+            docs.last()
+        };
+        match step(kind, held, piece, *seq, observed_at) {
+            Step::Same(doc) => *docs.last_mut().expect("held") = doc,
+            Step::New(doc) => docs.push(doc),
+        }
+    }
+    docs
+}
+
+const DOC_COLUMNS: &str =
+    "id, first_seq, seq, observed_at, role, block, head, raw, indexed_len, text";
+
+fn doc_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, DocState)> {
+    Ok((
+        row.get(0)?,
+        DocState {
+            first_seq: row.get(1)?,
+            seq: row.get(2)?,
+            observed_at: row.get(3)?,
+            role: row.get(4)?,
+            block: row.get(5)?,
+            head: row.get(6)?,
+            raw: row.get(7)?,
+            indexed_len: row.get::<_, i64>(8)?.max(0) as usize,
+            text: row.get(9)?,
+        },
+    ))
+}
+
+fn insert_doc(
+    conn: &Connection,
+    instance_id: &str,
+    kind: JournalSearchKind,
+    node_id: &str,
+    doc: &DocState,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO journal_search_docs
+            (instance_id, kind, node_id, first_seq, seq, role, observed_at, block, head,
+             raw, indexed_len, text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            instance_id,
+            kind_wire(kind),
+            node_id,
+            doc.first_seq,
+            doc.seq,
+            doc.role,
+            doc.observed_at,
+            doc.block,
+            doc.head,
+            doc.raw,
+            doc.indexed_len as i64,
+            doc.text
+        ],
+    )?;
+    Ok(())
+}
+
+/// Rebuild a node's documents from its recorded rows: a row arrived below
+/// rows already folded (the backfill reaching a node the append path
+/// started). Each row is re-read from the journal by its key.
+fn rebuild_node(
+    conn: &Connection,
+    instance_id: &str,
+    kind: JournalSearchKind,
+    node_id: &str,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String, Piece)> = {
+        let mut stmt = conn.prepare(
+            "SELECT r.seq, j.observed_at, j.payload_json
+               FROM journal_search_rows r
+               JOIN journal j ON j.instance_id = r.instance_id AND j.seq = r.seq
+              WHERE r.instance_id = ?1 AND r.kind = ?2 AND r.node_id = ?3
+              ORDER BY r.seq",
+        )?;
+        let rows = stmt
+            .query_map(params![instance_id, kind_wire(kind), node_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .filter_map(|(seq, observed_at, payload)| {
+                let event = serde_json::from_str::<Value>(&payload).ok()?;
+                Some((seq, observed_at, extract(&event)?))
+            })
+            .collect()
+    };
+    conn.execute(
+        "DELETE FROM journal_search_docs
+          WHERE instance_id = ?1 AND kind = ?2 AND node_id = ?3",
+        params![instance_id, kind_wire(kind), node_id],
+    )?;
+    for doc in fold_node(kind, &rows) {
+        insert_doc(conn, instance_id, kind, node_id, &doc)?;
+    }
+    Ok(())
+}
+
+/// Index one journal row, inside the caller's transaction; the append path
+/// and the backfill both call it. Returns whether the row was recorded (it
+/// carries searchable text and was not recorded before). The row folds
+/// into its node's newest document ([`step`]); a row below rows already
+/// folded rebuilds the node, so the order the two paths meet a node's rows
+/// in never changes its documents.
 pub(crate) fn index_event(
     conn: &Connection,
     instance_id: &str,
@@ -329,41 +683,68 @@ pub(crate) fn index_event(
     event: &Value,
     observed_at: &str,
 ) -> rusqlite::Result<bool> {
-    let Some(doc) = extract(event) else {
+    let Some(piece) = extract(event) else {
         return Ok(false);
     };
-    if !doc.node_id.is_empty() {
-        let newest: Option<(i64, i64)> = conn
-            .query_row(
-                "SELECT id, seq FROM journal_search_docs
-                  WHERE instance_id = ?1 AND node_id = ?2
-                  ORDER BY seq DESC LIMIT 1",
-                params![instance_id, doc.node_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((id, held)) = newest {
-            if held >= seq {
-                return Ok(false);
+    let kind = piece.kind;
+    let recorded = conn.execute(
+        "INSERT OR IGNORE INTO journal_search_rows (instance_id, seq, kind, node_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![instance_id, seq, kind_wire(kind), piece.node_id],
+    )?;
+    if recorded == 0 {
+        return Ok(false);
+    }
+    if piece.node_id.is_empty() {
+        if let Step::New(doc) = step(kind, None, &piece, seq, observed_at) {
+            insert_doc(conn, instance_id, kind, "", &doc)?;
+        }
+        return Ok(true);
+    }
+    let newest: Option<(i64, DocState)> = conn
+        .query_row(
+            &format!(
+                "SELECT {DOC_COLUMNS} FROM journal_search_docs
+                  WHERE instance_id = ?1 AND kind = ?2 AND node_id = ?3
+                  ORDER BY seq DESC LIMIT 1"
+            ),
+            params![instance_id, kind_wire(kind), piece.node_id],
+            doc_from_row,
+        )
+        .optional()?;
+    match newest {
+        Some((_, held)) if held.seq > seq => {
+            rebuild_node(conn, instance_id, kind, &piece.node_id)?;
+        }
+        Some((id, held)) => match step(kind, Some(&held), &piece, seq, observed_at) {
+            Step::Same(doc) => {
+                conn.execute(
+                    "UPDATE journal_search_docs
+                        SET seq = ?2, observed_at = ?3, role = ?4, block = ?5, head = ?6,
+                            raw = ?7, indexed_len = ?8, text = ?9
+                      WHERE id = ?1",
+                    params![
+                        id,
+                        doc.seq,
+                        doc.observed_at,
+                        doc.role,
+                        doc.block,
+                        doc.head,
+                        doc.raw,
+                        doc.indexed_len as i64,
+                        doc.text
+                    ],
+                )?;
             }
-            conn.execute("DELETE FROM journal_search_docs WHERE id = ?1", [id])?;
+            Step::New(doc) => insert_doc(conn, instance_id, kind, &piece.node_id, &doc)?,
+        },
+        None => {
+            if let Step::New(doc) = step(kind, None, &piece, seq, observed_at) {
+                insert_doc(conn, instance_id, kind, &piece.node_id, &doc)?;
+            }
         }
     }
-    let written = conn.execute(
-        "INSERT OR IGNORE INTO journal_search_docs
-            (instance_id, seq, node_id, kind, role, observed_at, text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            instance_id,
-            seq,
-            doc.node_id,
-            kind_wire(doc.kind),
-            doc.role,
-            observed_at,
-            doc.text
-        ],
-    )?;
-    Ok(written == 1)
+    Ok(true)
 }
 
 // ─── Backfill ──────────────────────────────────────────────────────────────

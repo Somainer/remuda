@@ -1296,6 +1296,18 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 **依据**：`crates/remuda-hub/src/store.rs`（`settle_instance_interactions`、`invalidate_interaction_payload`、`settle_on_terminal_transition`、`immediate_tx`、`Settlement`、各终态方法、`list_inbox_interactions`、`append_journal_batch`）；`crates/remuda-hub/src/ws.rs`（`FollowEvent::settlement`、follow 会话的 settlement 控制帧、journal append/epoch reconcile 后广播）；`crates/remuda-hub/src/lib.rs`（`AppState::broadcast_settlement`、reaper/启动清扫）；`crates/remuda-hub/src/http.rs`（delete/stop、NODE_BUSY/launch 失败路径广播）；`crates/remuda-hub/src/interactions.rs`（inbox feed、迟到回答状态判定）；`crates/remuda-hub/src/ssh_hosts.rs`（daemon inventory 同一事务结清）；`web/src/features/approvals/followSettlements.ts`、`web/src/lib/store.ts`、`web/src/lib/interactionStatus.ts`、`web/src/features/approvals/InboxShell.tsx`。
 ---
 
+**2026-11-05 修订注（cb-command-queue）：自己排队的命令可列出、编辑、撤回；`instance.configure` 带 generation 与明确的 `deferred`。** 不新开 ADR。本 ADR 的规则全部不变：Hub 与 Node 绝不因 ACK 不明而重发；unknown 的命令绝不以新 commandId 自动重试；send 可重放、configure 不可重放；离线排队的 configure 重放仍 409。在此之上增加：
+
+1. **「自己的」= Hub 盖章的发起者。** Agent 只看见、只能操作 initiator 为自己实例或同一血缘的命令；Human 或 Bot 设备的是它自己认证排队的命令（排队设备 id 只存 Hub）；未收窄的 owner 可列出并撤回范围内所有人的，但只能编辑自己排队的。Hub 自己写入的输入（`origin: hub`）不属于任何调用方。授权不因此变化：目标实例仍须是调用方今天可以命令的；别人的命令是 404。
+2. **「排队中」=「尚未送达」。** 只有两种情形可编辑、撤回：Hub 行 `queued`+`forwarded=0`（在 Hub 的串行 writer 里对 `forwarded=0` 做 CAS，转发的 intent 标记只对仍 `queued` 的行生效，撤回与转发恰好一方获胜）；或 PTY 承载在 Node 投递队列里持有的 prompt（经 Node `command.withdraw` / `command.edit`，对投递声明先到先得）。其余一律 409 `already-delivered`，从不猜测。
+3. **编辑保留 commandId，按 `expectedRevision` CAS 加一；已转发的命令在任何 id 下都不因编辑而再次发出。** 只改 `instance.send` 的文本与附件。转发在 intent 标记之后重读行，所以只可能发出编辑后的版本。同 id 重放若带编辑前的原始 payload 仍是同一条命令（返回当前行，仍排队则照 G1 转发一次），不会被当作 `COMMAND_ID_CONFLICT` 而退回「状态待确认」、诱导用户「仍要再送一条？」造成重复。
+4. **排队的 configure 不可编辑，只能撤回后以新 commandId 重发**，与本 ADR 2026-09-25 的「configure 不可重放」一致。撤回已 merge 的 configure 时，仍保持其所设值的字段恢复为之前的值。
+5. **撤回的命令结算为 `settled` + `withdrawn`（新的 settlement outcome），记录撤回者 `{origin, instanceId?}`，永不转发。**
+6. **运行时配置 generation。** 即实例投影已有的 `configureSeq`（每次 spec merge 加一，撤回恢复值时也加一）。configure 可带 `expectedGeneration`，不等则 409 `CONFIG_GENERATION_CONFLICT`（体内带当前 generation 与当前值），这一结局照本 ADR 与命令行一起持久化。只能在回合边界生效的 configure 明确返回 `deferred:{boundary: next-turn|next-chapter}`：忙着的 PTY 承载为 `next-turn`（由 journal 的 `effort-queued` / `effort-applied` 维持与解除）；`claude-print`、`claude-sdk` 的 effort 为 `next-chapter`，Hub 不再把 effort 转发给这两种承载去换一条拒绝。待生效的 configure 与 generation 进入 worker digest（2048 字节以内）。
+7. **审计。** 编辑、撤回与 generation 冲突各写一条审计行（谁、命令或实例、revision 或 generation）；审计与日志只记类别，绝不记 prompt 文本。
+
+路由、错误码与 Node 方法见 protocol.md §2.5 注、§7.2（2026-11-05 补）、§8.5、§9.1；授权见 main-agent.md §4.2.2；能力台账见 agent-parity.md。同一任务落地了 `ap-configure`（Agent 对自己拥有的实例改 model、effort、ultracode；permission mode 仍等 `ap-configure-mode`），因为 Main 与 owner 互不覆盖的前提是 Main 能改 configure。
+
 ## D-056
 
 **2026-10-05 · Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）**

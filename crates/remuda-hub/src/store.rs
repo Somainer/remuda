@@ -95,6 +95,26 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
+    /// cb-command-queue: a configure's `expectedGeneration` is not the
+    /// instance's runtime-config generation; nothing was merged.
+    #[error("runtime config is at generation {generation}")]
+    GenerationConflict {
+        /// Current generation.
+        generation: i64,
+        /// Current values (`GET /v1/instances/{id}/config` shape).
+        config: Value,
+    },
+    /// cb-command-queue: the command is no longer provably undelivered.
+    #[error("command {0} is not queued")]
+    NotQueued(String),
+    /// cb-command-queue: `expectedRevision` mismatch.
+    #[error("command {command_id} is at revision {revision}")]
+    RevisionConflict {
+        /// The command.
+        command_id: String,
+        /// Its current revision.
+        revision: i64,
+    },
     /// D-057 §7.3: the commit-time initiator check refused this write — the
     /// initiator's instance was fenced or superseded, the lineage paused, or
     /// the authenticating device row no longer exists. Maps to 409 `fenced`.
@@ -2173,6 +2193,25 @@ pub struct CommandRecord {
     /// serialized to clients and never sent to Nodes.
     #[serde(skip)]
     pub initiator_device_id: Option<String>,
+    /// cb-command-queue: the edit revision, 0 until the first edit.
+    #[serde(default)]
+    pub revision: i64,
+    /// cb-command-queue: where an undelivered command waits (`hub` or `node`);
+    /// set only on the queued-command list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
+    /// cb-command-queue: `{boundary, resolvedAt?}` for a configure that takes
+    /// effect only at a turn or chapter boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<Value>,
+    /// cb-command-queue: the payload before the first edit, kept only so a
+    /// D-055 same-id replay of the original still names this command.
+    /// Hub-only.
+    #[serde(skip)]
+    pub original_payload: Option<Value>,
+    /// cb-command-queue: the device that queued the command. Hub-only.
+    #[serde(skip)]
+    pub queued_by_device_id: Option<String>,
     /// Original payload.
     pub payload: Value,
     /// Optional caller idempotency key.
@@ -2194,6 +2233,10 @@ pub struct CommandSettlement {
     /// The Node's rejection message; present only for `rejected`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// cb-command-queue: who withdrew it, `{origin, instanceId?}`; present
+    /// only for `withdrawn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn_by: Option<Value>,
 }
 
 impl CommandRecord {
@@ -2205,6 +2248,7 @@ impl CommandRecord {
         outcome.map(|outcome| CommandSettlement {
             outcome: outcome.to_owned(),
             reason: reason.filter(|_| outcome == "rejected").map(str::to_owned),
+            withdrawn_by: None,
         })
     }
 }
@@ -6002,17 +6046,47 @@ impl Store {
         instance_id: String,
         payload: Value,
     ) -> Result<InstanceRecord, StoreError> {
+        self.patch_instance_configure_for(instance_id, None, payload)
+            .await
+    }
+
+    /// [`Self::patch_instance_configure`] for the configure `command_id`
+    /// (cb-command-queue): a payload `expectedGeneration` that is not the
+    /// instance's runtime-config generation (`configure_seq`) merges nothing
+    /// and fails with [`StoreError::GenerationConflict`], checked in this same
+    /// writer job; the values the merge replaced are recorded on the command
+    /// so a withdrawal can restore them.
+    pub async fn patch_instance_configure_for(
+        &self,
+        instance_id: String,
+        command_id: Option<String>,
+        payload: Value,
+    ) -> Result<InstanceRecord, StoreError> {
         self.run_named("patch_instance_configure", move |conn| {
-            let spec_raw: String = conn.query_row(
-                "SELECT spec_json FROM instances WHERE id = ?1",
+            let (spec_raw, generation): (String, i64) = conn.query_row(
+                "SELECT spec_json, configure_seq FROM instances WHERE id = ?1",
                 params![instance_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+            if let Some(expected) = payload.get("expectedGeneration") {
+                let expected = expected
+                    .as_i64()
+                    .or_else(|| expected.as_str().and_then(|text| text.trim().parse().ok()))
+                    .ok_or_else(|| {
+                        StoreError::Id("expectedGeneration must be a non-negative integer".into())
+                    })?;
+                if expected != generation {
+                    let config =
+                        crate::cmd_queue::config_view(conn, &instance_id)?.unwrap_or(Value::Null);
+                    return Err(StoreError::GenerationConflict { generation, config });
+                }
+            }
             let spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
             let Some(mut object) = spec.as_object().cloned() else {
                 return load_instance(conn, &instance_id)?
                     .ok_or_else(|| StoreError::Id("unknown instance".into()));
             };
+            let before = object.clone();
             if let Some(model) = payload
                 .get("model")
                 .or_else(|| payload.get("modelId"))
@@ -6056,6 +6130,19 @@ impl Store {
             }
             if let Some(mode) = payload.get("permissionMode").and_then(Value::as_str) {
                 object.insert("permissionMode".into(), json!(mode));
+            }
+            if let Some(command_id) = command_id.as_deref() {
+                let mut prior = serde_json::Map::new();
+                let mut set = serde_json::Map::new();
+                for key in ["model", "effort", "permissionMode"] {
+                    if before.get(key) != object.get(key)
+                        && let Some(value) = object.get(key)
+                    {
+                        prior.insert(key.into(), before.get(key).cloned().unwrap_or(Value::Null));
+                        set.insert(key.into(), value.clone());
+                    }
+                }
+                crate::cmd_queue::record_configure_prior(conn, command_id, &prior, &set)?;
             }
             let now = now_rfc3339();
             // The spec merge and the authoritative merge counter commit in one
@@ -6102,6 +6189,38 @@ impl Store {
         initiator: Option<remuda_protocol::Initiator>,
         initiator_device_id: Option<String>,
     ) -> Result<(CommandRecord, bool), StoreError> {
+        self.queue_command_by(
+            command_id,
+            instance_id,
+            host_id,
+            operation,
+            payload,
+            idempotency_key,
+            pinned_link_generation,
+            initiator,
+            initiator_device_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::queue_command`] that also records the device that queued it
+    /// (cb-command-queue: a Human or Bot device's own queued commands). The
+    /// device id is Hub-only and never serialized.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn queue_command_by(
+        &self,
+        command_id: Option<String>,
+        instance_id: Option<String>,
+        host_id: String,
+        operation: String,
+        payload: Value,
+        idempotency_key: Option<String>,
+        pinned_link_generation: Option<i64>,
+        initiator: Option<remuda_protocol::Initiator>,
+        initiator_device_id: Option<String>,
+        queued_by_device_id: Option<String>,
+    ) -> Result<(CommandRecord, bool), StoreError> {
         // Drain the test-only fence seam at enqueue time; it is applied at the
         // top of the writer job below.
         #[cfg(any(test, feature = "test-faults"))]
@@ -6134,7 +6253,7 @@ impl Store {
             if let Some(key) = idempotency_key.as_ref()
                 && let Some(existing) = load_command_by_key(conn, key)?
             {
-                if existing.payload != payload || existing.operation != operation {
+                if !same_command_payload(&existing, &payload) || existing.operation != operation {
                     return Err(StoreError::Id(
                         "idempotency key reused with a different payload".into(),
                     ));
@@ -6153,7 +6272,9 @@ impl Store {
             let command_id = match command_id {
                 Some(id) => {
                     if let Some(existing) = load_command(conn, &id)? {
-                        if existing.payload != payload || existing.operation != operation {
+                        if !same_command_payload(&existing, &payload)
+                            || existing.operation != operation
+                        {
                             return Err(StoreError::Id(
                                 "commandId reused with a different payload".into(),
                             ));
@@ -6189,10 +6310,10 @@ impl Store {
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
                      payload_json, idempotency_key, created_at, updated_at, link_generation,
                      initiator_instance_id, initiator_lineage_id, initiator_generation,
-                     initiator_device_id, initiator_root_turn_json)
+                     initiator_device_id, initiator_root_turn_json, queued_by_device_id)
                  VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
                          COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)),
-                         ?9, ?10, ?11, ?12, ?13)",
+                         ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     command_id,
                     instance_id,
@@ -6209,6 +6330,7 @@ impl Store {
                     crate::root_turn::to_column(
                         initiator.as_ref().and_then(|i| i.root_turn.as_ref())
                     ),
+                    queued_by_device_id,
                 ],
             )?;
             // D-060 (cb-memory-inject): the first input queued to a chapter
@@ -6274,7 +6396,10 @@ impl Store {
                 row.initiator.as_ref(),
                 row.initiator_device_id.as_deref(),
             )?;
-            if row.forwarded {
+            // cb-command-queue: a row withdrawn (or otherwise settled) while
+            // it waited is never forwarded; the withdraw and this mark share
+            // the writer, so exactly one of them wins.
+            if row.forwarded || row.state != "queued" {
                 return Ok(false);
             }
             let now = now_rfc3339();
@@ -6321,7 +6446,9 @@ impl Store {
                 row.initiator.as_ref(),
                 row.initiator_device_id.as_deref(),
             )?;
-            if row.forwarded {
+            // cb-command-queue: as in `mark_forward_intent`, a withdrawn or
+            // otherwise settled row is never marked.
+            if row.forwarded || row.state != "queued" {
                 return Ok(ForwardMark::AlreadyForwarded);
             }
             if crate::inbox_deliver::forward_waits(conn, &command_id)? {
@@ -6735,7 +6862,9 @@ impl Store {
                         settlement_outcome, settlement_reason,
                         settlement_http_status, settlement_http_body,
                         initiator_instance_id, initiator_lineage_id, initiator_generation,
-                        initiator_device_id, initiator_root_turn_json
+                        initiator_device_id, initiator_root_turn_json,
+                        revision, original_payload_json, queued_by_device_id,
+                        withdrawn_by_json, config_deferred, config_deferred_resolved_at
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -8571,6 +8700,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // D-060 decision 1 (cb-rootturn): the per-instance root-turn ledger and
     // the root turn stamped beside the initiator on command and audit rows.
     crate::root_turn::migrate(&conn)?;
+    // cb-command-queue: revision, queuing device, withdrawal and configure
+    // deferral columns.
+    crate::cmd_queue::migrate(&conn)?;
     // ma-lineage round 2: an immutable timestamp for the chapter's real end
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
@@ -9101,6 +9233,8 @@ fn apply_instance_projection(
     {
         apply_effective_permission_projection(conn, instance_id, effective)?;
     }
+    // cb-command-queue: a configure's deferral follows its own effort edges.
+    crate::cmd_queue::fold_configure_lifecycle(conn, instance_id, &payload)?;
     let mut lifecycle: Option<&str> = None;
     // Shared-classifier process-end evidence carried by THIS event (entity or
     // native), used to stamp ended_at from the evidence timestamp. None for a
@@ -9652,13 +9786,35 @@ fn apply_command_projection(
                 .pointer("/entity/settlement/value/error/execution")
                 .and_then(Value::as_str)
                 == Some("not-dispatched");
+            // cb-command-queue: a held prompt withdrawn through the Node whose
+            // reply was lost settles `withdrawn` with the recorded actor.
+            let withdrawn_by = crate::cmd_queue::settle_withdraw_intent(
+                conn,
+                command_id,
+                instance_id,
+                outcome,
+                not_dispatched,
+            )?;
+            let outcome = if withdrawn_by.is_some() {
+                "withdrawn"
+            } else {
+                outcome
+            };
             conn.execute(
                 "UPDATE commands
                  SET state = 'settled', resolution = 'clear',
                      settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3,
-                     settlement_not_dispatched = ?5
+                     settlement_not_dispatched = ?5,
+                     withdrawn_by_json = COALESCE(?6, withdrawn_by_json)
                  WHERE id = ?4 AND state != 'settled'",
-                params![outcome, reason, now, command_id, not_dispatched],
+                params![
+                    outcome,
+                    reason,
+                    now,
+                    command_id,
+                    not_dispatched,
+                    withdrawn_by
+                ],
             )?;
         }
         _ => {}
@@ -16987,6 +17143,13 @@ pub(crate) fn test_apply_fence(conn: &Connection, instance_id: &str) -> Result<(
     Ok(())
 }
 
+/// D-055 identity for a same-id or same-key retry: the stored payload, or
+/// the payload the command had before an edit (cb-command-queue), so an
+/// outbox replaying the original text still names the edited command.
+pub(crate) fn same_command_payload(existing: &CommandRecord, payload: &Value) -> bool {
+    &existing.payload == payload || existing.original_payload.as_ref() == Some(payload)
+}
+
 pub(crate) fn load_command(
     conn: &Connection,
     id: &str,
@@ -16997,7 +17160,9 @@ pub(crate) fn load_command(
                 settlement_outcome, settlement_reason,
                 settlement_http_status, settlement_http_body,
                 initiator_instance_id, initiator_lineage_id, initiator_generation,
-                initiator_device_id, initiator_root_turn_json
+                initiator_device_id, initiator_root_turn_json,
+                revision, original_payload_json, queued_by_device_id,
+                withdrawn_by_json, config_deferred, config_deferred_resolved_at
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -17016,7 +17181,9 @@ pub(crate) fn load_command_by_key(
                 settlement_outcome, settlement_reason,
                 settlement_http_status, settlement_http_body,
                 initiator_instance_id, initiator_lineage_id, initiator_generation,
-                initiator_device_id, initiator_root_turn_json
+                initiator_device_id, initiator_root_turn_json,
+                revision, original_payload_json, queued_by_device_id,
+                withdrawn_by_json, config_deferred, config_deferred_resolved_at
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -18121,7 +18288,7 @@ fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
     Some(json!({ "at": at, "text": text }).to_string())
 }
 
-fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
+pub(crate) fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     let payload: String = row.get(7)?;
     let forwarded: i64 = row.get(6)?;
     let settlement_outcome: Option<String> = row.get(11)?;
@@ -18148,6 +18315,50 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         }
         _ => None,
     };
+    // cb-command-queue columns, read by name: the older SELECTs that do not
+    // list them read the defaults (revision 0, nothing deferred or withdrawn).
+    let revision = row
+        .get::<_, Option<i64>>("revision")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let original_payload = row
+        .get::<_, Option<String>>("original_payload_json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let queued_by_device_id = row
+        .get::<_, Option<String>>("queued_by_device_id")
+        .ok()
+        .flatten();
+    let withdrawn_by = row
+        .get::<_, Option<String>>("withdrawn_by_json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let deferred = row
+        .get::<_, Option<String>>("config_deferred")
+        .ok()
+        .flatten()
+        .map(|boundary| {
+            let resolved = row
+                .get::<_, Option<String>>("config_deferred_resolved_at")
+                .ok()
+                .flatten();
+            match resolved {
+                Some(at) => json!({ "boundary": boundary, "resolvedAt": at }),
+                None => json!({ "boundary": boundary }),
+            }
+        });
+    let mut settlement = CommandRecord::settlement_projection(
+        settlement_outcome.as_deref(),
+        settlement_reason.as_deref(),
+    );
+    if let Some(settlement) = settlement.as_mut()
+        && settlement.outcome == "withdrawn"
+    {
+        settlement.withdrawn_by = withdrawn_by;
+    }
     Ok(CommandRecord {
         command_id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -18156,16 +18367,18 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         state: row.get(4)?,
         resolution: row.get(5)?,
         forwarded: forwarded != 0,
-        settlement: CommandRecord::settlement_projection(
-            settlement_outcome.as_deref(),
-            settlement_reason.as_deref(),
-        ),
+        settlement,
         settlement_outcome,
         settlement_reason,
         settlement_http_status,
         settlement_http_body,
         initiator,
         initiator_device_id: row.get(18)?,
+        revision,
+        held: None,
+        deferred,
+        original_payload,
+        queued_by_device_id,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

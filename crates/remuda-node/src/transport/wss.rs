@@ -1795,7 +1795,7 @@ mod tests {
         let value = encode_hello_params(&config, &epoch, &HashMap::new());
         assert_eq!(
             value["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true, "heldInput": true})
         );
 
         // No host at all (loopback config before inventory collection) still
@@ -1808,7 +1808,7 @@ mod tests {
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
         assert_eq!(
             value["capabilities"],
-            json!({"lineageFence": true, "memoryContext": true, "skillContext": true})
+            json!({"lineageFence": true, "memoryContext": true, "skillContext": true, "heldInput": true})
         );
     }
 

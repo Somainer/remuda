@@ -547,6 +547,8 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
   - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。driver 按**上报版本**从两轴选出唯一的打字词（c-effortui r4）：耦合（2.1.203–2.1.283）开 flag 是一条 `/effort ultracode`（同时把档位带到 xhigh），其余是档位词；解耦（≥2.1.284）同档切 flag 是一条 `/effort ultracode on|off`，换档（无论 flag 是否随行）是一条 `/effort <level>`，正交 flag 由 CLI 自行保持——**一次 configure 永远只有一条命令**。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
+- **「排队中」列表（cb-command-queue，2026-11-05；[protocol.md §8.5](./protocol.md#85-自己排队的命令与运行时配置的-generationcb-command-queue2026-11-05)）**：本设备自己发出、尚未送达 harness 的 send（Hub 因主机离线而持有，或 Node 在回合进行中持有）显示在 composer 上方的一个小列表（`queued-sends`），`--bg-inset` 底、1px `--border`、圆角 `--radius-md`，标题「排队中 · N」（12px `--fg-muted`）；每行一行文本（省略号，`title` 放全文）、一行 muted 说明（「主机离线，等待送达」/「等待本回合结束」）、`btnGhost` 的「编辑」「撤回」。编辑就地展开多行输入框，「保存」按 revision 提交（同一 commandId），已送达时行内显示「已送达，无法再修改」；撤回后该条永不送达，outbox 里对应的行同时删除（气泡消失），编辑后 outbox 行的文本随之更新。列表进入页面、journal 前进时与每 5 秒重读一次；为空时不渲染。与 composer 顶部区的「排队行」（浏览器自己持有、尚未 POST 的消息）不是一回事：那些还没离开本设备。
+- **配置生效边界（cb-command-queue）**：effort 与模型的变更带 `expectedGeneration`（本设备上一次 configure 应答给出的 generation，否则为实例投影的 `configureSeq`；本设备自己的 configure 还在途时不带，免得连续两次切换自相冲突）。Hub 回 409 generation 冲突时重新读取当前值并回滚乐观状态，toast「配置已在别处被修改，已载入当前值」。Hub 应答 `deferred` 时芯片的状态标签读「下一回合生效」（`next-turn`）或「下一章节生效」（`next-chapter`，本会话无法在会话内切换 effort，下次启动时生效），取代按 activity 推测的「排队中」。
 
 **compact composer 边界（D-042，修订 §11.7 冲突「P0-3」；收起态单行 56px 不变）**
 

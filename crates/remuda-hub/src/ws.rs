@@ -858,6 +858,8 @@ pub(crate) async fn handle_node_method(
                 for key in [
                     remuda_protocol::hubnode::MEMORY_CONTEXT_CAPABILITY,
                     remuda_protocol::hubnode::SKILL_CONTEXT_CAPABILITY,
+                    // cb-command-queue: nor answers for the prompts it holds.
+                    remuda_protocol::hubnode::HELD_INPUT_CAPABILITY,
                 ] {
                     state
                         .store

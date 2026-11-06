@@ -17,6 +17,7 @@ import {
   type ClaudeVersionGate,
   type EffortKind,
   type EffortSelection,
+  deferredLabel,
 } from "./effort";
 import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import css from "./effort.module.css";
@@ -83,7 +84,7 @@ export function EffortSlider({
   launchModel?: string | null;
   models?: string[];
   modelEffective?: string | null;
-  modelPending?: { id: string; queued: boolean } | null;
+  modelPending?: { id: string; queued: boolean; deferred?: "next-turn" | "next-chapter" } | null;
   modelSelectionPath?: ModelSelectionPath | null;
   modelCatalog?: ModelCatalogView | null;
   modelLockedReason?: string | null;
@@ -576,7 +577,11 @@ export function EffortSlider({
                     ) : null}
                     {pending ? (
                       <span className={css.effortDesc} data-testid="model-option-pending">
-                        {modelPending?.queued ? "排队中" : "切换中"}
+                        {modelPending?.deferred
+                          ? deferredLabel(modelPending.deferred)
+                          : modelPending?.queued
+                            ? "排队中"
+                            : "切换中"}
                       </span>
                     ) : null}
                   </button>

@@ -3,6 +3,7 @@
 pub mod agents;
 mod brief;
 mod capability;
+mod command;
 pub mod dev;
 mod dispatch;
 pub mod dispatcher;
@@ -67,6 +68,7 @@ commands! {
     Version(version::Args),
     Ssh(ssh::Args),
     Instance(instance::Args),
+    Cmd(command::CmdArgs),
     Journal(journal_diff::Args),
     Project(project::ProjectArgs),
     Task(task::TaskArgs),

@@ -45,6 +45,7 @@ gated block. The main pass sets none of these flags.
 | `dir-picker.hub.spec.ts:24` | `HUB_E2E_DIR_PICKER !== "1"` | 2 | never ran | **wired** — group `dir-picker` |
 | `effort-sync.hub.spec.ts:444` | `HUB_E2E_FAKE_NODE !== "1"` | 3 | never ran (nothing in the repo set the flag) | **wired** — group `effort-sentinels` (grep: only this describe) |
 | `ux-permmode.hub.spec.ts:68` | `HUB_E2E_FAKE_NODE !== "1"` | 4 | never ran | **wired** — group `fake-node` |
+| `cmd-queue.hub.spec.ts:84` | `HUB_E2E_FAKE_NODE !== "1"` | 3 | opt-in pass (cb-command-queue r2, beside the Main specs) | **runs** — group `fake-node` |
 | `task-model-bind.hub.spec.ts:30` | `HUB_E2E_TASK_BIND !== "1"` | 8 | never ran | **wired** — group `task-bind` |
 | `task-model-boardui.hub.spec.ts:39` | `HUB_E2E_TASK_BIND !== "1"` | 4 | never ran | **wired** — group `task-bind` |
 | `task-model-project.hub.spec.ts:44` | `HUB_E2E_PROJECT_SWITCHER !== "1"` | 7 | never ran | **wired** — group `project-switcher` |

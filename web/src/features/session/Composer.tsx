@@ -39,6 +39,7 @@ import {
   type ClaudeVersionGate,
   type EffortKind,
   type EffortSelection,
+  deferredLabel,
 } from "./effort";
 import { composerState, steerHeldControl, type Phase } from "../composer/state";
 import {
@@ -127,6 +128,7 @@ export function Composer({
   effortEffective,
   effortReadbackWithdrawn = false,
   effortPending,
+  effortDeferred = null,
   ultraGate,
   ultraBlocked,
   effortDefaultIndex,
@@ -207,7 +209,7 @@ export function Composer({
   /** §9.1 transcript-read-back effective model id; null/undefined = unobserved. */
   modelEffective?: string | null;
   /** §9.1 a model switch in flight. */
-  modelPending?: { id: string; queued: boolean } | null;
+  modelPending?: { id: string; queued: boolean; deferred?: "next-turn" | "next-chapter" } | null;
   /** Read-back marker: did the last Remuda switch pick a listed id or type it. */
   modelSelectionPath?: ModelSelectionPath | null;
   /** Resolved catalog with provenance, for the picker diagnostic note. */
@@ -228,9 +230,17 @@ export function Composer({
     name: string;
     ultracode: boolean;
     queued: boolean;
+    /** cb-command-queue: the boundary the Hub said this change waits for. */
+    deferred?: "next-turn" | "next-chapter";
     levelSettled?: boolean;
     flagSettled?: boolean;
   } | null;
+  /**
+   * cb-command-queue: an effort change the Hub deferred to the session's next
+   * launch (a carrier with no in-session effort channel); nothing is pending
+   * in this session, so the chip only says when it applies.
+   */
+  effortDeferred?: "next-turn" | "next-chapter" | null;
   /** Claude Code version classification for the switch (coupled/legacy gate). */
   ultraGate?: ClaudeVersionGate;
   /** Journal-projected refusal that disables the switch (model/workflows). */
@@ -1115,9 +1125,11 @@ export function Composer({
     );
   }
   const pendingTitle = pending
-    ? pending.queued
-      ? `排队中：${pending.name}${pending.ultracode ? " · ultracode" : ""} 将在本回合结束后生效`
-      : `切换中：${pending.name}${pending.ultracode ? " · ultracode" : ""}`
+    ? pending.deferred
+      ? `${deferredLabel(pending.deferred)}：${pending.name}${pending.ultracode ? " · ultracode" : ""}`
+      : pending.queued
+        ? `排队中：${pending.name}${pending.ultracode ? " · ultracode" : ""} 将在本回合结束后生效`
+        : `切换中：${pending.name}${pending.ultracode ? " · ultracode" : ""}`
     : "";
   const effortChipTitle = withdrawnPending
     ? "回读不可用：实际档位未知（？），切换结果等待本次 configure"
@@ -1293,8 +1305,21 @@ export function Composer({
         </span>
       ) : null}
       {pending ? (
-        <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
-          {pending.queued ? "排队中" : "切换中"}
+        <span
+          className={css.chipEffortPendingTag}
+          data-testid="model-effort-pending"
+          data-deferred={pending.deferred ?? ""}
+        >
+          {pending.deferred ? deferredLabel(pending.deferred) : pending.queued ? "排队中" : "切换中"}
+        </span>
+      ) : effortDeferred ? (
+        <span
+          className={css.chipEffortPendingTag}
+          data-testid="model-effort-pending"
+          data-deferred={effortDeferred}
+          title="本会话无法在会话内切换 effort；将在下一次启动时生效"
+        >
+          {deferredLabel(effortDeferred)}
         </span>
       ) : null}
       {mismatchLines.map((line, i) => (

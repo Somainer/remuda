@@ -135,6 +135,19 @@ impl PromptCorrelator {
         prune(&mut pending);
     }
 
+    /// cb-command-queue: a held prompt was edited before delivery; its
+    /// evidence will carry the new text.
+    pub fn retext(&self, command_id: &CommandId, text: String) {
+        let mut pending = self.pending.lock().expect("prompt correlator");
+        if let Some(entry) = pending
+            .iter_mut()
+            .find(|entry| &entry.command_id == command_id)
+        {
+            entry.normalized = normalize_ws(&text);
+            entry.text = text;
+        }
+    }
+
     /// Attribute one incoming prompt observation.
     ///
     /// `None` means no pending command owns this text (a natively typed

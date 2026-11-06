@@ -328,18 +328,46 @@ pub async fn require_instance_read(
     Ok(())
 }
 
+/// The per-instance GETs an Agent may make on an instance it owns, returning
+/// the path's instance id. Every handler behind them repeats the ownership
+/// check with [`require_instance_read`], except `memory-writes`, whose handler
+/// applies its own narrower one ([`is_own_chapter`]: the caller's own
+/// lineage, never a child).
 fn read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/instances/")?;
-    // Every per-instance *read* suffix must be listed: an unlisted one falls
-    // through to the `contains('/')` guard and is refused, which is the safe
-    // direction but silently breaks the endpoint for agent callers.
-    let id = rest
-        .strip_suffix("/journal")
-        .or_else(|| rest.strip_suffix("/screen"))
+    // Every per-instance *read* suffix must be listed: an unlisted one is
+    // refused, which is the safe direction but silently breaks the endpoint
+    // for agent callers.
+    let (id, suffix) = match rest.split_once('/') {
+        Some((id, suffix)) => (id, Some(suffix)),
+        None => (rest, None),
+    };
+    let admitted = match suffix {
+        None => true,
+        Some("journal" | "screen") => true,
         // cb-command-queue: the runtime config and its generation.
-        .or_else(|| rest.strip_suffix("/config"))
-        .unwrap_or(rest);
-    (!id.is_empty() && !id.contains('/')).then_some(id)
+        Some("config") => true,
+        // ap-command-read: the command ledger, so an Agent reconciles a send
+        // by its commandId (D-055) instead of re-sending it.
+        Some("commands") => true,
+        // ap-memory-writes: the handler narrows this to the caller's own
+        // lineage's chapters.
+        Some("memory-writes") => true,
+        Some(suffix) => {
+            suffix.strip_prefix("commands/").is_some_and(one_segment)
+                // ap-subagent-read: a subagent's transcript.
+                || suffix
+                    .strip_prefix("subagents/")
+                    .and_then(|rest| rest.strip_suffix("/transcript"))
+                    .is_some_and(one_segment)
+        }
+    };
+    (!id.is_empty() && admitted).then_some(id)
+}
+
+/// One non-empty path segment.
+fn one_segment(segment: &str) -> bool {
+    !segment.is_empty() && !segment.contains('/')
 }
 
 /// `PATCH /v1/commands/{id}` (cb-command-queue).
@@ -563,6 +591,24 @@ pub async fn require_worker_owned(
     }
 }
 
+/// Whether `instance_id` is a chapter of the Agent device's own lineage: the
+/// bound chapter itself, or a predecessor or successor of it, never a child.
+pub(crate) async fn is_own_chapter(
+    state: &AppState,
+    device: &Device,
+    instance_id: &str,
+) -> Result<bool, HubError> {
+    let Some(lineage) = state
+        .store
+        .lineage_id_for_instance(instance_id.to_string())
+        .await
+        .map_err(crate::http::map_store)?
+    else {
+        return Ok(false);
+    };
+    agent_owns_lineage(state, device, &lineage).await
+}
+
 /// Whether an Agent device's bound instance belongs to `lineage_id`.
 async fn agent_owns_lineage(
     state: &AppState,
@@ -608,6 +654,13 @@ fn project_read_target(path: &str) -> bool {
         Some(_) => false,
         None => false,
     }
+}
+
+/// ap-gate-reads: `GET /v1/gate/jobs`, which the handler filters to the
+/// caller's project scope, and `GET /v1/gate/logs/{id}`, which the handler
+/// checks against the job's project scope.
+fn gate_read_target(path: &str) -> bool {
+    path == "/v1/gate/jobs" || path.strip_prefix("/v1/gate/logs/").is_some_and(one_segment)
 }
 
 /// `PATCH /v1/projects/{id}`, `POST|DELETE /v1/projects/{id}/members`, or the
@@ -1321,6 +1374,7 @@ pub fn agent_route_admission<'a>(
             // §2.4: coordinators list/read projects and instances
             // inside their scope; handlers re-check grants + scope.
             || project_read_target(path)
+            || gate_read_target(path)
             || task_read_target(method, path)
             || path == "/v1/instances"
             // D-057 §4.2 item 1: scope-wide worker reads; the
@@ -1546,8 +1600,74 @@ mod tests {
             admission(Method::GET, "/v1/hosts"),
             AgentRouteAdmission::Refused
         );
+        // ap-command-read: both command reads are pinned to an owned target.
+        for path in [
+            "/v1/instances/ins_1/commands",
+            "/v1/instances/ins_1/commands/cmd_1",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1")),
+                "{path}"
+            );
+        }
+        for path in [
+            "/v1/instances/ins_1/commands/",
+            "/v1/instances/ins_1/commands/cmd_1/extra",
+            "/v1/instances//commands",
+            "/v1/instances/ins_1/",
+            "/v1/instances/ins_1/resume",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Refused,
+                "{path}"
+            );
+        }
+        // ap-gate-reads: scope-wide reads; the handlers filter by scope.
+        for path in ["/v1/gate/jobs", "/v1/gate/logs/gjb_1"] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Admitted,
+                "{path}"
+            );
+        }
+        for (method, path) in [
+            (Method::GET, "/v1/gate/logs/"),
+            (Method::GET, "/v1/gate/logs/gjb_1/extra"),
+            (Method::GET, "/v1/gate/jobs/gjb_1"),
+            (Method::POST, "/v1/gate/jobs"),
+        ] {
+            assert_eq!(
+                admission(method.clone(), path),
+                AgentRouteAdmission::Refused,
+                "{method} {path}"
+            );
+        }
+        // ap-subagent-read: a subagent's transcript under an owned instance.
         assert_eq!(
-            admission(Method::GET, "/v1/instances/ins_1/commands"),
+            admission(Method::GET, "/v1/instances/ins_1/subagents/a1b2/transcript"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        for path in [
+            "/v1/instances/ins_1/subagents//transcript",
+            "/v1/instances/ins_1/subagents/a/b/transcript",
+            "/v1/instances/ins_1/subagents/a1b2",
+        ] {
+            assert_eq!(
+                admission(Method::GET, path),
+                AgentRouteAdmission::Refused,
+                "{path}"
+            );
+        }
+        // ap-memory-writes: an owned instance; the handler narrows it to the
+        // caller's own lineage.
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/memory-writes"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        assert_eq!(
+            admission(Method::GET, "/v1/instances/ins_1/memory-writes/x"),
             AgentRouteAdmission::Refused
         );
         assert_eq!(

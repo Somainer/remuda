@@ -97,6 +97,27 @@ impl Ctx {
         }
     }
 
+    /// A continuity lineage of its own whose first chapter is a child of
+    /// `parent` (the edge `owns()` follows); returns its id.
+    async fn child_seat(&self, parent: &str) -> Result<String> {
+        let record = self
+            .hub
+            .store()
+            .context("store")?
+            .insert_instance_delegated(
+                HOST.into(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({"origin": "human", "parentInstanceId": parent}),
+                remuda_hub::store_test_support::continuity_delegation(),
+                remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+            )
+            .await?;
+        Ok(record.instance_id)
+    }
+
     async fn agent(&self, instance: &str) -> Result<String> {
         self.hub
             .test_mint_agent_token(&format!("agent-{instance}"), instance)
@@ -1329,18 +1350,9 @@ async fn an_agent_write_mid_turn_records_the_turn_and_the_feed_returns_it() -> R
         json!(started),
         "the owner reads the chapter's feed too"
     );
-    let feed = ctx.writes(&lineage, &seat).await;
-    assert!(feed.is_err(), "an Agent token is refused");
-    let reply = ctx
-        .call(
-            "GET",
-            &format!("/v1/instances/{lineage}/memory-writes"),
-            &seat,
-            None,
-            None,
-        )
-        .await?;
-    assert_eq!(reply.status, 403, "{}", reply.body);
+    // ap-memory-writes: the seat reads its own chapter's feed too.
+    let feed = ctx.writes(&lineage, &seat).await?;
+    assert_eq!(feed["items"][0]["turnSeq"], json!(started), "{feed}");
 
     let bot = ctx.hub.mint_bot_device_token("memory-writes-bot").await?;
     let feed = ctx.writes(&lineage, &bot).await?;
@@ -1595,5 +1607,92 @@ async fn an_after_id_above_the_i64_range_is_saturated() -> Result<()> {
         Some(i64::MAX as u64),
         "the cursor saturates instead of being dropped"
     );
+    Ok(())
+}
+
+/// ap-memory-writes: an Agent reads the write log of every chapter of its own
+/// lineage, the same scope as the entries it reads. Its child's log (an
+/// instance it owns, so the middleware admits the path) is the child seat's
+/// memory and is refused by the handler; an unrelated seat's is refused by
+/// the middleware. A Human narrowed to the chapter gets the same answers, and
+/// a plain Human reads every log.
+#[tokio::test]
+async fn an_agent_reads_its_own_lineages_write_log_and_no_other_seats() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let first = ctx.seat().await?;
+    let first_token = ctx.agent(&first).await?;
+    ctx.ok(
+        "POST",
+        &mem(&first, ""),
+        &first_token,
+        Some(entry("early", "project", "")),
+    )
+    .await?;
+    let second = ctx.continue_lineage(&first, 1).await?;
+    let second_token = ctx.agent(&second).await?;
+    ctx.ok(
+        "POST",
+        &mem(&first, ""),
+        &second_token,
+        Some(entry("late", "project", "")),
+    )
+    .await?;
+    let child = ctx.child_seat(&second).await?;
+    let child_token = ctx.agent(&child).await?;
+    ctx.ok(
+        "POST",
+        &mem(&child, ""),
+        &child_token,
+        Some(entry("child-note", "project", "")),
+    )
+    .await?;
+    let other = ctx.seat().await?;
+    let other_token = ctx.agent(&other).await?;
+    ctx.ok(
+        "POST",
+        &mem(&other, ""),
+        &other_token,
+        Some(entry("other-note", "project", "")),
+    )
+    .await?;
+
+    let slugs = |body: &Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["slug"].as_str().unwrap_or("").to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let path = |instance: &str| format!("/v1/instances/{instance}/memory-writes");
+    for (token, narrow, who) in [
+        (second_token.as_str(), None, "agent"),
+        (ctx.human.as_str(), Some(second.as_str()), "narrowed human"),
+    ] {
+        for (chapter, slug) in [(&second, "late"), (&first, "early")] {
+            let reply = ctx.call("GET", &path(chapter), token, narrow, None).await?;
+            assert_eq!(reply.status, 200, "{who} {chapter}: {}", reply.body);
+            assert_eq!(slugs(&reply.body), [slug], "{who}: {}", reply.body);
+        }
+        for (target, reason) in [(&child, "not-owner"), (&other, "agent-route")] {
+            let reply = ctx.call("GET", &path(target), token, narrow, None).await?;
+            assert_eq!(reply.status, 403, "{who} {target}: {}", reply.body);
+            assert_eq!(reply.body["reason"], reason, "{who}: {}", reply.body);
+            assert_eq!(reply.body["next"]["action"], "ask-owner");
+            assert!(reply.body.get("items").is_none(), "{}", reply.body);
+        }
+    }
+    for (chapter, slug) in [
+        (&first, "early"),
+        (&second, "late"),
+        (&child, "child-note"),
+        (&other, "other-note"),
+    ] {
+        let feed = ctx.writes(chapter, &ctx.human).await?;
+        assert_eq!(slugs(&feed), [slug], "human {chapter}: {feed}");
+    }
     Ok(())
 }

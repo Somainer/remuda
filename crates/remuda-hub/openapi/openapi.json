@@ -10551,7 +10551,7 @@
     },
     "/v1/instances/{id}/memory-writes": {
       "get": {
-        "description": "One page of a writer chapter's memory write log (latest page when no cursor is given; oldest first within the page), keyed by log row id so a single turn with more rows than a page still advances. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. Human and Bot callers only: an Agent credential is refused (403).",
+        "description": "One page of a writer chapter's memory write log (latest page when no cursor is given; oldest first within the page), keyed by log row id so a single turn with more rows than a page still advances. A row survives a later rewrite or delete of its entry, so the transcript can show every turn that wrote memory. Human and Bot callers read any chapter; an Agent reads a chapter of its own lineage (ap-memory-writes), and another session's log is 403 (not-owner for one it owns, agent-route otherwise).",
         "operationId": "memoryWrites",
         "parameters": [
           {

@@ -73,6 +73,8 @@ const TOOL_TEXT_BYTES: usize = 2 * 1024;
 const REDACT_SLACK_BYTES: usize = 4 * 1024;
 /// Journal rows read per backfill writer job.
 pub(crate) const BACKFILL_BATCH_ROWS: usize = 2000;
+/// Writer time one backfill batch may take before it stops early.
+const BACKFILL_BATCH_BUDGET: Duration = Duration::from_millis(100);
 /// Pause between backfill batches, so appends interleave on the writer.
 const BACKFILL_PAUSE: Duration = Duration::from_millis(20);
 /// Pause after a failed batch before it is retried.
@@ -92,7 +94,9 @@ const SNIPPET_LEAD_CHARS: usize = 60;
 ///
 /// - `journal_search_rows` records every journal row that carries
 ///   searchable text, keyed like the journal, with the node it belongs to.
-///   It makes indexing idempotent and lets a node be rebuilt from its rows.
+///   It makes indexing idempotent and lets a node be rebuilt from its rows
+///   (rare, so a rebuild scans the instance's records by key prefix rather
+///   than keeping a second index).
 /// - `journal_search_docs` holds one document per run of a node's rows
 ///   ([`step`]): the rows `first_seq..=seq` of `(instance_id, kind,
 ///   node_id)`. `raw` is the concatenated journal text, never searched or
@@ -110,8 +114,6 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             node_id TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
         ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS journal_search_rows_node
-            ON journal_search_rows (instance_id, kind, node_id, seq);
         CREATE TABLE IF NOT EXISTS journal_search_docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instance_id TEXT NOT NULL,
@@ -823,21 +825,26 @@ fn backfill_batch(conn: &mut Connection, limit: usize) -> Result<BackfillStep, S
         )?
         .collect::<rusqlite::Result<_>>()?
     };
-    let mut step = BackfillStep {
-        scanned: rows.len(),
-        done: rows.len() < limit,
-        ..BackfillStep::default()
-    };
+    let mut step = BackfillStep::default();
+    // A batch also stops at its time budget, so one writer job never holds
+    // the writer long: rows with long streams fold slower than others.
+    let started = Instant::now();
+    let mut taken = 0;
     for (index, (instance_id, seq, payload, observed_at)) in rows.iter().enumerate() {
         backfill_hook(index)?;
-        let Ok(event) = serde_json::from_str::<Value>(payload) else {
-            continue;
-        };
-        if index_event(&tx, instance_id, *seq, &event, observed_at)? {
+        taken = index + 1;
+        if let Ok(event) = serde_json::from_str::<Value>(payload)
+            && index_event(&tx, instance_id, *seq, &event, observed_at)?
+        {
             step.indexed += 1;
         }
+        if started.elapsed() >= BACKFILL_BATCH_BUDGET {
+            break;
+        }
     }
-    let (after_instance, after_seq) = rows
+    step.scanned = taken;
+    step.done = taken == rows.len() && rows.len() < limit;
+    let (after_instance, after_seq) = rows[..taken]
         .last()
         .map(|(instance_id, seq, _, _)| (instance_id.clone(), *seq))
         .unwrap_or((mark.after_instance, mark.after_seq));

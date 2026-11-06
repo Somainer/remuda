@@ -9,6 +9,15 @@
 //! builds into a target dir owned by a parent `cargo test`. After a build (or
 //! when another process may still be writing the file), the locator waits until
 //! the binary can be exec'd, retrying `ETXTBSY` / [`std::io::ErrorKind::ExecutableFileBusy`].
+//!
+//! A remuda-testing binary found on disk is reused only when it was built from
+//! THIS tree: every one of them embeds the build stamp (`build.rs`: checkout
+//! path plus a hash of the sources it is compiled from), and the locator
+//! compares it with its own. A target dir shared across checkouts (the landing
+//! gate's, which builds each candidate in a throwaway worktree) otherwise hands
+//! a test a binary from another tree, which can read fixture paths that no
+//! longer exist or speak an older protocol. A mismatch rebuilds, like a
+//! missing binary does.
 
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
@@ -17,6 +26,40 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+
+/// The remuda-testing build stamp, as embedded in each of its binaries.
+const BUILD_STAMP_MARKER: &str = concat!(
+    "REMUDA_TESTING_BUILD_STAMP=",
+    env!("REMUDA_TESTING_BUILD_STAMP")
+);
+
+/// Keep the build stamp in a binary's image. Every remuda-testing binary calls
+/// this first thing in `main`; [`ensure_workspace_bin`] reuses only a binary
+/// that carries the stamp of the tree the caller was built from.
+pub fn embed_build_stamp() {
+    std::hint::black_box(BUILD_STAMP_MARKER);
+}
+
+/// Whether the file at `path` carries `marker` (read, never executed: a
+/// binary from another tree may do anything when run).
+fn carries_marker(path: &Path, marker: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let marker = marker.as_bytes();
+    let first = marker[0];
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == first)
+        .any(|(at, _)| bytes[at..].starts_with(marker))
+}
+
+/// Whether `path` is a remuda-testing binary built from this tree. The real
+/// `remuda` binary is another package and carries no stamp.
+fn built_from_this_tree(name: &str, path: &Path) -> bool {
+    name == "remuda" || carries_marker(path, BUILD_STAMP_MARKER)
+}
 
 /// Workspace root (`crates/remuda-testing/../..`).
 pub fn workspace_root() -> PathBuf {
@@ -112,8 +155,10 @@ pub fn fallback_bin_path(name: &str) -> PathBuf {
 /// Return `{name}` built for this workspace, without racing a parent `cargo test`.
 ///
 /// Lookup order: `REMUDA_<NAME>_BIN` (hyphens → underscores), `CARGO_BIN_EXE_*`,
-/// then `{debug,release}/<name>` under [`cargo_target_dir`]. If the binary is
-/// missing, a nested `cargo build -p remuda-testing --bin <name>` runs **only**
+/// then `{debug,release}/<name>` under [`cargo_target_dir`] and its sidecar,
+/// reusing a found binary only when it carries this tree's build stamp. If no
+/// binary from this tree is on disk, a nested
+/// `cargo build -p remuda-testing --bin <name>` runs **only**
 /// when this process is not already inside a parent cargo that owns the same
 /// target dir. Under `cargo test` the fallback uses a sidecar target
 /// (`<target>/remuda-test-bins`) so it never takes the parent `.cargo-lock`.
@@ -132,7 +177,11 @@ pub fn ensure_workspace_bin(name: &str) -> PathBuf {
     let target_dir = cargo_target_dir();
     let sidecar = target_dir.join("remuda-test-bins");
     let _lock = lock_bin_locator(&target_dir);
-    if let Some(path) = locate_bin_in(&target_dir, name).or_else(|| locate_bin_in(&sidecar, name)) {
+    let current = [&target_dir, &sidecar]
+        .into_iter()
+        .filter_map(|dir| locate_bin_in(dir, name))
+        .find(|path| built_from_this_tree(name, path));
+    if let Some(path) = current {
         wait_until_runnable(&path);
         return path;
     }
@@ -148,6 +197,11 @@ pub fn ensure_workspace_bin(name: &str) -> PathBuf {
             build_dir.display()
         )
     });
+    assert!(
+        built_from_this_tree(name, &path),
+        "{} was just built but does not carry this tree's build stamp",
+        path.display()
+    );
     wait_until_runnable(&path);
     path
 }
@@ -302,6 +356,35 @@ mod tests {
         let path = ensure_workspace_bin("fake-herdr");
         assert!(path.is_file(), "{}", path.display());
         assert!(is_executable(&path), "{}", path.display());
+    }
+
+    #[test]
+    fn ensured_fake_herdr_carries_this_trees_stamp() {
+        let path = ensure_workspace_bin("fake-herdr");
+        assert!(
+            built_from_this_tree("fake-herdr", &path),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn a_binary_without_this_trees_stamp_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_tree = dir.path().join("fake-herdr");
+        // Another tree's stamp: the same marker prefix, a different hash.
+        std::fs::write(
+            &other_tree,
+            format!("\x7fELF..REMUDA_TESTING_BUILD_STAMP={}..", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(!built_from_this_tree("fake-herdr", &other_tree));
+        let unstamped = dir.path().join("fake-claude");
+        std::fs::write(&unstamped, "\x7fELF..an older build with no stamp..").unwrap();
+        assert!(!built_from_this_tree("fake-claude", &unstamped));
+        let this_tree = dir.path().join("fake-harness");
+        std::fs::write(&this_tree, format!("\x7fELF..{BUILD_STAMP_MARKER}..")).unwrap();
+        assert!(built_from_this_tree("fake-harness", &this_tree));
     }
 
     #[test]

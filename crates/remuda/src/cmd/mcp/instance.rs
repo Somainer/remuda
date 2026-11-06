@@ -79,6 +79,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         opt_str(&args, "commandId"),
                         opt_str(&args, "completionScope").unwrap_or("native-turn"),
                         "mcp",
+                        &[],
                     )
                     .await
                 })

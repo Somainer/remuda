@@ -150,6 +150,7 @@ v2 的 `crates/remuda-driver/src/clipboard.rs`：macOS `osascript` 写 `«class 
 ### 5.4 安全
 
 - 鉴权：`require_origin` + device cookie，仅 owner device 可上传；agent-origin 一律 403（MVP），v2 再把 `object.attach` 纳入 `agent_scope` 的 approval 类别。`GET /v1/objects/{id}` 双重绑定 account + 该对象绑定的 instance；Node 只能读它所托管 instance 的对象。
+  - 2026-11-06（`ap-attachments`，main-agent.md §4.2.3）：Agent 来源不再一律 403。它可以为自己拥有的实例（`owns()`）上传、把对象附在发给该实例的 send 上、并读取该实例的附件，不需审批（与它读该实例的 journal 同一谓词，附件是它本可读到的会话内容）；上限与类型规则不变；别的会话的对象对它是 404，与不存在相同。
 - 尺寸：单文件 ≤5 MiB、单条消息 ≤4 个附件、单 instance 暂存 ≤64 MiB，超限返回 `RESOURCE_LIMIT`（chip 保留可重试）。滑动窗口限流留 v2。
 - MIME：allowlist `image/png|jpeg|webp|gif`（PDF 默认关闭）；**以服务端 magic bytes 嗅探为准**，与 `Content-Type` 不符即拒。**丢弃原始文件名**，落盘名固定 `<obj_id>.<ext-from-sniff>`，结构性消除路径穿越。
 - 响应头：`Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`。

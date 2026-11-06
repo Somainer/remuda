@@ -618,6 +618,9 @@ pub fn render_section(context: &SkillContext) -> String {
          - their runtime config: `remuda instance config`, then \
          `remuda instance configure` for model, effort or ultracode with the generation you \
          read;\n\
+         - their attachments: `remuda instance attach` stages a file for one of them, \
+         `remuda instance send --attach` delivers it, `remuda instance attachment` reads \
+         one back;\n\
          - the commands you queued that have not been delivered: `remuda cmd ls`, \
          `remuda cmd edit`, `remuda cmd withdraw`, and `remuda cmd deliver` once the host is \
          back;\n\

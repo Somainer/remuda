@@ -1486,6 +1486,9 @@ pub fn agent_route_admission<'a>(
             // cb-command-queue: withdraw an own queued command; the
             // handler admits only the caller's own, undelivered ones.
             || command_withdraw_target(path)
+            // ap-attachments: stage an attachment; the handler admits it
+            // only for an instance the caller owns (`instanceId` query).
+            || path == "/v1/objects"
             || task_write_target(method, path));
     let patched = *method == Method::PATCH
         && (project_write_target(path)
@@ -1644,6 +1647,10 @@ mod tests {
         assert_eq!(
             admission(Method::GET, "/v1/objects/obj_1"),
             AgentRouteAdmission::MiddlewareSkipped
+        );
+        assert_eq!(
+            admission(Method::POST, "/v1/objects"),
+            AgentRouteAdmission::Admitted
         );
     }
 

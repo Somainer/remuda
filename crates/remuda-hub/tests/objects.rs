@@ -452,9 +452,10 @@ async fn an_oversize_content_length_is_rejected_before_the_body() -> Result<()> 
     Ok(())
 }
 
-/// D-027: the MVP gives Agent-origin callers no upload channel at all.
+/// D-027 gave Agent-origin callers no upload channel; `ap-attachments` opens
+/// one for the instances an Agent owns, and nothing else.
 #[tokio::test]
-async fn agent_origin_cannot_upload_and_human_can() -> Result<()> {
+async fn agent_origin_uploads_only_for_what_it_owns_and_a_bot_can() -> Result<()> {
     let fixture = fixture().await?;
     let addr = fixture.hub.addr;
     // Mint an instance-scoped credential, which is exactly what an in-session
@@ -484,7 +485,23 @@ async fn agent_origin_cannot_upload_and_human_can() -> Result<()> {
         .await?;
         (status, String::from_utf8_lossy(&body).to_string())
     };
-    assert_eq!(status, 403, "an agent must not stage attachments: {body}");
+    // ap-attachments: an Agent stages for an instance it owns (itself here)…
+    assert_eq!(status, 200, "an agent stages for its own session: {body}");
+    // …and nothing else; an unknown instance is the same refusal.
+    let (status, _, body) = raw(
+        addr,
+        "POST",
+        "/v1/objects?instanceId=ins_not_owned",
+        &[("Authorization", &format!("Bearer {agent_token}"))],
+        Some(("image/png", &png_bytes(256))),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        403,
+        "an agent stages only for what it owns: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     // A bot device is an operator for this purpose and is allowed.
     let bot = login(addr, &fixture.hub.bootstrap_token, "objects-bot", "bot").await?;

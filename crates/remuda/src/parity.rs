@@ -64,7 +64,11 @@ pub const ALLOWLIST_SECTIONS: [&str; 2] = [
 ///   `GET /v1/gate/jobs` is not.
 /// - `` `watch` `` and `` `report` ``: the worker read is admitted, the
 ///   cross-project gate read is not.
-const AGENT_ROUTE_EXEMPTIONS: [&str; 9] = [
+/// - `Open an attachment` and `` `instance attachment` ``: the middleware
+///   skips `GET /v1/objects/{id}` (a Node pulls it with its host token), so
+///   it carries no middleware verdict; the handler admits an Agent that owns
+///   the object's instance (`ap-attachments`).
+const AGENT_ROUTE_EXEMPTIONS: [&str; 11] = [
     "Follow the session live",
     "Create a worktree for it",
     "List pending items",
@@ -74,6 +78,8 @@ const AGENT_ROUTE_EXEMPTIONS: [&str; 9] = [
     "`gate list`",
     "`watch`",
     "`report`",
+    "Open an attachment",
+    "`instance attachment`",
 ];
 
 const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];

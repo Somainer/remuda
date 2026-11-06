@@ -204,13 +204,20 @@ async fn upload(
     body: Bytes,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    // Human or Bot only. An Agent-origin caller is refused outright in the
-    // MVP; giving agents an upload channel needs an approval category first.
-    let device = crate::agent_scope::require_operator(&state, &headers).await?;
+    // ap-attachments: an Agent stages only for an instance it owns
+    // (`owns()`, the journal read's predicate); limits and types are the same
+    // for every caller. Ownership is decided before the instance is looked
+    // up, so a foreign or unknown id answers the same 403.
+    let device = crate::agent_scope::caller(&state, &headers).await?;
 
     let instance_id = query.instance_id.trim().to_owned();
     if instance_id.is_empty() {
         return Err(HubError::BadRequest("instanceId is required".into()));
+    }
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent
+        && !crate::agent_scope::owns(&state, &device, &instance_id).await?
+    {
+        return Err(HubError::not_owner());
     }
     let instance = state
         .store
@@ -299,6 +306,7 @@ async fn upload(
         original_name = ?record.original_name,
         instance_id = %record.instance_id,
         device_id = %device.id,
+        origin = ?crate::agent_scope::origin(&device),
         "attachment.uploaded"
     );
     Ok(Json(json!({
@@ -359,10 +367,12 @@ pub async fn validate_send_attachments(
             .map(|object| object.remove("attachments"));
         return Ok(());
     }
-    // An Agent-origin caller has no upload channel in the MVP, so it has no
-    // legitimate way to hold an object id either.
-    if crate::agent_scope::origin(device) == remuda_protocol::InputOrigin::Agent {
-        return Err(HubError::Forbidden);
+    // ap-attachments: an Agent stages objects only for instances it owns, so
+    // it attaches only to a send to one of them.
+    if crate::agent_scope::origin(device) == remuda_protocol::InputOrigin::Agent
+        && !crate::agent_scope::owns(state, device, &instance.instance_id).await?
+    {
+        return Err(HubError::not_owner());
     }
     if entries.len() > MAX_ATTACHMENTS_PER_SEND {
         return Err(HubError::BadRequest(format!(
@@ -425,10 +435,12 @@ pub async fn validate_send_attachments(
 
 /// `GET /v1/objects/{id}` — read staged bytes back.
 ///
-/// Two callers are allowed, and each is bound to the object's instance:
-/// the operator device that can already see the instance, and the Node
+/// Three callers are allowed, and each is bound to the object's instance:
+/// the operator device that can already see the instance, an Agent that owns
+/// it (`ap-attachments`, `owns()` as for the journal read), and the Node
 /// hosting it. A host credential therefore cannot read another host's
-/// attachments.
+/// attachments, and an Agent gets the same 404 for another session's object
+/// as for one that does not exist.
 ///
 /// Images are served inline so the composer's thumbnails and download links
 /// both work; non-images always carry `attachment` disposition with the
@@ -481,7 +493,8 @@ async fn download(
         .into_response())
 }
 
-/// Accept the owning Node or a non-Agent device; refuse everything else.
+/// Accept the owning Node, a non-Agent device, or an Agent that owns the
+/// object's instance; refuse everything else.
 async fn authorize_read(
     state: &AppState,
     headers: &HeaderMap,
@@ -495,8 +508,14 @@ async fn authorize_read(
             Err(HubError::Forbidden)
         };
     }
-    let device = crate::agent_scope::require_operator(state, headers).await?;
-    let _ = device;
+    let device = crate::agent_scope::caller(state, headers).await?;
+    // ap-attachments: the journal read's predicate. Another session's object
+    // is a 404, exactly like a missing one, so its existence never leaks.
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent
+        && !crate::agent_scope::owns(state, &device, &object.instance_id).await?
+    {
+        return Err(HubError::NotFound);
+    }
     Ok(())
 }
 

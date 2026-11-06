@@ -2,9 +2,10 @@
 //!
 //! D-027 staged attachments and gave two readers: the operator device that
 //! uploaded one, and the Node hosting the instance (`GET /v1/objects/{id}`).
-//! Neither is the agent. `require_operator` refuses an instance-bound
-//! credential outright, so the MCP server running *inside* a session cannot
-//! use that route at all — which is why D-028 needs these two.
+//! Neither was the agent, which is why D-028 needs these two. (Since
+//! `ap-attachments`, `GET /v1/objects/{id}` also serves an Agent the raw
+//! bytes of an instance it owns; these routes keep their own-session pin and
+//! the MCP-shaped base64 body.)
 //!
 //! The scope rule is deliberately narrower than the rest of the Agent surface:
 //! an instance credential reads **its own session's** attachments and nothing

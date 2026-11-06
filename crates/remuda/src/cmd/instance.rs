@@ -74,6 +74,10 @@ pub(crate) enum InstanceCommand {
         /// once per send) with the approval's interaction id.
         #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
         approval_id: Option<String>,
+        /// Attach an object staged for this instance (`instance attach`);
+        /// repeatable, at most 8.
+        #[arg(long = "attach", value_name = "OBJECT_ID")]
+        attach: Vec<String>,
         /// Prompt words after the instance id.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -195,6 +199,31 @@ pub(crate) enum InstanceCommand {
         /// Retry with the interaction id of the owner's approval, when asked.
         #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
         approval_id: Option<String>,
+    },
+    /// Stage a file as an attachment for an instance (`POST /v1/objects`);
+    /// prints its `objectId` for `instance send --attach`. From a seat, the
+    /// instance must be one it owns.
+    Attach {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+        /// The file to stage.
+        file: PathBuf,
+        /// Name shown with the attachment (defaults to the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Media type (guessed from the extension when omitted; images are
+        /// recognised by their bytes).
+        #[arg(long)]
+        media_type: Option<String>,
+    },
+    /// Read an attachment's bytes (`GET /v1/objects/{id}`). From a seat, only
+    /// an attachment of an instance it owns.
+    Attachment {
+        /// Object id (`obj_…`).
+        object_id: String,
+        /// Write the bytes here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Close an instance (`instance.close`).
     Rm {
@@ -531,6 +560,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 command_id,
                 completion_scope,
                 approval_id,
+                attach,
                 prompt,
             } => {
                 let text = load_send_text(text, file, prompt)?;
@@ -543,6 +573,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     command_id.as_deref(),
                     &completion_scope,
                     "cli",
+                    &attach,
                 )
                 .await?;
                 print_json(&value)
@@ -670,6 +701,34 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 let value = resume(&client, &instance_id, &mode, prompt, permission_mode).await?;
                 print_json(&value)
             }
+            InstanceCommand::Attach {
+                instance_id,
+                file,
+                name,
+                media_type,
+            } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let value = attach(&client, &instance_id, &file, name, media_type).await?;
+                print_json(&value)
+            }
+            InstanceCommand::Attachment { object_id, out } => {
+                let bytes = client
+                    .get_bytes(&format!("/v1/objects/{object_id}"))
+                    .await?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(&path, &bytes)
+                            .with_context(|| format!("write {}", path.display()))?;
+                        print_json(&json!({ "objectId": object_id, "bytes": bytes.len(),
+                                            "out": path }))
+                    }
+                    None => {
+                        use std::io::Write as _;
+                        std::io::stdout().write_all(&bytes)?;
+                        Ok(())
+                    }
+                }
+            }
             InstanceCommand::Rm {
                 instance_id,
                 command_id,
@@ -687,6 +746,54 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
             }
         }
     })
+}
+
+/// `remuda instance attach`: stage `file` for `instance_id`
+/// (`POST /v1/objects`), with the Hub's own size and type limits.
+pub(crate) async fn attach(
+    client: &HubClient,
+    instance_id: &str,
+    file: &std::path::Path,
+    name: Option<String>,
+    media_type: Option<String>,
+) -> Result<Value> {
+    let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let name = name.or_else(|| {
+        file.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    });
+    let media_type = media_type.unwrap_or_else(|| guess_media_type(file).to_owned());
+    let mut path = format!(
+        "/v1/objects?instanceId={}",
+        super::task::urlencode(instance_id)
+    );
+    if let Some(name) = &name {
+        path.push_str(&format!("&name={}", super::task::urlencode(name)));
+    }
+    Ok(client.post_bytes(&path, &media_type, bytes).await?)
+}
+
+/// A declared media type from the extension; the Hub sniffs images itself
+/// and treats anything unknown as `application/octet-stream`.
+fn guess_media_type(file: &std::path::Path) -> &'static str {
+    let extension = file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
 }
 
 /// `remuda instance resume`: a seat resumes through the Agent route
@@ -1042,8 +1149,9 @@ pub(crate) async fn send(
     command_id: Option<&str>,
     completion_scope: &str,
     origin: &str,
+    attachments: &[String],
 ) -> Result<Value> {
-    let payload = json!({
+    let mut payload = json!({
         "instanceId": instance_id,
         "input": {
             "type": "prompt",
@@ -1053,6 +1161,14 @@ pub(crate) async fn send(
         },
         "completionScope": completion_scope,
     });
+    if !attachments.is_empty() {
+        // The Hub fills each entry's metadata from the staged object.
+        payload["attachments"] = attachments
+            .iter()
+            .enumerate()
+            .map(|(index, object_id)| json!({ "objectId": object_id, "index": index + 1 }))
+            .collect();
+    }
     let mut body = client
         .post_command(instance_id, "instance.send", payload, command_id)
         .await?;

@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+/// The per-file attachment cap these Hubs run with.
+const ATTACHMENT_MAX: usize = 64 * 1024;
+
 /// Request frames a fake Node received.
 #[derive(Clone, Default)]
 struct Frames(Arc<Mutex<Vec<Value>>>);
@@ -150,7 +153,9 @@ struct Seat {
 impl Ctx {
     async fn spawn() -> Result<Ctx> {
         let dir = tempfile::tempdir()?;
-        let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+        let mut config = HubConfig::for_test(dir.path().join("hub"));
+        config.attachment_max_bytes = ATTACHMENT_MAX;
+        let hub = spawn(config).await?;
         let human = hub.mint_device_token("apactions-human").await?;
         let bot = hub.mint_bot_device_token("apactions-bot").await?;
         let mut nodes = Vec::new();
@@ -1029,5 +1034,218 @@ async fn a_cross_host_resume_asks_the_owner_and_a_denial_resumes_nothing() -> Re
         .await?;
     assert_refused(status, &asked, 409, "approval-required");
     assert!(ctx.frames_a.of("instance.resume").is_empty());
+    Ok(())
+}
+
+// ── ap-attachments ─────────────────────────────────────────────────────────
+
+impl Ctx {
+    async fn upload(
+        &self,
+        token: &str,
+        narrow: Option<&str>,
+        instance: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(u16, Value)> {
+        let mut request = self
+            .http
+            .post(format!(
+                "http://{}/v1/objects?instanceId={instance}&name=notes.txt",
+                self.hub.addr
+            ))
+            .bearer_auth(token)
+            .header("content-type", media_type)
+            .body(bytes);
+        if let Some(instance) = narrow {
+            request = request.header("x-remuda-instance-id", instance);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        Ok((
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        ))
+    }
+
+    async fn download(
+        &self,
+        token: &str,
+        narrow: Option<&str>,
+        object: &str,
+    ) -> Result<(u16, Vec<u8>)> {
+        let mut request = self
+            .http
+            .get(format!("http://{}/v1/objects/{object}", self.hub.addr))
+            .bearer_auth(token);
+        if let Some(instance) = narrow {
+            request = request.header("x-remuda-instance-id", instance);
+        }
+        let response = request.send().await?;
+        Ok((response.status().as_u16(), response.bytes().await?.to_vec()))
+    }
+
+    async fn staged(&self, token: &str, instance: &str, text: &str) -> Result<String> {
+        let (status, body) = self
+            .upload(
+                token,
+                None,
+                instance,
+                "text/plain",
+                text.as_bytes().to_vec(),
+            )
+            .await?;
+        anyhow::ensure!(status == 200, "upload {status}: {body}");
+        Ok(body["objectId"].as_str().context("objectId")?.to_string())
+    }
+
+    fn attached_send(object: &str) -> Value {
+        json!({ "operation": "instance.send", "payload": {
+            "input": { "type": "prompt", "mode": "new-turn",
+                       "blocks": [{ "type": "text", "text": "see [File #1]" }] },
+            "attachments": [{ "objectId": object, "index": 1 }] } })
+    }
+}
+
+/// An Agent (and a Human narrowed to it) stages attachments only for
+/// instances it owns, within the same limits as anyone, attaches them only
+/// to sends to those instances, and reads only owned instances' attachments;
+/// another session's object is the same 404 as a missing one. Humans and
+/// Bots are unchanged, and the D-028 in-session routes keep their own pin.
+#[tokio::test]
+async fn attachment_authority_matrix() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let main = ctx.seat(&ctx.project).await?;
+    let other = ctx.seat(&ctx.elsewhere).await?;
+    let owned = ctx.child(&main.token, &ctx.project, &ctx.host_a).await?;
+    let foreign = ctx.child(&ctx.human, &ctx.project, &ctx.host_a).await?;
+    let outside = ctx.child(&other.token, &ctx.elsewhere, &ctx.host_a).await?;
+    let foreign_object = ctx
+        .staged(&ctx.human, &foreign, "the owner's notes")
+        .await?;
+    let outside_object = ctx
+        .staged(&other.token, &outside, "another seat's notes")
+        .await?;
+
+    for (token, narrow) in [
+        (main.token.as_str(), None),
+        (ctx.human.as_str(), Some(main.id.as_str())),
+    ] {
+        // Upload for an owned instance; the read gives the same bytes back.
+        let text = format!("notes via {narrow:?}");
+        let (status, staged) = ctx
+            .upload(
+                token,
+                narrow,
+                &owned,
+                "text/plain",
+                text.clone().into_bytes(),
+            )
+            .await?;
+        assert_eq!(status, 200, "{staged}");
+        assert_eq!(staged["instanceId"], owned.as_str());
+        assert_eq!(staged["mediaType"], "text/plain");
+        let object = staged["objectId"].as_str().context("objectId")?;
+        let (status, bytes) = ctx.download(token, narrow, object).await?;
+        assert_eq!(status, 200);
+        assert_eq!(bytes, text.as_bytes());
+        // Attach it to a send to that instance.
+        let (status, sent) = ctx
+            .call(
+                reqwest::Method::POST,
+                token,
+                narrow,
+                &format!("/v1/instances/{owned}/commands"),
+                Some(Ctx::attached_send(object)),
+            )
+            .await?;
+        assert_eq!(status, 200, "{sent}");
+        assert_eq!(
+            sent["command"]["payload"]["attachments"][0]["name"],
+            "notes.txt"
+        );
+
+        // Never for, from, or to what it does not own; an unknown id is the
+        // same refusal.
+        for target in [&foreign, &outside, &"ins_unknown".to_string()] {
+            let (status, body) = ctx
+                .upload(token, narrow, target, "text/plain", b"x".to_vec())
+                .await?;
+            assert_refused(status, &body, 403, "not-owner");
+        }
+        let (_, missing) = ctx.download(token, narrow, "obj_missing").await?;
+        for theirs in [&foreign_object, &outside_object] {
+            let (status, body) = ctx.download(token, narrow, theirs).await?;
+            assert_eq!(status, 404, "{theirs}");
+            assert_eq!(body, missing, "no existence leak");
+        }
+        let (status, _) = ctx
+            .call(
+                reqwest::Method::POST,
+                token,
+                narrow,
+                &format!("/v1/instances/{owned}/commands"),
+                Some(Ctx::attached_send(&foreign_object)),
+            )
+            .await?;
+        assert_eq!(status, 403, "another session's object");
+        let (status, body) = ctx
+            .call(
+                reqwest::Method::POST,
+                token,
+                narrow,
+                &format!("/v1/instances/{foreign}/commands"),
+                Some(Ctx::attached_send(&foreign_object)),
+            )
+            .await?;
+        assert_refused(status, &body, 403, "not-owner");
+
+        // The same limits as any caller: size and type.
+        let (status, body) = ctx
+            .upload(
+                token,
+                narrow,
+                &owned,
+                "text/plain",
+                vec![b'x'; ATTACHMENT_MAX + 1],
+            )
+            .await?;
+        assert_eq!(status, 413, "{body}");
+        assert_eq!(body["code"], "RESOURCE_LIMIT");
+        let (status, _) = ctx
+            .upload(token, narrow, &owned, "text/ht ml", b"x".to_vec())
+            .await?;
+        assert_eq!(status, 400);
+        let (status, _) = ctx
+            .upload(
+                token,
+                narrow,
+                &owned,
+                "image/gif",
+                b"\x89PNG\r\n\x1a\nrest".to_vec(),
+            )
+            .await?;
+        assert_eq!(status, 400, "a declared type must agree with the bytes");
+        // D-028's in-session reads stay pinned to the caller's own session.
+        let (status, _) = ctx
+            .call(
+                reqwest::Method::GET,
+                token,
+                narrow,
+                &format!("/v1/attachments?instanceId={owned}"),
+                None,
+            )
+            .await?;
+        assert_eq!(status, 403);
+    }
+
+    // Humans and Bots are unchanged.
+    for token in [&ctx.human, &ctx.bot] {
+        let object = ctx.staged(token, &outside, "operator notes").await?;
+        for theirs in [&object, &foreign_object, &outside_object] {
+            assert_eq!(ctx.download(token, None, theirs).await?.0, 200);
+        }
+    }
     Ok(())
 }

@@ -386,7 +386,7 @@
       "method": "GET",
       "path": "/v1/objects/{id}",
       "middleware": "skipped",
-      "handler": "operator-only"
+      "handler": "handler-checked"
     },
     {
       "method": "GET",
@@ -775,8 +775,8 @@
     {
       "method": "POST",
       "path": "/v1/objects",
-      "middleware": "refused",
-      "handler": "operator-only"
+      "middleware": "admitted",
+      "handler": "handler-checked"
     },
     {
       "method": "POST",
@@ -1188,6 +1188,16 @@
     {
       "path": "instance",
       "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance attach",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance attachment",
+      "group": false,
       "hubRoutes": []
     },
     {

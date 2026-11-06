@@ -288,8 +288,9 @@ async fn stage(
         .to_owned())
 }
 
-/// The whole point of D-028 §4.5: the credential the agent actually holds can
-/// read the image bytes, which `GET /v1/objects/{id}` refuses it outright.
+/// D-028 §4.5: the credential the agent actually holds reads the image bytes
+/// as an MCP-shaped base64 body. (Since `ap-attachments` the D-027 route
+/// serves the same credential the raw bytes of an instance it owns.)
 #[tokio::test]
 async fn an_instance_credential_reads_its_own_attachment_as_base64() -> Result<()> {
     let fixture = fixture().await?;
@@ -304,17 +305,15 @@ async fn an_instance_credential_reads_its_own_attachment_as_base64() -> Result<(
     )
     .await?;
 
-    // D-027's route is closed to this credential; that is why §4.5 exists.
+    // ap-attachments: the D-027 route serves an instance it owns, itself
+    // included.
     let (status, _) = get_as(
         addr,
         &format!("/v1/objects/{object_id}"),
         &fixture.agent_token,
     )
     .await?;
-    assert_eq!(
-        status, 403,
-        "the D-027 read must stay operator/Node only, or §4.5 has no purpose"
-    );
+    assert_eq!(status, 200, "an Agent reads its own session's attachment");
 
     let (status, body) = get_as(
         addr,

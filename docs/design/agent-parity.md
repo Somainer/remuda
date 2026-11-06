@@ -99,8 +99,8 @@ Two limits recur below:
 | Edit a queued send | `PATCH /v1/commands/{id}` | Agent route. Own commands only, while provably undelivered; the target must still pass the send rule | — |
 | Withdraw a queued send | `POST /v1/commands/{id}/withdraw` | Agent route. As "Edit a queued send" | — |
 | Turn auto-continue on or off for a session | `PATCH /v1/instances/{id}` | Safety. Act only on what you own: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device only, and an agent turns it on for its own children when it dispatches them | — |
-| Attach a file | `POST /v1/objects` | Gap. Operator-only (`upload` in `crates/remuda-hub/src/objects.rs`) | `ap-attachments` |
-| Open an attachment | `GET /v1/objects/{id}` | Gap. Operator-only for devices; an agent reads only its own session's attachments, through `GET /v1/attachments/{objectId}/content` (D-028) | `ap-attachments` (owned targets) |
+| Attach a file | `POST /v1/objects` | Agent route. Owned targets (`owns()`; a foreign or unknown instance is the same 403) under the same size and type limits as any caller; the staged object rides only a send to that instance (`ap-attachments`, main-agent.md §4.2.3) | — |
+| Open an attachment | `GET /v1/objects/{id}` | Agent route, gated in the handler: the middleware skips this path (a Node pulls objects with its host token), and the handler serves an Agent only an object of an instance it owns (`owns()`); another session's object is the same 404 as a missing one (`ap-attachments`). The D-028 in-session reads stay pinned to the caller's own session | — |
 | Send keys from the key bar | commands, `instance.keys` | Safety. Keystrokes | — |
 | Type into the terminal | `/v1/follow?tty=1` | Safety. Keystrokes: the socket is not admitted for Agents, and `tty.write` always needs the D-017 approval | — |
 | See workspace changes (Files tab) | `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/diff`, `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes/file` | Safety. Cross-host: operator-only (`proxy_scm`). On its own host the seat reads the same through its harness's shell; reading another host through the Hub would skip the D-017 cross-host approval | — |
@@ -213,13 +213,15 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `instance list` | `GET /v1/hosts` and `GET /v1/instances`; with `--watch`, `GET /v1/follow` | Gap. The CLI path (`agents::list` in `crates/remuda/src/cmd/agents.rs`) joins the host inventory, `GET /v1/hosts` (operator-only, `list_hosts`), with `GET /v1/instances`, so it fails for Agent origin even though `GET /v1/instances` itself admits a `dispatch` holder. `--watch` also opens the all-instances follow socket, which is not admitted for Agent origin | `ap-agent-list` |
 | `agents` | as `instance list` | Gap. The same `agents::list` path, with the same host-inventory and follow-socket dependencies | `ap-agent-list` |
 | `instance show` | `GET /v1/instances/{id}` | Agent route. Owned targets | — |
-| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule. The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
+| `instance send` | commands, `instance.send`; then `GET /v1/instances/{id}/commands` to follow a forwarded command | Agent route for the send. The send rule; `--attach` names objects staged for an instance the caller owns (`ap-attachments`). The follow-up read (`resolve_command_state` in `crates/remuda/src/cmd/instance.rs`) is refused for Agent origin by `read_target`; the CLI then prints the POST's own row, so a send whose reply was lost stays `queued` in its output | `ap-command-read` for the follow-up read |
 | `instance respond` | `GET /v1/interactions?instanceId=`, `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits for questions and plan reviews; approvals: Safety | — |
 | `instance wait` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance read` | `GET /v1/instances/{id}/journal` | Agent route. Owned targets | — |
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
 | `instance stop` | commands, `instance.cancel` or `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | `instance rm` | commands, `instance.close` | Agent route. As `instance stop` | — |
+| `instance attach` | `POST /v1/objects` | Agent route. As "Attach a file": an instance the caller owns; prints the `objectId` that `instance send --attach` names | — |
+| `instance attachment` | `GET /v1/objects/{id}` | Agent route, gated in the handler. As "Open an attachment": an object of an instance the caller owns | — |
 | `instance resume` | `POST /v1/instances/{id}/respawn` from a seat (an operator's goes to the D-026 route) | Agent route. As "Resume a session": an owned instance that is not a worker, under `dispatch` and the create's admission; another host or a shell-driver carrier asks the owner once (`--approval-id`); `--permission-mode` is re-admitted by the creator rule | — |
 | `instance configure` | commands, `instance.configure` | Agent route. Owned targets: `--model`, `--effort`, `--ultracode` and `--expected-generation`; `--permission-mode` is operator-only for Agent origin (403 `configure-operator-only`); the model id follows the create's vocabulary | — |
 | `instance config` | `GET /v1/instances/{id}/config` | Agent route. Owned targets | — |
@@ -410,7 +412,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
-| `ap-attachments` | attaching a file; opening an attachment of an owned session |
 | `ap-subagent-read` | a subagent's transcript |
 | `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |
 | `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |

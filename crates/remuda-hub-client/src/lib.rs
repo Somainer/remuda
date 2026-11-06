@@ -167,6 +167,39 @@ impl HubClient {
         Ok(response.bytes().await?.to_vec())
     }
 
+    /// `POST` raw bytes with a content type — used for `POST /v1/objects`
+    /// uploads; the answer is JSON.
+    pub async fn post_bytes(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Value, ClientError> {
+        self.ensure_auth().await?;
+        let url = format!("{}{path}", self.base);
+        let mut request = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(bytes);
+        if let Some(token) = self.current_token()? {
+            request = request.bearer_auth(token);
+        }
+        if let Some(instance) = &self.caller_instance {
+            request = request.header("x-remuda-instance-id", instance);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(ClientError::Http {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
     /// `POST` JSON.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
         self.send(reqwest::Method::POST, path, Some(body)).await

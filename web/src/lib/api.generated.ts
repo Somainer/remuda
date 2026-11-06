@@ -1562,7 +1562,7 @@ export interface paths {
         put?: never;
         /**
          * Stage one image for a later instance.send (D-027)
-         * @description Raw attachment bytes with a Content-Type (D-027b: any file type). Human or Bot devices only; an Agent-origin caller is refused. Images (PNG/JPEG/GIF/WebP) are magic-byte sniffed and the declared Content-Type must agree; other files keep a validated declared media type, are served back with attachment disposition + nosniff, and are never executed. Limits: 25 MiB per attachment by default (config key attachmentMaxBytes / REMUDA_ATTACHMENT_MAX_BYTES), 256 MiB staged per instance, 8 attachments per send. The optional `name` query parameter carries the original filename; it is sanitised (no path separators or control characters, length-capped).
+         * @description Raw attachment bytes with a Content-Type (D-027b: any file type). Human and Bot devices stage for any instance; an Agent stages only for an instance it owns (`owns()`, ap-attachments) — a foreign or unknown instanceId is the same 403 not-owner — under the same limits. Images (PNG/JPEG/GIF/WebP) are magic-byte sniffed and the declared Content-Type must agree; other files keep a validated declared media type, are served back with attachment disposition + nosniff, and are never executed. Limits: 25 MiB per attachment by default (config key attachmentMaxBytes / REMUDA_ATTACHMENT_MAX_BYTES), 256 MiB staged per instance, 8 attachments per send. The optional `name` query parameter carries the original filename; it is sanitised (no path separators or control characters, length-capped).
          */
         post: operations["objectUpload"];
         delete?: never;
@@ -1580,7 +1580,7 @@ export interface paths {
         };
         /**
          * Read staged attachment bytes
-         * @description Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.
+         * @description Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — as a Human/Bot device, or as an Agent that owns the object's instance (`owns()`, ap-attachments); for an Agent another session's object is the same 404 as a missing one. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.
          */
         get: operations["objectRead"];
         put?: never;

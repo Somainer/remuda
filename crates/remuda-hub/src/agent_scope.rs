@@ -342,6 +342,15 @@ fn read_target(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// `POST /v1/instances/{id}/respawn` (`ap-resume`): the Agent resume of an
+/// owned instance; the handler re-checks ownership and the create admission.
+fn respawn_target(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/instances/")?
+        .strip_suffix("/respawn")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// `PATCH /v1/commands/{id}` (cb-command-queue).
 fn command_edit_target(path: &str) -> bool {
     path.strip_prefix("/v1/commands/")
@@ -1433,6 +1442,12 @@ pub fn agent_route_admission<'a>(
     if let Some(id) = memory_target(method, path) {
         return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
     }
+    // ap-resume: resume an owned instance that is not a worker.
+    if *method == Method::POST
+        && let Some(id) = respawn_target(path)
+    {
+        return AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance(id));
+    }
     // cb-inbox-facts: the caller's own lineage inbox.
     if let Some(id) = inbox_target(method, path) {
         return AgentRouteAdmission::OwnerScoped(OwnedTarget::Lineage(id));
@@ -1604,6 +1619,15 @@ mod tests {
         assert_eq!(
             admission(Method::POST, "/v1/instances/ins_1/commands"),
             AgentRouteAdmission::Admitted
+        );
+        assert_eq!(
+            admission(Method::POST, "/v1/instances/ins_1/respawn"),
+            AgentRouteAdmission::OwnerScoped(OwnedTarget::Instance("ins_1"))
+        );
+        // The D-026 operator resume stays refused for Agent origin.
+        assert_eq!(
+            admission(Method::POST, "/v1/instances/ins_1/resume"),
+            AgentRouteAdmission::Refused
         );
         assert_eq!(
             admission(Method::GET, "/v1/hosts"),

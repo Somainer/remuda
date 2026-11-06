@@ -4409,6 +4409,35 @@
         },
         "type": "object"
       },
+      "RespawnRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "default": "structured",
+            "description": "structured keeps the parent's driver; terminal continues the same native session in claude-pty so the conversation gains a terminal tab.",
+            "enum": [
+              "structured",
+              "terminal"
+            ],
+            "type": "string"
+          },
+          "permissionMode": {
+            "description": "The mode to resume with, admitted like a create's (D-057 OA1). Omitted: the instance's own requested word, so an inherited mode inherits again from the caller's mode now.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "Optional first prompt delivered to the resumed session.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ResumeResult": {
         "additionalProperties": true,
         "properties": {
@@ -10733,6 +10762,74 @@
           }
         },
         "summary": "Continue an exited Claude session on a new instance (D-026)",
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/instances/{id}/respawn": {
+      "post": {
+        "description": "ap-resume (main-agent.md §15.2): an Agent resumes an instance it owns (`owns()`) that is not a worker, under the same admission as a create: the `dispatch` grant, the caller's scope over the instance's host and workspace, and the mode admitted by \"never beyond the creator\" (D-057 OA1) against the caller's mode now (the body's `permissionMode`, else the instance's own requested word, so an inherited mode inherits again). Another host, or a shell-driver carrier, needs the D-017 one-shot human approval, decided before anything is allocated (409 HUMAN_APPROVAL_REQUIRED, then retry with x-remuda-approval-id). The new instance continues the native session like D-026 (same host, workspace, provider, model and observed route), but its parent is the chapter that created the instance and `resumedFrom` names the old one. The seat's own chapters and continuity lineages stay the owner's (403 operator-only); a worker's instance is 400 worker-instance (use POST /v1/workers/{id}/resume); a Human or Bot gets 400 (use POST /v1/instances/{id}/resume, which is unchanged). Idempotent per (instance, mode) inside a short window.",
+        "operationId": "instanceRespawn",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          },
+          {
+            "$ref": "#/components/parameters/AgentApproval"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RespawnRequest"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResumeResult"
+                }
+              }
+            },
+            "description": "Resumed instance"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Approval required, no resumable native transcript, transcript too old, or already resumed by someone else"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Agent resume of an owned instance that is not a worker (ap-resume)",
         "tags": [
           "instances"
         ]

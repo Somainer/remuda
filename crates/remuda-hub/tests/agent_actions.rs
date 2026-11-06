@@ -133,6 +133,7 @@ struct Ctx {
     bot: String,
     host_a: String,
     host_b: String,
+    ws_a: String,
     frames_a: Frames,
     frames_b: Frames,
     _nodes: Vec<FakeNode>,
@@ -175,6 +176,7 @@ impl Ctx {
             bot,
             host_a: hosts[0].0.clone(),
             host_b: hosts[1].0.clone(),
+            ws_a: hosts[0].1.clone(),
             frames_a: frames[0].clone(),
             frames_b: frames[1].clone(),
             _nodes: nodes,
@@ -335,6 +337,165 @@ impl Ctx {
             .context("store")?
             .audit_for(subject.to_string())
             .await?)
+    }
+}
+
+impl Ctx {
+    /// A seat seated by the owner with `mode`.
+    async fn seat_with_mode(&self, project: &str, mode: &str) -> Result<Seat> {
+        let created = self
+            .ok(
+                &self.human,
+                "/v1/instances",
+                json!({ "role": "project-coordinator", "projectId": project,
+                        "hostId": self.host_a, "prompt": "coordinate",
+                        "driver": "claude-pty", "permissionMode": mode }),
+            )
+            .await?;
+        let id = created["instance"]["instanceId"]
+            .as_str()
+            .context("id")?
+            .to_string();
+        let token = self
+            .ok(
+                &self.human,
+                &format!("/v1/instances/{id}/mcp-token"),
+                json!({}),
+            )
+            .await?["token"]
+            .as_str()
+            .context("token")?
+            .to_string();
+        Ok(Seat { id, token })
+    }
+
+    /// POST as `token`, optionally narrowed and carrying an approval id.
+    async fn post_as(
+        &self,
+        token: &str,
+        narrow: Option<&str>,
+        approval: Option<&str>,
+        path: &str,
+        body: Value,
+    ) -> Result<(u16, Value)> {
+        let mut request = self
+            .http
+            .post(format!("http://{}{path}", self.hub.addr))
+            .bearer_auth(token)
+            .json(&body);
+        if let Some(instance) = narrow {
+            request = request.header("x-remuda-instance-id", instance);
+        }
+        if let Some(id) = approval {
+            request = request.header("x-remuda-approval-id", id);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        Ok((
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        ))
+    }
+
+    /// Create through a D-017 card the owner approves.
+    async fn create_approved(&self, token: &str, body: Value) -> Result<String> {
+        let (status, asked) = self
+            .post_as(token, None, None, "/v1/instances", body.clone())
+            .await?;
+        anyhow::ensure!(status == 409, "expected a card: {asked}");
+        let card = asked["interactionId"].as_str().context("card")?.to_string();
+        self.decide(&card, "allow-once").await?;
+        let (status, created) = self
+            .post_as(token, None, Some(&card), "/v1/instances", body)
+            .await?;
+        anyhow::ensure!(status == 200, "approved create {status}: {created}");
+        Ok(created["instance"]["instanceId"]
+            .as_str()
+            .context("id")?
+            .to_string())
+    }
+
+    /// The owner answers a D-017 card.
+    async fn decide(&self, card: &str, option: &str) -> Result<()> {
+        let (_, pending) = self.get(&self.human, "/v1/interactions").await?;
+        let item = pending["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["id"] == card || item["interactionId"] == card)
+            .with_context(|| format!("no card {card}: {pending}"))?;
+        let digest = item
+            .pointer("/request/inputDigest")
+            .or_else(|| item.pointer("/interaction/request/inputDigest"))
+            .and_then(Value::as_str)
+            .context("digest")?
+            .to_owned();
+        let reply = self
+            .ok(
+                &self.human,
+                &format!("/v1/interactions/{card}/answer"),
+                json!({ "answer": { "kind": "approval", "optionId": option, "inputDigest": digest } }),
+            )
+            .await?;
+        let _ = reply;
+        Ok(())
+    }
+
+    /// The instance reported `session` and then exited (D-026's preconditions).
+    async fn ended_session(&self, host: &str, instance: &str, session: &str) -> Result<()> {
+        self.journal(
+            host,
+            instance,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "native", "topic": "session", "nativeName": "session",
+                "nativeId": { "state": "known", "value": session },
+                "status": { "state": "known", "value": "started" },
+                "relatedIds": { "transcriptPath": format!("/t/{session}.jsonl") },
+                "dataRef": null, "severity": "info", "affectsCompletion": false } }),
+        )
+        .await?;
+        self.journal(
+            host,
+            instance,
+            json!({ "kind": "lifecycle",
+                    "payload": { "type": "entity", "state": "exited", "reasonCode": "native-exit" } }),
+        )
+        .await
+    }
+
+    async fn respawn(
+        &self,
+        token: &str,
+        narrow: Option<&str>,
+        approval: Option<&str>,
+        instance: &str,
+        body: Value,
+    ) -> Result<(u16, Value)> {
+        self.post_as(
+            token,
+            narrow,
+            approval,
+            &format!("/v1/instances/{instance}/respawn"),
+            body,
+        )
+        .await
+    }
+
+    /// The instance row (as JSON) and its stored spec.
+    async fn record(&self, instance: &str) -> Result<(Value, Value)> {
+        let store = self.hub.store().context("store")?;
+        let record = serde_json::to_value(
+            store
+                .get_instance(instance.to_string())
+                .await?
+                .context("instance")?,
+        )?;
+        let spec = store
+            .get_instance_spec_json(instance.to_string())
+            .await?
+            .unwrap_or(Value::Null);
+        Ok((record, spec))
     }
 }
 
@@ -556,5 +717,317 @@ async fn an_agent_configure_keeps_the_generation_cas_and_deferral() -> Result<()
         "both admitted configures reached host A"
     );
     assert!(ctx.frames_b.of("instance.configure").is_empty());
+    Ok(())
+}
+
+// ── ap-resume ──────────────────────────────────────────────────────────────
+
+/// Insert a roster worker whose instance is `instance`.
+async fn roster_worker(ctx: &Ctx, instance: &str) -> Result<String> {
+    let roster_id = remuda_protocol::WorkerRosterId::new().as_id().to_string();
+    let roster: remuda_protocol::WorkerRoster = serde_json::from_value(json!({
+        "id": roster_id, "revision": "1",
+        "createdAt": "2026-11-06T01:00:00.000Z", "updatedAt": "2026-11-06T01:00:00.000Z",
+        "projectId": ctx.project, "name": format!("w-{}", &roster_id[roster_id.len() - 6..]),
+        "instanceId": instance,
+        "hostId": ctx.host_a, "workspaceId": ctx.ws_a, "harness": "claude",
+        "driver": "claude-pty", "model": "claude-sonnet-5-5",
+        "branch": "wt/w-resume/b-resume-md", "worktreePath": "/w/w-resume",
+        "state": { "state": "working" },
+    }))?;
+    ctx.hub
+        .store()
+        .context("store")?
+        .insert_worker(
+            roster,
+            "apactions-test".into(),
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
+        .await?;
+    Ok(roster_id)
+}
+
+/// An owned instance that is not a worker resumes on its own host with no
+/// card, for the Agent credential and a Human narrowed to it; the new
+/// instance stays the caller's (parent = the creating chapter). Foreign and
+/// out-of-scope targets, a worker's instance, the seat's own chapter and a
+/// seat without `dispatch` are refused; Humans and Bots keep D-026.
+#[tokio::test]
+async fn resume_authority_matrix() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let main = ctx.seat(&ctx.project).await?;
+    let other = ctx.seat(&ctx.elsewhere).await?;
+    let owned = ctx.child(&main.token, &ctx.project, &ctx.host_a).await?;
+    let again = ctx.child(&main.token, &ctx.project, &ctx.host_a).await?;
+    let foreign = ctx.child(&ctx.human, &ctx.project, &ctx.host_a).await?;
+    let outside = ctx.child(&other.token, &ctx.elsewhere, &ctx.host_a).await?;
+    let worker_instance = ctx.child(&main.token, &ctx.project, &ctx.host_a).await?;
+    let roster_id = roster_worker(&ctx, &worker_instance).await?;
+    for (index, id) in [&owned, &again, &foreign, &outside, &worker_instance]
+        .into_iter()
+        .enumerate()
+    {
+        ctx.ended_session(&ctx.host_a, id, &format!("session-{index}"))
+            .await?;
+    }
+
+    let (status, body) = ctx
+        .respawn(&main.token, None, None, &owned, json!({}))
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["replayed"], false);
+    let resumed = body["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    let (record, spec) = ctx.record(&resumed).await?;
+    assert_eq!(record["parentInstanceId"], main.id.as_str(), "{record}");
+    assert_eq!(record["resumedFrom"], owned.as_str());
+    assert_eq!(record["hostId"], ctx.host_a.as_str());
+    assert_eq!(spec["resumeSessionId"], "session-0");
+    assert_eq!(spec["origin"], "agent");
+    assert_eq!(ctx.frames_a.of("instance.resume").len(), 1);
+    // The caller still owns what it resumed.
+    assert_eq!(
+        ctx.get(&main.token, &format!("/v1/instances/{resumed}"))
+            .await?
+            .0,
+        200
+    );
+    // A repeat inside the window replays the same instance.
+    let (status, body) = ctx
+        .respawn(&main.token, None, None, &owned, json!({}))
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["replayed"], true);
+    assert_eq!(body["instance"]["instanceId"], resumed.as_str());
+    assert_eq!(ctx.frames_a.of("instance.resume").len(), 1);
+    // A Human narrowed to Main is Main.
+    let (status, body) = ctx
+        .respawn(
+            &ctx.human,
+            Some(&main.id),
+            None,
+            &again,
+            json!({ "mode": "terminal" }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["instance"]["driver"], "claude-pty");
+    let audit = ctx.audit(&again).await?;
+    let row = audit
+        .iter()
+        .find(|row| row["action"] == "instance.respawn")
+        .context("respawn audit row")?;
+    assert_eq!(row["initiator"]["instanceId"], main.id.as_str(), "{row}");
+
+    for (token, narrow) in [
+        (main.token.as_str(), None),
+        (ctx.human.as_str(), Some(main.id.as_str())),
+    ] {
+        for target in [&foreign, &outside] {
+            let (status, body) = ctx.respawn(token, narrow, None, target, json!({})).await?;
+            assert_eq!(status, 403, "{target}: {body}");
+        }
+        let (status, body) = ctx
+            .respawn(token, narrow, None, &worker_instance, json!({}))
+            .await?;
+        assert_refused(status, &body, 400, "worker-instance");
+        assert!(
+            body["next"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains(&roster_id)),
+            "{body}"
+        );
+        let (status, body) = ctx
+            .respawn(token, narrow, None, &main.id, json!({}))
+            .await?;
+        assert_refused(status, &body, 403, "operator-only");
+    }
+    // A seat without `dispatch`.
+    let leaf = ctx
+        .ok(
+            &ctx.human,
+            &format!("/v1/instances/{owned}/mcp-token"),
+            json!({}),
+        )
+        .await?["token"]
+        .as_str()
+        .context("token")?
+        .to_string();
+    let (status, body) = ctx.respawn(&leaf, None, None, &owned, json!({})).await?;
+    assert_refused(status, &body, 403, "grant-required");
+    assert_eq!(ctx.frames_a.of("instance.resume").len(), 2);
+
+    // D-026 is unchanged: Human and Bot resume there, an Agent may not.
+    for token in [&ctx.human, &ctx.bot] {
+        let (status, body) = ctx.respawn(token, None, None, &foreign, json!({})).await?;
+        assert_eq!(status, 400, "{body}");
+    }
+    let (status, body) = ctx
+        .post(
+            &main.token,
+            &format!("/v1/instances/{owned}/resume"),
+            json!({}),
+        )
+        .await?;
+    assert_refused(status, &body, 403, "agent-route");
+    let (status, body) = ctx
+        .post(
+            &ctx.human,
+            &format!("/v1/instances/{foreign}/resume"),
+            json!({}),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let operator = body["instance"]["instanceId"].as_str().context("id")?;
+    let (record, _) = ctx.record(operator).await?;
+    assert_eq!(record["parentInstanceId"], foreign.as_str(), "D-026's edge");
+    Ok(())
+}
+
+/// A resume never runs an instance beyond what OA1 allows the caller now:
+/// once the owner turns Main's own control back on, a child Main created
+/// control-off is refused control-off, an inherited mode inherits Main's
+/// mode now, and nothing is launched for a refusal.
+#[tokio::test]
+async fn resume_never_escalates_beyond_the_creator() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let main = ctx
+        .seat_with_mode(&ctx.project, "bypassPermissions")
+        .await?;
+    let inherited = ctx.child(&main.token, &ctx.project, &ctx.host_a).await?;
+    let named = ctx
+        .ok(
+            &main.token,
+            "/v1/instances",
+            json!({ "projectId": ctx.project, "hostId": ctx.host_a, "prompt": "work",
+                    "driver": "claude-pty", "model": "claude-sonnet-5-5",
+                    "permissionMode": "bypassPermissions" }),
+        )
+        .await?["instance"]["instanceId"]
+        .as_str()
+        .context("id")?
+        .to_string();
+    for (id, session) in [(&inherited, "session-i"), (&named, "session-n")] {
+        let (_, spec) = ctx.record(id).await?;
+        assert_eq!(spec["permissionMode"], "bypassPermissions", "{spec}");
+        ctx.ended_session(&ctx.host_a, id, session).await?;
+    }
+    // The owner turns Main's own control back on.
+    let (status, body) = ctx
+        .configure(
+            &ctx.human,
+            None,
+            &main.id,
+            json!({ "permissionMode": "acceptEdits" }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+
+    for (target, request) in [
+        (&named, json!({})),
+        (&named, json!({ "permissionMode": "bypassPermissions" })),
+        (&inherited, json!({ "permissionMode": "dontAsk" })),
+    ] {
+        let (status, body) = ctx
+            .respawn(&main.token, None, None, target, request)
+            .await?;
+        assert_refused(status, &body, 403, "beyond-creator");
+    }
+    assert!(
+        ctx.frames_a.of("instance.resume").is_empty(),
+        "a refusal launches nothing"
+    );
+
+    let (status, body) = ctx
+        .respawn(&main.token, None, None, &inherited, json!({}))
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (_, spec) = ctx
+        .record(body["instance"]["instanceId"].as_str().context("id")?)
+        .await?;
+    assert_eq!(spec["permissionMode"], "acceptEdits", "{spec}");
+    assert_eq!(spec["permissionModeRequested"], Value::Null);
+    assert_eq!(spec["creatorPermissionMode"], "acceptEdits");
+    let (status, body) = ctx
+        .respawn(
+            &main.token,
+            None,
+            None,
+            &named,
+            json!({ "permissionMode": "auto" }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let (_, spec) = ctx
+        .record(body["instance"]["instanceId"].as_str().context("id")?)
+        .await?;
+    assert_eq!(spec["permissionMode"], "auto", "{spec}");
+    assert_eq!(ctx.frames_a.of("instance.resume").len(), 2);
+    Ok(())
+}
+
+/// Another host, or a shell-driver carrier, asks the owner once (D-017)
+/// before anything is launched; a denial resumes nothing, and an approved
+/// retry resumes on the instance's own host.
+#[tokio::test]
+async fn a_cross_host_resume_asks_the_owner_and_a_denial_resumes_nothing() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let main = ctx.seat(&ctx.project).await?;
+    let cross = ctx
+        .create_approved(
+            &main.token,
+            json!({ "projectId": ctx.project, "hostId": ctx.host_b, "prompt": "work",
+                    "driver": "claude-pty", "model": "claude-sonnet-5-5" }),
+        )
+        .await?;
+    ctx.ended_session(&ctx.host_b, &cross, "session-b").await?;
+
+    let (status, asked) = ctx
+        .respawn(&main.token, None, None, &cross, json!({}))
+        .await?;
+    assert_refused(status, &asked, 409, "approval-required");
+    let card = asked["interactionId"].as_str().context("card")?.to_string();
+    ctx.decide(&card, "deny").await?;
+    let (status, body) = ctx
+        .respawn(&main.token, None, Some(&card), &cross, json!({}))
+        .await?;
+    assert_refused(status, &body, 403, "approval-invalid");
+    assert!(ctx.frames_b.of("instance.resume").is_empty(), "denied");
+    let resumed_any = ctx.get(&ctx.human, "/v1/instances").await?.1["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| item["resumedFrom"] == cross.as_str());
+    assert!(!resumed_any, "a denial resumes nothing");
+
+    let (status, asked) = ctx
+        .respawn(&main.token, None, None, &cross, json!({}))
+        .await?;
+    assert_refused(status, &asked, 409, "approval-required");
+    let card = asked["interactionId"].as_str().context("card")?.to_string();
+    ctx.decide(&card, "allow-once").await?;
+    let (status, body) = ctx
+        .respawn(&main.token, None, Some(&card), &cross, json!({}))
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hostId"], ctx.host_b.as_str());
+    assert_eq!(ctx.frames_b.of("instance.resume").len(), 1);
+
+    // A shell-driver carrier asks too, on the seat's own host.
+    let shell = ctx
+        .create_approved(
+            &main.token,
+            json!({ "projectId": ctx.project, "hostId": ctx.host_a, "prompt": "work",
+                    "driver": "shell-pty", "model": "claude-sonnet-5-5" }),
+        )
+        .await?;
+    ctx.ended_session(&ctx.host_a, &shell, "session-s").await?;
+    let (status, asked) = ctx
+        .respawn(&main.token, None, None, &shell, json!({}))
+        .await?;
+    assert_refused(status, &asked, 409, "approval-required");
+    assert!(ctx.frames_a.of("instance.resume").is_empty());
     Ok(())
 }

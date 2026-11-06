@@ -640,6 +640,8 @@ pub fn render_section(context: &SkillContext) -> String {
              `remuda worker nudge`, `remuda worker switch-model`, `remuda worker resume`, \
              `remuda worker replace`, `remuda worker stop`, `remuda retire`; \
              `remuda worker answer` types keys, so every use asks the owner first;\n\
+             - resume an exited session you own that is not a worker: \
+             `remuda instance resume`, under the same rules as a create;\n\
              - follow them: `remuda watch`, `remuda report --project <id>`, \
              `remuda hostcap <host>`;\n\
              - the task ledger: `remuda task add`, `remuda task split`, \

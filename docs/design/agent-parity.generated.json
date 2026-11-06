@@ -710,6 +710,13 @@
     },
     {
       "method": "POST",
+      "path": "/v1/instances/{id}/respawn",
+      "middleware": "owner-scoped",
+      "owned": "instance",
+      "handler": "grant: dispatch; scope"
+    },
+    {
+      "method": "POST",
       "path": "/v1/instances/{id}/resume",
       "middleware": "refused",
       "handler": "operator-only"
@@ -1225,6 +1232,11 @@
     },
     {
       "path": "instance respond",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance resume",
       "group": false,
       "hubRoutes": []
     },

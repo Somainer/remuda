@@ -176,6 +176,26 @@ pub(crate) enum InstanceCommand {
         /// Instance id (`ins_…`) or name.
         instance_id: String,
     },
+    /// Continue an exited Claude session on a new instance (D-026). From a
+    /// seat this resumes a session it owns that is not a worker
+    /// (`ap-resume`): the same admission as a create, and another host or a
+    /// shell-driver carrier asks the owner once (retry with `--approval-id`).
+    Resume {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+        /// `structured` keeps the driver; `terminal` continues in claude-pty.
+        #[arg(long, default_value = "structured", value_parser = ["structured", "terminal"])]
+        mode: String,
+        /// First prompt for the resumed session.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Permission mode for a seat's resume (never beyond its own).
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Retry with the interaction id of the owner's approval, when asked.
+        #[arg(long = "approval-id", value_name = "INTERACTION_ID")]
+        approval_id: Option<String>,
+    },
     /// Close an instance (`instance.close`).
     Rm {
         /// Instance id (`ins_…`) or name.
@@ -638,6 +658,18 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     .await?;
                 print_json(&value)
             }
+            InstanceCommand::Resume {
+                instance_id,
+                mode,
+                prompt,
+                permission_mode,
+                approval_id,
+            } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let client = client.clone().with_approval(approval_id, false);
+                let value = resume(&client, &instance_id, &mode, prompt, permission_mode).await?;
+                print_json(&value)
+            }
             InstanceCommand::Rm {
                 instance_id,
                 command_id,
@@ -655,6 +687,34 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
             }
         }
     })
+}
+
+/// `remuda instance resume`: a seat resumes through the Agent route
+/// (`POST /v1/instances/{id}/respawn`, `ap-resume`), an operator through the
+/// D-026 route (`POST /v1/instances/{id}/resume`).
+pub(crate) async fn resume(
+    client: &HubClient,
+    instance_id: &str,
+    mode: &str,
+    prompt: Option<String>,
+    permission_mode: Option<String>,
+) -> Result<Value> {
+    let mut body = json!({ "mode": mode, "prompt": prompt });
+    let agent = client.caller_context().await?.origin == remuda_hub_client::CallerOrigin::Agent;
+    if agent {
+        if let Some(mode) = permission_mode {
+            body["permissionMode"] = json!(mode);
+        }
+        return Ok(client
+            .post(&format!("/v1/instances/{instance_id}/respawn"), &body)
+            .await?);
+    }
+    if permission_mode.is_some() {
+        bail!("--permission-mode applies to a seat's resume; an operator resume keeps the mode");
+    }
+    Ok(client
+        .post(&format!("/v1/instances/{instance_id}/resume"), &body)
+        .await?)
 }
 
 pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<Value> {

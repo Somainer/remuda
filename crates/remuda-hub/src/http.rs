@@ -2227,84 +2227,7 @@ pub async fn resume_instance(
         });
     }
     let host = crate::store::Store::with_live_link(host, true);
-    // D-047: a resumed session inherits the parent's *observed* route, not the
-    // profile/project waterfall. A parent that ran direct is forced direct
-    // even if the profile now says via; a parent that ran via is re-validated
-    // against the same proxy (which may have gone offline).
-    let parent_observed_via = parent
-        .api_route
-        .as_ref()
-        .filter(|route| route.is_via())
-        .cloned();
-    let resume_overrides = if parent_observed_via.is_none() {
-        // Force direct: do not let the profile's current delivery move a
-        // direct session onto a proxy on resume.
-        crate::providers::RouteOverrides {
-            via: Some(remuda_protocol::ApiViaOverride::Direct),
-            ..Default::default()
-        }
-    } else {
-        crate::providers::RouteOverrides::default()
-    };
-    crate::providers::resolve_and_attach(&state, &host, &mut spec, resume_overrides).await?;
-    if let Some(observed) = parent_observed_via.as_ref() {
-        let target = match observed.via_host_id.as_ref() {
-            Some(id) => crate::provider_resolve::ViaTarget::Host(id.as_id().to_string()),
-            None => crate::provider_resolve::ViaTarget::HubHost,
-        };
-        let mode = match observed.route {
-            Some(remuda_protocol::ApiRouteKind::HubRelay) => {
-                remuda_protocol::ApiRouteMode::HubRelay
-            }
-            Some(remuda_protocol::ApiRouteKind::DirectNet) => {
-                remuda_protocol::ApiRouteMode::DirectNet
-            }
-            None => remuda_protocol::ApiRouteMode::HubRelay,
-        };
-        let choice = crate::provider_resolve::ApiRouteChoice {
-            target,
-            route: mode,
-            source: "resume",
-        };
-        let profile_id = spec
-            .get("providerProfileId")
-            .and_then(Value::as_str)
-            .filter(|id| crate::provider_resolve::is_real_profile_id(id))
-            .ok_or_else(|| {
-                HubError::BadRequest(
-                    "the resumed via session has no gateway profile on its spec".into(),
-                )
-            })?;
-        let profile = state
-            .store
-            .get_provider(profile_id.to_string())
-            .await?
-            .ok_or_else(|| {
-                HubError::BadRequest("the resumed via session's gateway profile vanished".into())
-            })?;
-        crate::providers::validate_via_target(&state, &host, &choice, &profile).await?;
-        crate::providers::write_requested_route(&mut spec, &choice)?;
-        // Re-install the egress context (credential) on the proxy host for
-        // the new instance; credentials ride api.egress, never api.open.
-        if let Some(proxy_host) = observed.via_host_id.as_ref() {
-            let new_instance_id = spec
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if !new_instance_id.is_empty() {
-                state
-                    .api_relay
-                    .install_egress(
-                        &state,
-                        proxy_host.as_id().as_str(),
-                        &new_instance_id,
-                        &profile,
-                    )
-                    .await?;
-            }
-        }
-    }
+    attach_resume_route(&state, &host, &parent, &mut spec).await?;
 
     let title = parent
         .title
@@ -2374,6 +2297,417 @@ pub async fn resume_instance(
         "mode": mode.as_str(),
         "replayed": false,
     })))
+}
+
+/// Body of `POST /v1/instances/{id}/respawn` (`ap-resume`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RespawnBody {
+    /// `structured` keeps the instance's driver; `terminal` continues in
+    /// claude-pty (D-026).
+    #[serde(default = "default_resume_mode")]
+    mode: String,
+    /// Optional first prompt for the resumed session.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// The mode to resume with, admitted like a create's (D-057 OA1).
+    /// Omitted: the instance's own requested word, so an inherited mode
+    /// inherits again, from the caller's mode now.
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
+/// `POST /v1/instances/{id}/respawn` — `ap-resume` (main-agent.md §15.2): an
+/// Agent resumes an instance it owns that is not a worker, under the same
+/// admission as a create.
+///
+/// The D-026 operator route (`POST /v1/instances/{id}/resume`) is unchanged
+/// and stays Human/Bot only; workers keep `POST /v1/workers/{id}/resume`.
+/// Here, before anything is allocated:
+/// - the `dispatch` grant, ownership (`owns()`), and the caller's scope over
+///   the instance's host and workspace; the seat's own chapters and a
+///   continuity lineage stay the owner's (§6.5), and a worker's instance is
+///   refused toward the worker route;
+/// - the mode is admitted under "never beyond the creator" against the
+///   caller's mode now (OA1): the body's word, else the instance's requested
+///   word, so a resume never runs an instance with its control off under a
+///   caller that keeps its control on;
+/// - another host, or a shell-driver carrier, asks the owner once (D-017),
+///   on a request derived from the resume.
+///
+/// The new instance continues the native session (`--resume`) on the same
+/// host and workspace with the instance's provider, model and observed
+/// route, as D-026 does, but its parent is the chapter that created the
+/// instance (not a new delegation edge, so the caller keeps owning it) and
+/// `resumedFrom` names the old instance.
+pub async fn respawn_owned_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Json(body): Json<RespawnBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Agent {
+        return Err(HubError::BadRequest(format!(
+            "POST /v1/instances/{instance_id}/respawn is the Agent resume; a Human or Bot \
+             resumes through POST /v1/instances/{instance_id}/resume"
+        )));
+    }
+    crate::agent_scope::require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch)
+        .await?;
+    let caller_id = device.instance_id.clone().ok_or(HubError::Forbidden)?;
+    if !crate::agent_scope::owns(&state, &device, &instance_id).await? {
+        return Err(HubError::not_owner());
+    }
+    let old = state
+        .store
+        .get_instance_read(instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // The seat's own chapters, and any continuity lineage, are resumed by the
+    // owner (main-agent.md §6.5): their resume is a continuation, not this.
+    let caller_lineage = state.store.lineage_id_for_instance(caller_id).await?;
+    if caller_lineage.as_deref() == Some(old.lineage_id.as_str())
+        || state
+            .store
+            .get_lineage(old.lineage_id.clone())
+            .await?
+            .is_some()
+    {
+        return Err(HubError::operator_only());
+    }
+    if let Some(worker) = state
+        .store
+        .worker_for_instance(instance_id.clone())
+        .await
+        .map_err(map_store)?
+    {
+        return Err(HubError::worker_instance(
+            &instance_id,
+            worker.meta.id.as_id().as_str(),
+        ));
+    }
+    // D-062: a claimed pane was never launched by Remuda (Human-only, 403).
+    crate::herdr_claims::authorize_pane_write(
+        &old,
+        Some(&device),
+        "instance.resume",
+        &mut json!({}),
+    )?;
+    let mode = match body.mode.as_str() {
+        "structured" => ResumeMode::Structured,
+        "terminal" => ResumeMode::Terminal,
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "unknown resume mode {other}; expected structured or terminal"
+            )));
+        }
+    };
+    if old.kind != "claude" {
+        return Err(HubError::Conflict(format!(
+            "resume supports Claude sessions; this one is {}",
+            old.kind
+        )));
+    }
+    let session_id = old.native_session_id.clone().ok_or_else(|| {
+        HubError::Conflict(
+            "this session never reported a native session id, so there is no transcript to resume"
+                .into(),
+        )
+    })?;
+    if let Some(age) = resume_age_days(&old.updated_at)
+        && age > RESUME_MAX_AGE_DAYS
+    {
+        return Err(HubError::Conflict(format!(
+            "session last ran {age} days ago; transcripts older than {RESUME_MAX_AGE_DAYS} days are not resumable"
+        )));
+    }
+    let driver = mode.driver(&old.driver);
+    // A repeat inside the window gets the instance the first one started; a
+    // resume someone else started is not the caller's to take over.
+    if let Some(existing) = state
+        .store
+        .find_resume_child(instance_id.clone(), driver.to_string(), session_id.clone())
+        .await?
+    {
+        if !crate::agent_scope::owns(&state, &device, &existing.instance_id).await? {
+            return Err(HubError::Conflict(format!(
+                "this session was already resumed into {}",
+                existing.instance_id
+            )));
+        }
+        return Ok(Json(json!({
+            "instance": existing,
+            "hostId": existing.host_id,
+            "mode": mode.as_str(),
+            "replayed": true,
+        })));
+    }
+    let host = state
+        .store
+        .get_host(old.host_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    if state.nodes.kind_of(&host.host_id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: host.host_id.clone(),
+        });
+    }
+    let host = crate::store::Store::with_live_link(host, true);
+    // Refused before the owner is paged: a placement outside the scope.
+    let scope = crate::agent_scope::caller_project_scope(&state, &device).await?;
+    if !scope.allows_host(&host.host_id)
+        || old
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace| !scope.allows_workspace(workspace))
+    {
+        return Err(HubError::out_of_scope());
+    }
+    // D-057 OA1, with the instance's own request replayed when the body names
+    // none: `null` (inherited) inherits again; a row from before the
+    // requested word was recorded falls back to its mode.
+    let old_spec = state
+        .store
+        .get_instance_spec_json(instance_id.clone())
+        .await?
+        .unwrap_or(Value::Null);
+    let requested = match body.permission_mode.clone() {
+        Some(word) => Some(word),
+        None => match old_spec.get(crate::agent_scope::PERMISSION_MODE_REQUESTED_FIELD) {
+            Some(word) => word.as_str().map(str::to_string),
+            None => old.permission_mode.clone(),
+        },
+    };
+    let admitted =
+        crate::agent_scope::admit_agent_mode(&state, &device, &old.kind, requested.as_deref())
+            .await?;
+    // D-017, decided before anything is launched.
+    if !crate::agent_scope::same_host(&state, &device, &host.host_id).await?
+        || crate::agent_scope::shell_driver(driver)
+        || headers.contains_key("x-remuda-require-approval")
+    {
+        crate::agent_scope::require_approval(
+            &state,
+            &headers,
+            &device,
+            json!({
+                "operation": "instance.respawn",
+                "instanceId": instance_id,
+                "hostId": host.host_id,
+                "driver": driver,
+                "model": old.model,
+                "permissionMode": admitted.effective,
+                "mode": mode.as_str(),
+            }),
+        )
+        .await?;
+    }
+
+    let mut spec = old.spec_for_resume();
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("driver".into(), json!(driver));
+        object.insert("resumeSessionId".into(), json!(session_id));
+        object.insert("resumedFrom".into(), json!(instance_id));
+        object.insert("hostId".into(), json!(host.host_id));
+        object.insert("prompt".into(), json!(body.prompt));
+        object.remove("nativeSessionId");
+        object.remove("nativeTranscriptPath");
+    }
+    crate::agent_scope::prepare_create(
+        &state,
+        &headers,
+        &device,
+        crate::agent_scope::CreateAdmission {
+            host: &host.host_id,
+            driver,
+            mode: crate::agent_scope::ModeAdmission::Admitted(&admitted),
+            approval: crate::agent_scope::CreateApproval::Decided,
+        },
+        &mut spec,
+    )
+    .await?;
+    // Not a new delegation edge: the chapter that created the instance stays
+    // its parent, so the caller's lineage keeps owning it (main-agent.md §5).
+    spec["parentInstanceId"] = json!(old.parent_instance_id);
+    attach_resume_route(&state, &host, &old, &mut spec).await?;
+    let (initiator, initiator_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
+    let title = old
+        .title
+        .clone()
+        .map(|title| format!("{title} (resumed)"))
+        .or_else(|| Some("resumed session".to_string()));
+    let (instance, command) = crate::placement::spawn_on_host(
+        &state,
+        &host,
+        crate::placement::SpawnRequest {
+            kind: old.kind.clone(),
+            driver: driver.to_string(),
+            workspace_id: old.workspace_id.clone(),
+            title,
+            prompt: body.prompt.clone(),
+            spec,
+            operation: "instance.resume",
+            idempotency_key: Some(format!(
+                "respawn:{instance_id}:{}:{}",
+                mode.as_str(),
+                resume_window_index()
+            )),
+            delegation: crate::store::InstanceDelegation {
+                // The instance's own reach, re-validated against its parent
+                // by the store (scope narrows, grants never grow).
+                role: old.role.clone(),
+                scope: old.scope.clone(),
+                grants: old.grants.clone(),
+                task_id: old.task_id.clone(),
+                enforce_tree: true,
+                restart: None,
+                seated_by: None,
+                auto_continue: old.auto_continue,
+                // home-glance-d060: a resume keeps the chain root's stamp.
+                creator_origin: old
+                    .creator_origin
+                    .clone()
+                    .or_else(|| Some(crate::agent_scope::origin_wire(&device).to_string())),
+            },
+            initiator: initiator.clone(),
+            initiator_device_id,
+        },
+    )
+    .await?;
+    let now = crate::config::now_rfc3339();
+    journal_resume_link(
+        &state,
+        &old.host_id,
+        &instance_id,
+        "resumed-into",
+        &instance.instance_id,
+        &session_id,
+        &now,
+    )
+    .await;
+    journal_resume_link(
+        &state,
+        &old.host_id,
+        &instance.instance_id,
+        "resumed-from",
+        &instance_id,
+        &session_id,
+        &now,
+    )
+    .await;
+    if let Err(error) = state
+        .store
+        .append_audit_as(
+            device.id.clone(),
+            "instance.respawn".into(),
+            Some(instance_id.clone()),
+            json!({ "to": instance.instance_id, "mode": mode.as_str(),
+                    "permissionMode": admitted.effective }),
+            initiator,
+        )
+        .await
+    {
+        tracing::warn!(%error, "respawn audit row not written");
+    }
+    Ok(Json(json!({
+        "instance": instance,
+        "command": command,
+        "hostId": host.host_id,
+        "mode": mode.as_str(),
+        "replayed": false,
+    })))
+}
+
+/// D-047: a resumed session inherits its parent's *observed* route, on the
+/// D-026 operator resume and the Agent resume (`ap-resume`) alike.
+async fn attach_resume_route(
+    state: &AppState,
+    host: &crate::store::HostRecord,
+    parent: &crate::store::InstanceRecord,
+    spec: &mut Value,
+) -> Result<(), HubError> {
+    // D-047: a resumed session inherits the parent's *observed* route, not the
+    // profile/project waterfall. A parent that ran direct is forced direct
+    // even if the profile now says via; a parent that ran via is re-validated
+    // against the same proxy (which may have gone offline).
+    let parent_observed_via = parent
+        .api_route
+        .as_ref()
+        .filter(|route| route.is_via())
+        .cloned();
+    let resume_overrides = if parent_observed_via.is_none() {
+        // Force direct: do not let the profile's current delivery move a
+        // direct session onto a proxy on resume.
+        crate::providers::RouteOverrides {
+            via: Some(remuda_protocol::ApiViaOverride::Direct),
+            ..Default::default()
+        }
+    } else {
+        crate::providers::RouteOverrides::default()
+    };
+    crate::providers::resolve_and_attach(state, host, spec, resume_overrides).await?;
+    if let Some(observed) = parent_observed_via.as_ref() {
+        let target = match observed.via_host_id.as_ref() {
+            Some(id) => crate::provider_resolve::ViaTarget::Host(id.as_id().to_string()),
+            None => crate::provider_resolve::ViaTarget::HubHost,
+        };
+        let mode = match observed.route {
+            Some(remuda_protocol::ApiRouteKind::HubRelay) => {
+                remuda_protocol::ApiRouteMode::HubRelay
+            }
+            Some(remuda_protocol::ApiRouteKind::DirectNet) => {
+                remuda_protocol::ApiRouteMode::DirectNet
+            }
+            None => remuda_protocol::ApiRouteMode::HubRelay,
+        };
+        let choice = crate::provider_resolve::ApiRouteChoice {
+            target,
+            route: mode,
+            source: "resume",
+        };
+        let profile_id = spec
+            .get("providerProfileId")
+            .and_then(Value::as_str)
+            .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+            .ok_or_else(|| {
+                HubError::BadRequest(
+                    "the resumed via session has no gateway profile on its spec".into(),
+                )
+            })?;
+        let profile = state
+            .store
+            .get_provider(profile_id.to_string())
+            .await?
+            .ok_or_else(|| {
+                HubError::BadRequest("the resumed via session's gateway profile vanished".into())
+            })?;
+        crate::providers::validate_via_target(state, host, &choice, &profile).await?;
+        crate::providers::write_requested_route(spec, &choice)?;
+        // Re-install the egress context (credential) on the proxy host for
+        // the new instance; credentials ride api.egress, never api.open.
+        if let Some(proxy_host) = observed.via_host_id.as_ref() {
+            let new_instance_id = spec
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !new_instance_id.is_empty() {
+                state
+                    .api_relay
+                    .install_egress(
+                        state,
+                        proxy_host.as_id().as_str(),
+                        &new_instance_id,
+                        &profile,
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// D-057 §5/§7.2 (ma-lineage): continuation resume of a continuity lineage.

@@ -18,3 +18,10 @@ steering. Output lists every instance plus an `accepted` / `failed` /
 `skipped` summary: read it, a partial fan-out is not an error.
 `--idempotency-key` makes a retry replay instead of double-sending. Don't
 `rm` instances you didn't create unless asked.
+
+An exited Claude session continues on a new instance with
+`remuda instance resume reviewer` (`--mode terminal` for a terminal tab).
+From a seat that holds `dispatch`, this works for a session you own that is
+not a worker (workers use `remuda worker resume`). Another host, or a
+shell-driver carrier, asks the owner once: wait for the answer, then retry
+with `--approval-id <interaction>`.

@@ -1991,6 +1991,31 @@ impl Store {
             .await
     }
 
+    /// ap-resume: the worker whose current or earlier instance is
+    /// `instance_id`, if any.
+    pub async fn worker_for_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<WorkerRoster>, StoreError> {
+        self.run_named("worker_for_instance", move |conn| {
+            let id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM worker_roster
+                      WHERE json_extract(doc_json, '$.instanceId') = ?1
+                         OR json_extract(doc_json, '$.resumedFrom') = ?1
+                      ORDER BY created_at DESC LIMIT 1",
+                    params![instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) => load_worker(conn, &id),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     pub async fn find_active_workers_named(
         &self,
         name: String,

@@ -32,6 +32,11 @@ pub fn routes() -> Router<AppState> {
             get(http::get_instance_command),
         )
         .route("/v1/instances/{id}/resume", post(http::resume_instance))
+        // ap-resume: an Agent resumes an owned instance that is not a worker.
+        .route(
+            "/v1/instances/{id}/respawn",
+            post(http::respawn_owned_instance),
+        )
         .route("/v1/instances/{id}/seen", post(mark_seen))
         .route("/v1/lineages/{id}", get(http::get_lineage))
         .route("/v1/instances/{id}/journal", get(http::get_journal))

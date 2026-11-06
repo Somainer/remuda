@@ -71,7 +71,7 @@ Two limits recur below:
 | Send one prompt to several selected sessions | `POST /v1/instances/{id}/commands`, `instance.send`, once per session | Agent route. The send rule, per target | — |
 | Send keys from the list | commands, `instance.keys` | Safety. Keystrokes: every Agent `instance.keys` needs the D-017 approval | — |
 | Close a session from the list or a space tab | commands, `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
-| Resume a session (list, phone home, session page) | `POST /v1/instances/{id}/resume` | Workers: Agent route by another path, `POST /v1/workers/{id}/resume` (the scoped respawn helper: `dispatch`, project scope, lineage-subtree ownership, the creator rule, and the D-017 approval for a shell-driver carrier; main-agent.md §4.2 item 5). Any other instance: Gap. The public route is operator-only (D-026) | Other owned instances: `ap-resume`. Main's own Resume stays a Human control (§6.5) |
+| Resume a session (list, phone home, session page) | `POST /v1/instances/{id}/resume` | Agent route by another path. An owned instance that is not a worker: `POST /v1/instances/{id}/respawn` (`ap-resume`, main-agent.md §4.2.3: `dispatch`, ownership, the caller's scope, the mode re-admitted by the creator rule against the caller's mode now, and the D-017 approval for another host or a shell-driver carrier; the new instance stays the caller's). Workers: `POST /v1/workers/{id}/resume` (the scoped respawn helper; main-agent.md §4.2 item 5). The public route `POST /v1/instances/{id}/resume` is not admitted for Agent origin and stays operator-only (D-026) | Main's own Resume stays a Human control (§6.5) |
 | Delete a session (spaces panel) | `DELETE /v1/instances/{id}` | Safety. Records are truthful: the record and journal are the evidence of what agents did. Operator-only (`delete_instance`) | — |
 
 ### Session (`/s/:id` and its tabs)
@@ -220,6 +220,7 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
 | `instance stop` | commands, `instance.cancel` or `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | `instance rm` | commands, `instance.close` | Agent route. As `instance stop` | — |
+| `instance resume` | `POST /v1/instances/{id}/respawn` from a seat (an operator's goes to the D-026 route) | Agent route. As "Resume a session": an owned instance that is not a worker, under `dispatch` and the create's admission; another host or a shell-driver carrier asks the owner once (`--approval-id`); `--permission-mode` is re-admitted by the creator rule | — |
 | `instance configure` | commands, `instance.configure` | Agent route. Owned targets: `--model`, `--effort`, `--ultracode` and `--expected-generation`; `--permission-mode` is operator-only for Agent origin (403 `configure-operator-only`); the model id follows the create's vocabulary | — |
 | `instance config` | `GET /v1/instances/{id}/config` | Agent route. Owned targets | — |
 | `instance set` | `PATCH /v1/instances/{id}` | Safety. Owner-only: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device, and an agent asks for it on the children it dispatches | — |
@@ -409,7 +410,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
-| `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
 | `ap-subagent-read` | a subagent's transcript |
 | `ap-memory-writes` | the transcript's memory-write receipts (`GET /v1/instances/{id}/memory-writes`) |

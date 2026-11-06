@@ -398,6 +398,24 @@ impl HubError {
         )
     }
 
+    /// 400 for a worker's instance on the Agent resume (`ap-resume`): workers
+    /// respawn through their own route.
+    pub fn worker_instance(instance_id: &str, worker_id: &str) -> Self {
+        Self::BadRequest(format!(
+            "instance {instance_id} is worker {worker_id}'s; resume the worker instead"
+        ))
+        .with_next(
+            "worker-instance",
+            NextStep::new(
+                action::FIX_REQUEST,
+                format!(
+                    "a worker respawns through its own route, which keeps its worktree and \
+                     brief: `remuda worker resume {worker_id}` (POST /v1/workers/{worker_id}/resume)"
+                ),
+            ),
+        )
+    }
+
     /// 403 for a route the Agent middleware does not admit.
     pub fn agent_route() -> Self {
         Self::Forbidden.with_next(

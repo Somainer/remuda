@@ -1069,6 +1069,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/respawn": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Agent resume of an owned instance that is not a worker (ap-resume)
+         * @description ap-resume (main-agent.md §15.2): an Agent resumes an instance it owns (`owns()`) that is not a worker, under the same admission as a create: the `dispatch` grant, the caller's scope over the instance's host and workspace, and the mode admitted by "never beyond the creator" (D-057 OA1) against the caller's mode now (the body's `permissionMode`, else the instance's own requested word, so an inherited mode inherits again). Another host, or a shell-driver carrier, needs the D-017 one-shot human approval, decided before anything is allocated (409 HUMAN_APPROVAL_REQUIRED, then retry with x-remuda-approval-id). The new instance continues the native session like D-026 (same host, workspace, provider, model and observed route), but its parent is the chapter that created the instance and `resumedFrom` names the old one. The seat's own chapters and continuity lineages stay the owner's (403 operator-only); a worker's instance is 400 worker-instance (use POST /v1/workers/{id}/resume); a Human or Bot gets 400 (use POST /v1/instances/{id}/resume, which is unchanged). Idempotent per (instance, mode) inside a short window.
+         */
+        post: operations["instanceRespawn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/resume": {
         parameters: {
             query?: never;
@@ -4319,6 +4339,18 @@ export interface components {
              */
             origin?: "human" | "bot" | "agent" | "hub";
         };
+        RespawnRequest: {
+            /**
+             * @description structured keeps the parent's driver; terminal continues the same native session in claude-pty so the conversation gains a terminal tab.
+             * @default structured
+             * @enum {string}
+             */
+            mode: "structured" | "terminal";
+            /** @description The mode to resume with, admitted like a create's (D-057 OA1). Omitted: the instance's own requested word, so an inherited mode inherits again from the caller's mode now. */
+            permissionMode?: string | null;
+            /** @description Optional first prompt delivered to the resumed session. */
+            prompt?: string | null;
+        };
         /** @description D-057 §6.1 C1 restart policy chosen at create time. */
         RestartPolicy: {
             /** @description At-most restart decisions per rolling hour; at least 1. */
@@ -7169,6 +7201,51 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    instanceRespawn: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+                /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+                "x-remuda-approval-id"?: components["parameters"]["AgentApproval"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RespawnRequest"];
+            };
+        };
+        responses: {
+            /** @description Resumed instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResumeResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            /** @description Approval required, no resumable native transcript, transcript too old, or already resumed by someone else */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            503: components["responses"]["Error"];
         };
     };
     instanceResume: {

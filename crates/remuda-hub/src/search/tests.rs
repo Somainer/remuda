@@ -1276,4 +1276,36 @@ async fn bench_backfill_query_and_append_on_a_large_journal() {
     for (kind, ms) in &per_kind {
         println!("append {kind:8} ms_per_event={ms:.3}");
     }
+    // A streamed reply: open, then token-sized deltas into one node, past
+    // the 8 KiB every-row threshold (about 24 KiB in all).
+    let words = [
+        "supervisor ",
+        "restart ",
+        "chapter ",
+        "lineage ",
+        "fence ",
+        "ledger ",
+    ];
+    for (label, rows) in [("stream-thought", "thought"), ("stream-message", "message")] {
+        let node = format!("bench-{label}");
+        let t = Instant::now();
+        let mut first = streamed(&node, "open", "Start ");
+        first["kind"] = json!(rows);
+        store
+            .append_journal(host.clone(), seat.clone(), None, first)
+            .await
+            .unwrap();
+        for n in 0..3000 {
+            let mut event = streamed(&node, "append", words[n % words.len()]);
+            event["kind"] = json!(rows);
+            store
+                .append_journal(host.clone(), seat.clone(), None, event)
+                .await
+                .unwrap();
+        }
+        println!(
+            "append {label} ms_per_delta={:.3}",
+            t.elapsed().as_secs_f64() * 1000.0 / 3001.0
+        );
+    }
 }

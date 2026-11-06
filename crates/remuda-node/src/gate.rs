@@ -11780,15 +11780,15 @@ head -c 1 >/dev/null || exit 4
     #[test]
     fn run_owned_completes_reaps_and_timeout_kills_unreaped_group() {
         let keep = tempfile::TempDir::new().unwrap();
+        // Installed closed and complete (hidden part file, renamed into
+        // place): a direct write leaves the script open for writing while
+        // other test threads fork, and the spawn then fails with ETXTBSY.
         let quick = keep.path().join("quick");
-        std::fs::write(&quick, "#!/bin/sh\nexit 0\n").unwrap();
+        remuda_testing::install_at(&quick, "#!/bin/sh\nexit 0\n").unwrap();
         let long = keep.path().join("long");
         // Leader + a grandchild, both in the script's new group.
-        std::fs::write(&long, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        for bin in [&quick, &long] {
-            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        remuda_testing::install_at(&long, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n")
+            .unwrap();
 
         // Completed path: a generous deadline, normal exit, reaped once.
         let command = std::process::Command::new(quick.to_str().unwrap());
@@ -11875,13 +11875,13 @@ head -c 1 >/dev/null || exit 4
         let wrapper = keep.path().join("wrapper");
         // Same-group backgrounded transport: stdout detached, stderr inherited
         // (the captured pipe). The leader exits unsuccessfully immediately.
-        std::fs::write(
+        // Installed closed and complete so a concurrent test thread's fork
+        // cannot hold it open for writing (ETXTBSY at the spawn).
+        remuda_testing::install_at(
             &wrapper,
             "#!/bin/sh\n(sleep 47.55 >/dev/null) &\necho transport-line >&2\nexit 7\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = std::time::Instant::now();
         let command = std::process::Command::new(wrapper.to_str().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

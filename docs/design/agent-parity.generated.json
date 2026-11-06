@@ -79,7 +79,7 @@
       "method": "DELETE",
       "path": "/v1/tasks/{id}/own",
       "middleware": "admitted",
-      "handler": "grant: dispatch"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "GET",
@@ -862,7 +862,7 @@
       "method": "POST",
       "path": "/v1/tasks/{id}/own",
       "middleware": "admitted",
-      "handler": "grant: dispatch"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "POST",

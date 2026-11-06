@@ -1030,3 +1030,139 @@ async fn board_projects_states_placement_failures_and_the_archive_flag() -> Resu
     assert!(view["lockedDeps"].as_array().unwrap().is_empty());
     Ok(())
 }
+
+/// ap-own-scope: `own claim` and `own release` check the target task's
+/// project against the caller's scope, as every other task mutation does. A
+/// `dispatch` holder scoped to project A gets the cb-errors `out-of-scope` 403
+/// on a project-B task and changes neither its claims nor its `task_paths`
+/// rows; inside A both calls work, and a Human is unchanged.
+#[tokio::test]
+async fn own_claim_and_release_stay_inside_the_callers_project_scope() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project_a = ctx.create_project("alpha").await?;
+    let project_b = ctx.create_project("beta").await?;
+    let host = remuda_protocol::HostId::new();
+    ctx.hub.test_insert_host(host.as_id().as_str()).await?;
+    let coordinator = ctx
+        .hub
+        .store()
+        .unwrap()
+        .insert_instance_delegated(
+            host.as_id().to_string(),
+            None,
+            "claude".into(),
+            "claude-sdk".into(),
+            None,
+            json!({ "projectId": project_a }),
+            remuda_hub::store_test_support::seat_delegation(
+                remuda_protocol::InstanceScope {
+                    project_ids: vec![remuda_protocol::ProjectId::try_from(project_a.clone())?],
+                    ..Default::default()
+                },
+                vec!["dispatch".into()],
+            ),
+            remuda_hub::agent_scope_test_support::CallerAuthority::internal(),
+        )
+        .await?;
+    let agent =
+        remuda_hub::instance_token(ctx.hub.store().unwrap().clone(), coordinator.instance_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+
+    let a_id = ctx.add_task(&project_a, "a-task", json!({})).await?["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_id = ctx.add_task(&project_b, "b-task", json!({})).await?["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The owner's claim on the project-B task, which the Agent must not touch.
+    ctx.json_ok(
+        "POST",
+        &format!("/v1/tasks/{b_id}/own"),
+        Some(json!({ "paths": ["crates/b.rs"] })),
+    )
+    .await?;
+    let db = ctx._dir.path().join("hub").join("hub.sqlite");
+    let task_paths = |task: &str| -> Result<Vec<String>> {
+        let db = rusqlite::Connection::open(&db)?;
+        let mut stmt =
+            db.prepare("SELECT pattern FROM task_paths WHERE task_id = ?1 ORDER BY pattern")?;
+        let rows = stmt.query_map([task], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    let owns = |task: Value| -> Vec<String> {
+        task["owns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    for (method, paths) in [
+        ("POST", json!(["crates/sneaky.rs"])),
+        ("DELETE", json!(["crates/b.rs"])),
+        // An empty release would drop every claim on the task.
+        ("DELETE", json!([])),
+    ] {
+        let refused = ctx
+            .request(
+                method,
+                &format!("/v1/tasks/{b_id}/own"),
+                &agent,
+                Some(json!({ "paths": paths })),
+            )
+            .await?;
+        assert_eq!(refused.status(), 403, "{method} {paths}");
+        let body: Value = refused.json().await?;
+        assert_eq!(body["reason"], "out-of-scope", "{method}: {body}");
+        assert_eq!(body["next"]["action"], "ask-owner", "{body}");
+        assert_eq!(task_paths(&b_id)?, ["crates/b.rs"], "{method} {paths}");
+        let task = ctx
+            .json_ok("GET", &format!("/v1/tasks/{b_id}"), None)
+            .await?;
+        assert_eq!(owns(task), ["crates/b.rs"], "{method} {paths}");
+    }
+
+    // Inside its scope the Agent claims and releases as before.
+    let claimed = ctx
+        .request(
+            "POST",
+            &format!("/v1/tasks/{a_id}/own"),
+            &agent,
+            Some(json!({ "paths": ["crates/a.rs"] })),
+        )
+        .await?;
+    assert_eq!(claimed.status(), 200);
+    assert_eq!(task_paths(&a_id)?, ["crates/a.rs"]);
+    let released = ctx
+        .request(
+            "DELETE",
+            &format!("/v1/tasks/{a_id}/own"),
+            &agent,
+            Some(json!({ "paths": ["crates/a.rs"] })),
+        )
+        .await?;
+    assert_eq!(released.status(), 200);
+    assert!(task_paths(&a_id)?.is_empty());
+
+    // A Human (universe scope) still claims and releases in either project.
+    for task in [&a_id, &b_id] {
+        ctx.json_ok(
+            "POST",
+            &format!("/v1/tasks/{task}/own"),
+            Some(json!({ "paths": ["docs/human.md"] })),
+        )
+        .await?;
+        ctx.json_ok(
+            "DELETE",
+            &format!("/v1/tasks/{task}/own"),
+            Some(json!({ "paths": ["docs/human.md"] })),
+        )
+        .await?;
+    }
+    assert_eq!(task_paths(&b_id)?, ["crates/b.rs"]);
+    Ok(())
+}

@@ -1,6 +1,6 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Rows closed by `ap-command-read`, `ap-gate-reads`, `ap-subagent-read`, `ap-memory-writes`, `ap-agent-list` and `ap-own-scope` (2026-11-06) were moved the same way. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
 
 ## The two halves
 
@@ -238,8 +238,8 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `task show` | `GET /v1/tasks/{id}` | Agent route. Project scope only, no grant | — |
 | `task split` | `POST /v1/tasks/{id}/split` | Agent route. `dispatch` and scope | — |
 | `task set-state` | `PATCH /v1/tasks/{id}` | Agent route. `dispatch` and scope | — |
-| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not.** `claim_own` calls `require_dispatch` (grant only) and then mutates the named task; unlike every other task mutation (`create_task`, `set_task_state`, `archive_task`, `split_task`, `add_placement`), it never calls `require_project_scope` (`crates/remuda-hub/src/tasks.rs`). An Agent with `dispatch` can therefore claim paths on a task in a project outside its scope | `ap-own-scope` |
-| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. **`dispatch` is enforced; the target task's project scope is not**, exactly as for `own claim` (`release_own`). An Agent with `dispatch` can release another project's claims | `ap-own-scope` |
+| `own claim` | `POST /v1/tasks/{id}/own` | Agent route. `dispatch`, and the target task must be in the caller's project scope, as for every other task mutation (`require_project_scope`); a task outside it is 403 `out-of-scope` and no claim changes (`claim_own` in `crates/remuda-hub/src/tasks.rs`) | — |
+| `own release` | `DELETE /v1/tasks/{id}/own` | Agent route. As `own claim`: `dispatch` and the target task's project scope (`release_own`) | — |
 | `own check` | `POST /v1/own/check` | Agent route. Project scope only, no grant | — |
 | `own list` | `GET /v1/own` | Agent route. Project scope only, no grant | — |
 
@@ -395,7 +395,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |
-| `ap-own-scope` | the missing target-project scope check on `own claim` and `own release` (an over-broad Agent route today, not a missing one) |
 | `ap-host-read` | the host list, a host's workspaces and `doctor`, for hosts in the caller's scope |
 | `ap-supply-read` | `profile catalog`, `list`, `show`, `usage`, `probe`; the provider list; the model and supply catalog |
 | `ap-supply-event` | `profile event` |

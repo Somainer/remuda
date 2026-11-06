@@ -19,6 +19,7 @@ mod error;
 mod fence;
 mod files;
 mod gate;
+mod held_input;
 pub mod herdr_claim;
 mod hook_shim;
 mod identity;

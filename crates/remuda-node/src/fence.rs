@@ -77,6 +77,9 @@ impl FenceTable {
 pub(crate) struct NodeFences {
     table: Mutex<FenceTable>,
     db: Option<Mutex<Connection>>,
+    /// cb-command-queue: prompts PTY queues hold, claimed beside the
+    /// dispatch claim below so a withdrawal and a delivery have one winner.
+    pub(crate) held: crate::held_input::HeldInputs,
 }
 
 impl NodeFences {
@@ -85,6 +88,7 @@ impl NodeFences {
         Self {
             table: Mutex::new(FenceTable::default()),
             db: None,
+            held: Default::default(),
         }
     }
 
@@ -166,6 +170,7 @@ impl NodeFences {
         Ok(Self {
             table: Mutex::new(table),
             db: Some(Mutex::new(conn)),
+            held: Default::default(),
         })
     }
 

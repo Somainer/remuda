@@ -148,6 +148,30 @@ pub enum HubError {
         /// Human-readable detail.
         message: String,
     },
+    /// cb-command-queue (protocol.md §8.5): the command can no longer be
+    /// shown to be undelivered, so it cannot be edited or withdrawn.
+    #[error("command {command_id} was already delivered or settled")]
+    NotQueued {
+        /// The command the caller addressed.
+        command_id: String,
+    },
+    /// cb-command-queue: `expectedRevision` is not the command's revision.
+    #[error("command {command_id} is at revision {revision}")]
+    RevisionConflict {
+        /// The command the caller addressed.
+        command_id: String,
+        /// Its current revision.
+        revision: i64,
+    },
+    /// cb-command-queue: `expectedGeneration` is not the instance's current
+    /// runtime-config generation; nothing was merged.
+    #[error("runtime config is at generation {generation}")]
+    GenerationConflict {
+        /// The current generation (`configureSeq`).
+        generation: i64,
+        /// The current values, shaped as `GET /v1/instances/{id}/config`.
+        config: serde_json::Value,
+    },
     /// Interaction deadline already passed.
     #[error("interaction expired")]
     Expired,
@@ -397,9 +421,71 @@ impl HubError {
         )
     }
 
+    /// 409 `already-delivered` (cb-command-queue): read the command, never
+    /// guess.
+    pub fn not_queued(command_id: &str) -> Self {
+        Self::NotQueued {
+            command_id: command_id.to_owned(),
+        }
+        .with_next(
+            "already-delivered",
+            NextStep::new(
+                action::READ_THEN_DECIDE,
+                "the command is no longer provably undelivered, so it cannot be edited or \
+                 withdrawn; read its state, and send a new command if something still needs \
+                 saying",
+            )
+            .command(command_id),
+        )
+    }
+
+    /// 409 `revision-conflict` (cb-command-queue).
+    pub fn revision_conflict(command_id: &str, revision: i64) -> Self {
+        Self::RevisionConflict {
+            command_id: command_id.to_owned(),
+            revision,
+        }
+        .with_next(
+            "revision-conflict",
+            NextStep::new(
+                action::READ_THEN_DECIDE,
+                "someone edited this command since you read it; read it again and decide \
+                 against its current text and revision",
+            )
+            .command(command_id),
+        )
+    }
+
+    /// 409 `generation-conflict` (cb-command-queue).
+    pub fn generation_conflict(generation: i64, config: serde_json::Value) -> Self {
+        Self::GenerationConflict { generation, config }.with_next(
+            "generation-conflict",
+            NextStep::new(
+                action::READ_THEN_DECIDE,
+                "the runtime config changed since you read it; read the current values and \
+                 generation, then decide whether your change still applies",
+            ),
+        )
+    }
+
+    /// 400 `not-editable` (cb-command-queue).
+    pub fn not_editable(hint: impl Into<String>) -> Self {
+        Self::BadRequest(hint.into()).with_next(
+            "not-editable",
+            NextStep::new(
+                action::FIX_REQUEST,
+                "only the text and attachments of a queued instance.send can be edited; \
+                 withdraw it and send a new command with a new commandId",
+            ),
+        )
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::Actionable { source, .. } => source.status(),
+            Self::NotQueued { .. }
+            | Self::RevisionConflict { .. }
+            | Self::GenerationConflict { .. } => StatusCode::CONFLICT,
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::ForbiddenReason(_) => StatusCode::FORBIDDEN,
@@ -447,6 +533,9 @@ impl HubError {
             Self::NotFound => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
+            Self::NotQueued { .. } => "COMMAND_NOT_QUEUED",
+            Self::RevisionConflict { .. } => "COMMAND_REVISION_CONFLICT",
+            Self::GenerationConflict { .. } => "CONFIG_GENERATION_CONFLICT",
             Self::Fenced => "fenced",
             Self::LineageConflict { reason, .. }
                 if *reason == remuda_protocol::NODE_LACKS_FENCE_REASON =>
@@ -534,6 +623,17 @@ impl HubError {
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("winner".into(), json!(winner));
+        }
+        if let Self::RevisionConflict { revision, .. } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("revision".into(), json!(revision));
+        }
+        if let Self::GenerationConflict { generation, config } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("generation".into(), json!(generation));
+            obj.insert("config".into(), config.clone());
         }
         if let Self::HostOffline { host_id } = &self
             && let Some(obj) = body.as_object_mut()

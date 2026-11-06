@@ -3143,8 +3143,15 @@
       "type": "string"
     },
     "DigestConfigure": {
-      "description": "An `instance.configure` command that has not settled.",
+      "description": "An `instance.configure` command that is not in effect yet.",
       "properties": {
+        "boundary": {
+          "description": "For `deferred`: `next-turn` or `next-chapter`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "requestId": {
           "description": "The per-request id the effort switch carries, when it has one.",
           "type": [
@@ -3153,7 +3160,7 @@
           ]
         },
         "state": {
-          "description": "Command state: `queued` or `accepted`.",
+          "description": "`queued` (the Hub has not forwarded it), `accepted`, or `deferred`\n(it waits for a turn or chapter boundary; cb-command-queue).",
           "type": "string"
         }
       },
@@ -3194,7 +3201,7 @@
               "type": "null"
             }
           ],
-          "description": "An unsettled `instance.configure`."
+          "description": "The newest `instance.configure` not in effect yet."
         },
         "effective": {
           "description": "The model id the harness was observed answering with.",
@@ -3207,6 +3214,13 @@
           "$ref": "#/$defs/DigestEffort",
           "description": "Requested vs effective effort."
         },
+        "generation": {
+          "default": 0,
+          "description": "The runtime-config generation (`configureSeq`): a configure carrying\n`expectedGeneration` must name it (cb-command-queue).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "requested": {
           "description": "The model id Remuda asked for.",
           "type": [
@@ -3216,7 +3230,8 @@
         }
       },
       "required": [
-        "effort"
+        "effort",
+        "generation"
       ],
       "type": "object"
     },
@@ -21326,6 +21341,11 @@
         {
           "const": "withheld",
           "description": "Wire value `withheld`.",
+          "type": "string"
+        },
+        {
+          "const": "withdrawn",
+          "description": "Wire value `withdrawn`.",
           "type": "string"
         }
       ]

@@ -46,6 +46,8 @@ pub(super) async fn run(
     let mut pending = VecDeque::new();
     if let Some((mut command, prompt)) = create {
         if !prompt.is_empty() {
+            // cb-command-queue: held until the delivery claim.
+            fences.held.hold(&command.command_id);
             pending.push_back(enqueue(
                 store.as_ref(),
                 &instance_id,
@@ -75,7 +77,7 @@ pub(super) async fn run(
         tokio::select! {
             queued = receiver.recv() => {
                 let Some(queued) = queued else {
-                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed", prompts.as_ref())?;
+                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed", prompts.as_ref(), &fences)?;
                     return Err(NodeError::DriverUnavailable);
                 };
                 if let DriverRequest::Send { prompt, attachments: _, origin, mode, command_id: _ } = queued.request {
@@ -87,6 +89,7 @@ pub(super) async fn run(
                     } else {
                         let was_working = store.get_instance(&instance_id)?.activity
                             == (Knowledge::Known { value: Activity::Working });
+                        fences.held.hold(&queued.command_id);
                         let item = enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, queued.attachment_refs, origin, mode, prompts.as_ref())?;
                         if mode == remuda_protocol::PromptMode::Steer {
                             // c-steer: jump ahead of every ORDINARY queued
@@ -134,7 +137,7 @@ pub(super) async fn run(
                 } else {
                     let close_after = queued.close_after;
                     if matches!(queued.request, DriverRequest::Cancel | DriverRequest::Close) {
-                        interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled", prompts.as_ref())?;
+                        interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled", prompts.as_ref(), &fences)?;
                     }
                     execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone(), Arc::clone(&prompts), Arc::clone(&fences)).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
@@ -158,8 +161,16 @@ pub(super) async fn run(
                 }
             }
             _ = tick.tick(), if !pending.is_empty() => {
+                // cb-command-queue: a prompt withdrawn or edited while it
+                // waits is dropped or rewritten now, not when it reaches the
+                // head.
+                apply_held_changes(store.as_ref(), &instance_id, &mut pending, prompts.as_ref(), &fences)?;
+                if pending.is_empty() {
+                    settle_activity_after_drain(store.as_ref(), interactions.as_ref(), &instance_id).await?;
+                    continue;
+                }
                 if store.get_instance(&instance_id)?.lifecycle != InstanceLifecycle::Ready {
-                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance no longer ready", prompts.as_ref())?;
+                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance no longer ready", prompts.as_ref(), &fences)?;
                     continue;
                 }
                 let front = pending.front().expect("guarded by non-empty tick");
@@ -428,6 +439,7 @@ async fn deliver(
     {
         Ok(attachments) => attachments,
         Err(error) => {
+            fences.held.release(&prompt.command_id);
             update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
             prompts.cancel(&prompt.command_id);
             let command = store.get_command(&prompt.command_id)?;
@@ -458,6 +470,19 @@ async fn deliver(
             }
             Ok(Err(error)) => Err(error),
             Ok(Ok(_)) => {
+                // cb-command-queue: the held-input claim. From here on a
+                // withdrawal or an edit answers `already-delivered`; a
+                // withdrawal that won is never written.
+                match fences.held.claim(&prompt.command_id) {
+                    crate::held_input::Claim::Withdrawn => {
+                        finalize_withdrawn(store, instance_id, prompt, prompts)?;
+                        return Ok(true);
+                    }
+                    crate::held_input::Claim::Deliver(Some(text)) => {
+                        apply_edit(store, instance_id, prompt, prompts, text)?;
+                    }
+                    crate::held_input::Claim::Deliver(None) => {}
+                }
                 // D-057 §7.4/§7.6: PTY delivery re-checks the fence right
                 // before writing. A prompt a fence cancelled (or whose
                 // initiator is now fenced) never reaches the worker; a
@@ -466,6 +491,7 @@ async fn deliver(
                 if super::super::fence::claim(store, fences, &prompt.command_id)?
                     == super::super::fence::Claim::Fenced
                 {
+                    fences.held.release(&prompt.command_id);
                     update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
                     prompts.cancel(&prompt.command_id);
                     return Ok(true);
@@ -491,6 +517,9 @@ async fn deliver(
     let mut command = store.get_command(&prompt.command_id)?;
     match execution {
         Err(DriverError::ControlUnavailable) => {
+            // Nothing was written: the prompt waits again and stays
+            // withdrawable and editable (cb-command-queue).
+            fences.held.unclaim(&prompt.command_id);
             remark_after_enqueue(store, instance_id, Some(prompt.mode))?;
             return Ok(false);
         }
@@ -589,12 +618,114 @@ async fn deliver(
             }
         }
     }
+    fences.held.release(&prompt.command_id);
     // The already-settled create is immutable even if its optional prompt later fails.
     if command.operation != CommandOperation::InstanceCreate {
         store.save_command(command.clone())?;
         append_command_lifecycle(store, instance_id, &command, "settled")?;
     }
     Ok(true)
+}
+
+/// cb-command-queue: apply the withdrawals and edits the Hub made to prompts
+/// still waiting in the queue.
+fn apply_held_changes(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    pending: &mut VecDeque<PendingPrompt>,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
+    fences: &crate::fence::NodeFences,
+) -> Result<(), NodeError> {
+    let mut index = 0;
+    while index < pending.len() {
+        match fences.held.change(&pending[index].command_id) {
+            Some(crate::held_input::Change::Withdrawn) => {
+                if let Some(mut prompt) = pending.remove(index) {
+                    finalize_withdrawn(store, instance_id, &mut prompt, prompts)?;
+                }
+                continue;
+            }
+            Some(crate::held_input::Change::Edited(text)) => {
+                apply_edit(store, instance_id, &mut pending[index], prompts, text)?;
+            }
+            None => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// A withdrawn prompt never reaches the harness: its queued message reads
+/// interrupted and its command settles `cancelled` (reason `withdrawn`,
+/// not dispatched).
+fn finalize_withdrawn(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    prompt: &mut PendingPrompt,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
+) -> Result<(), NodeError> {
+    update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
+    prompts.cancel(&prompt.command_id);
+    let mut command = store.get_command(&prompt.command_id)?;
+    if command.state != CommandState::Settled {
+        settle_command(
+            &mut command,
+            SettlementOutcome::Cancelled,
+            Some("withdrawn".to_owned()),
+            remuda_protocol::ExecutionState::NotDispatched,
+        )?;
+        store.save_command(command.clone())?;
+        append_command_lifecycle(store, instance_id, &command, "settled")?;
+    }
+    Ok(())
+}
+
+/// Rewrite a waiting prompt with the Hub's edited text: the write, the
+/// queued transcript row and the correlation all carry the new text.
+fn apply_edit(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    prompt: &mut PendingPrompt,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
+    text: String,
+) -> Result<(), NodeError> {
+    prompt.prompt = text.clone();
+    prompt
+        .message
+        .blocks
+        .retain(|block| !matches!(block, remuda_protocol::ContentBlock::Text(_)));
+    prompt
+        .message
+        .blocks
+        .push(remuda_protocol::ContentBlock::Text(Box::new(
+            remuda_protocol::TextBlock { text: text.clone() },
+        )));
+    prompts.retext(&prompt.command_id, text);
+    update_message(store, instance_id, prompt, ContentStatus::Queued)
+}
+
+/// The last queued prompt was withdrawn: a composer the queue marked
+/// "waiting on the next turn boundary" with no real question pending is
+/// idle again.
+async fn settle_activity_after_drain(
+    store: &dyn LocalStore,
+    interactions: &InteractionRuntime,
+    instance_id: &InstanceId,
+) -> Result<(), NodeError> {
+    let waiting = store.get_instance(instance_id)?.activity
+        == (Knowledge::Known {
+            value: Activity::WaitingInteraction,
+        });
+    if waiting && interactions.list(Some(instance_id), None).await.is_empty() {
+        store.set_instance_state(
+            instance_id,
+            None,
+            Some(Knowledge::Known {
+                value: Activity::Idle,
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn update_message(
@@ -622,8 +753,10 @@ fn interrupt_pending(
     pending: &mut VecDeque<PendingPrompt>,
     reason: &str,
     prompts: &crate::prompt_correlation::PromptCorrelator,
+    fences: &crate::fence::NodeFences,
 ) -> Result<(), NodeError> {
     while let Some(mut prompt) = pending.pop_front() {
+        fences.held.release(&prompt.command_id);
         update_message(store, instance_id, &mut prompt, ContentStatus::Interrupted)?;
         // The prompt was never written, so later hook/transcript evidence for
         // this text belongs to whatever produced it, not this command.

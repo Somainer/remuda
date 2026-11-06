@@ -266,6 +266,17 @@ Interpretations the implementation made, for reviewers and later tasks:
 - **OA3** applies to questions and plan reviews only; an elicitation keeps the D-051(b) bypass exclusion, and approvals never route.
 - **Not covered here.** A continuation successor (§5) of an Agent-created chapter carries no creator stamp, so the Node refuses a control-off successor launch (fail closed); re-admitting a successor's mode belongs with `ma-restart` and `ap-resume`. A permission-mode change by `instance.configure` stays outside Agent reach until `ap-configure-mode`.
 
+### 4.2.2 Own queued commands and runtime-config generations (cb-command-queue, 2026-11-05)
+
+A seat that queues work for a worker whose host is offline, or whose worker is busy, must be able to take it back before it runs. The rules are a D-055 amendment (decisions.md D-055, 2026-11-05 note); the wire is protocol.md §8.5.
+
+- **"Own" is the Hub-stamped initiator (§7.1), nothing else.** An Agent sees and acts only on commands whose initiator is its own instance or its own lineage, so a successor chapter can manage what its predecessor queued. A Human or Bot device sees the commands it queued itself; the Hub records the queuing device on the row and never returns it. The unnarrowed owner may list and withdraw every queued command in scope, but edits only its own: a command another caller queued is never editable by you. Hub-written input (`origin: hub`) belongs to no caller and is not listed. Another caller's command is a 404, so an Agent never edits a Human's command or another Agent's.
+- **Authority does not change.** Editing or withdrawing re-checks that the target is one the caller may command today, with the send rule (`owns()`, or inside an explicitly narrowed scope). Withdrawing cannot reach anything the caller could not have sent to.
+- **"Queued" means "not yet delivered".** A Hub row with `forwarded = 0`, or a prompt a PTY carrier's Node holds for a busy instance (`command.withdraw` / `command.edit`, a first-wins claim against delivery). Anything else answers 409 `already-delivered` with `next`.
+- **`ap-configure` lands here.** `authorize_command` now admits `instance.configure` from Agent origin for model, effort and ultracode on owned targets, without an approval, because Main and the owner can only avoid overwriting each other if both can write. A payload that changes `permissionMode` is still operator-only, until `ap-configure-mode`.
+- **Generations.** The runtime-config generation is the instance's `configureSeq`. `GET /v1/instances/{id}/config` returns the values, the generation and the pending changes; a configure carrying `expectedGeneration` that no longer matches gets 409 with the current generation and values. A configure that can only take effect at a turn boundary says so with `deferred: {boundary}`, `next-turn` or `next-chapter`.
+- **Audit.** Edits, withdrawals and generation conflicts are audit rows carrying the caller's device and initiator; logs and audit carry categories and ids, never prompt text.
+
 ### 4.3 Known limitations (stated, not designed away)
 
 - No OS isolation (D3). The seat's harness has a shell on the devbox and can read whatever its OS user can read there, including the Node's own configuration and any local git credentials. Hub-side checks bound Hub-mediated actions only.
@@ -786,7 +797,7 @@ A woken seat reads one bounded projection per worker instead of a whole journal.
   - the latest turn result;
   - the head and tail of the last assistant text;
   - the pending interaction: kind, question, the tool awaiting approval, and a bounded summary of its arguments quoted as untrusted data;
-  - the requested and effective model and effort, and the pending state and requestId of `instance.configure`;
+  - the requested and effective model and effort, the runtime-config generation (`model.generation`), and the pending state, requestId and deferral boundary of `instance.configure` (cb-command-queue: the state is `queued`, `accepted` or `deferred`, and a deferred change names its boundary, `next-turn` or `next-chapter`);
   - the cooling-down supply window and its `resetsAt`;
   - the number of queued commands;
   - task, branch and sha;
@@ -1200,6 +1211,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
   - `resume_on_reset` and its per-instance `resume_trackers` [`cb-usage-resume`].
   - `owner notify` claim rows, unique per dedupe key [`cb-owner-notify`].
 - Hub columns: instances `auto_continue` [`cb-usage-resume`]; memory write references (instance, turn) [`cb-memory-ui`].
+- Hub columns: commands `revision`, `original_payload_json`, `queued_by_device_id` (Hub-only), `withdrawn_by_json`, `config_prior_json`, `config_deferred`, `config_deferred_resolved_at` [`cb-command-queue`].
 - Task and dispatch documents gain `requestedBy` inside the existing `doc_json`, with a serde default and no migration: a reference only, `{commandId}` for an owner-origin root turn and `{origin}` for any other [`cb-requested-by`]. The same record rides the approval card the request opened. The owner's words are never stored outside the Hub's command row: a Human read of the approval card source, the board and a task detail is hydrated with a read-time `excerpt` (one line, at most 280 chars, secret-scrubbed) from that row, and every Agent or Bot read, on any route, gets the reference alone. It is never a gate.
 - Project policy gains an optional `stallToolThresholdMins` (unset by default: no stall fact while a tool call is in flight) and the 24-hour fact cap (default 6) [`cb-stall-tooluse`, `cb-inbox-facts`].
 - On the Node: nothing for memory, digest or glance. `check` runs keep their exit code and a bounded stdout [`cb-wake-check`].
@@ -1212,6 +1224,7 @@ Additive, like the Phase 1 budget. Each item lands with the task named in bracke
 - `rootTurn {commandId, origin, continuation}` on the initiator, journal rows, audit rows and gate jobs. It is derived by the Hub, never read from a request body, and read by no admission rule [`cb-rootturn`, after `ma-initiator`].
 - `autoContinue` on dispatch and create, and the owner's `PATCH /v1/instances/{id}` [`cb-usage-resume`].
 - `remuda wake …` routes and `/healthz` tick fields [`cb-wake-engine`]; `remuda owner notify` [`cb-owner-notify`].
+- `GET /v1/commands?mine=1&state=queued`, `PATCH /v1/commands/{id}`, `POST /v1/commands/{id}/withdraw` and `GET /v1/instances/{id}/config`; settlement outcome `withdrawn`; `expectedGeneration` and `deferred` on `instance.configure`; digest `model.generation`; Node methods `command.withdraw` and `command.edit` behind hello `capabilities.heldInput` [`cb-command-queue`].
 
 New frames and bodies are documented in protocol.md inside `~~~text` fences (§8.4, §9.1), for the same reason as above.
 
@@ -1428,7 +1441,7 @@ Each closes Gap rows of the capability ledger ([agent-parity.md](./agent-parity.
 | `ap-command-read` | admit `GET /v1/instances/{id}/commands` and `GET /v1/instances/{id}/commands/{commandId}` for owned targets, by listing the `/commands` suffixes in the middleware's `read_target` (today it lists only `/journal` and `/screen`); the handlers already call `require_instance_read`. This is what D-055 reconciliation by commandId needs, and what `cb-errors`' `read-then-decide` hint points at | none |
 | `ap-gate-reads` | admit `GET /v1/gate/jobs` (already filtered to the caller's scope) and `GET /v1/gate/logs/{id}` (checked against the job's project scope) for Agent origin. A seat that gates needs the failure log (§14.1, E2) | none |
 | `ap-agent-list` | make `remuda instance list` and `remuda agents` work for Agent origin: `agents::list` skips the host inventory for an Agent caller, as the CLI's `list_instances` helper in `crates/remuda/src/cmd/instance.rs` already does (or uses `ap-host-read`'s scope-filtered list once it lands), and `--watch` polls `GET /v1/instances` instead of opening the all-instances follow socket | none |
-| `ap-configure` | admit `instance.configure` for model, effort and ultracode on owned targets in `authorize_command`; the permission mode is not included | none |
+| `ap-configure` | admit `instance.configure` for model, effort and ultracode on owned targets in `authorize_command`; the permission mode is not included. Landed with `cb-command-queue` (§4.2.2) | none |
 | `ap-configure-mode` | an owner decision on how OA1 applies to a permission-mode change, then that rule in the Hub and the Node | the owner's decision; `ma-admission` |
 | `ap-resume` | resume an owned instance that is not a worker, under `dispatch` and the same admission as a create (OA1; the D-017 approval for cross-host or shell-driver); the public operator route (D-026) is unchanged | `ma-admission` |
 | `ap-attachments` | Agent upload to `POST /v1/objects`, and reading the attachments of owned targets | none |

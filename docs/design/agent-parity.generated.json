@@ -137,6 +137,12 @@
     },
     {
       "method": "GET",
+      "path": "/v1/commands",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
       "path": "/v1/devices",
       "middleware": "refused",
       "handler": "operator-only"
@@ -254,6 +260,13 @@
       "method": "GET",
       "path": "/v1/instances/{id}/commands/{commandId}",
       "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/instances/{id}/config",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
@@ -510,6 +523,12 @@
     },
     {
       "method": "PATCH",
+      "path": "/v1/commands/{id}",
+      "middleware": "admitted",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "PATCH",
       "path": "/v1/hosts/{id}",
       "middleware": "refused",
       "handler": "handler-checked"
@@ -597,6 +616,12 @@
       "method": "POST",
       "path": "/v1/bot/owner-allowlist",
       "middleware": "refused",
+      "handler": "handler-checked"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/commands/{id}/withdraw",
+      "middleware": "admitted",
       "handler": "handler-checked"
     },
     {
@@ -1011,6 +1036,31 @@
       "hubRoutes": []
     },
     {
+      "path": "cmd",
+      "group": true,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd deliver",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd edit",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd ls",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "cmd withdraw",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
       "path": "dev",
       "group": false,
       "hubRoutes": []
@@ -1147,6 +1197,16 @@
     },
     {
       "path": "instance claim",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance config",
+      "group": false,
+      "hubRoutes": []
+    },
+    {
+      "path": "instance configure",
       "group": false,
       "hubRoutes": []
     },

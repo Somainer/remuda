@@ -334,6 +334,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own commands that are provably undelivered (cb-command-queue)
+         * @description protocol.md §8.5. Own = the Hub-stamped initiator for an Agent (its instance or its lineage) and the queuing device for a Human or Bot; the unnarrowed owner without mine=1 sees every caller's. Hub-written input (origin hub) is never listed. Lists instance.send and instance.configure rows that are Hub-held (queued, never forwarded) or Node-held (an accepted send a PTY carrier's Node holds, on a host that advertised heldInput), newest first, each with revision and held.
+         */
+        get: operations["queuedCommands"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/commands/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Edit an own queued instance.send (text and attachments) under a revision CAS
+         * @description protocol.md §8.5. Keeps the commandId and bumps revision. Only while provably undelivered: a Hub-held row is edited in the Hub's writer; a Node-held prompt through the Node's command.edit. 409 COMMAND_NOT_QUEUED (already-delivered), 409 COMMAND_REVISION_CONFLICT (with the current revision), 400 not-editable for a configure or a Node-held prompt's attachments, 404 for another caller's command.
+         */
+        patch: operations["editQueuedCommand"];
+        trace?: never;
+    };
+    "/v1/commands/{id}/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Withdraw an own undelivered command; it settles withdrawn and is never forwarded
+         * @description protocol.md §8.5. Exactly one of withdraw and forward wins. Withdrawing a queued instance.configure restores the values it set that still hold. Withdrawing a withdrawn command returns the same row.
+         */
+        post: operations["withdrawQueuedCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/devices": {
         parameters: {
             query?: never;
@@ -905,6 +965,26 @@ export interface paths {
             cookie?: never;
         };
         get: operations["instanceCommandStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/instances/{id}/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Runtime config, its generation and the changes not yet in effect
+         * @description protocol.md §8.5. generation is the instance's configureSeq; an instance.configure carrying expectedGeneration that no longer matches answers 409 CONFIG_GENERATION_CONFLICT with this document as config. pending lists queued (never forwarded) and deferred (next-turn or next-chapter) configures. An Agent reads owned instances only.
+         */
+        get: operations["instanceConfig"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2587,10 +2667,33 @@ export interface components {
              */
             origin: "human" | "bot" | "agent";
         };
+        CommandEdit: {
+            attachments?: {
+                [key: string]: unknown;
+            }[];
+            expectedRevision: number | string;
+            text?: string;
+        };
+        CommandEnvelope: {
+            command: components["schemas"]["CommandRecord"];
+        };
         CommandRecord: {
             commandId: string;
             createdAt: string;
+            /** @description A configure that takes effect only at a boundary */
+            deferred?: {
+                /** @enum {string} */
+                boundary: "next-chapter" | "next-turn";
+                resolvedAt?: string;
+            } & {
+                [key: string]: unknown;
+            };
             forwarded: boolean;
+            /**
+             * @description Where an undelivered command waits; only on GET /v1/commands
+             * @enum {string}
+             */
+            held?: "hub" | "node";
             hostId: string;
             idempotencyKey: string | null;
             initiator?: components["schemas"]["Initiator"] | null;
@@ -2601,10 +2704,18 @@ export interface components {
             };
             /** @enum {string} */
             resolution: "clear" | "reconciling" | "unknown";
+            /** @description cb-command-queue: edit revision, 0 until the first edit */
+            revision?: number;
             settlement?: {
                 /** @enum {string} */
-                outcome: "cancelled" | "completed" | "expired" | "rejected" | "withheld";
+                outcome: "cancelled" | "completed" | "expired" | "rejected" | "withdrawn" | "withheld";
                 reason?: string;
+                withdrawnBy?: {
+                    instanceId?: string;
+                    origin: string;
+                } & {
+                    [key: string]: unknown;
+                };
             } & {
                 [key: string]: unknown;
             };
@@ -2625,7 +2736,12 @@ export interface components {
         };
         CommandResult: {
             command: components["schemas"]["CommandRecord"];
+            /** @description cb-command-queue: for instance.configure, the runtime-config generation (configureSeq) its merge produced */
+            generation?: number;
             replayed?: boolean;
+        };
+        CommandWithdraw: {
+            expectedRevision?: number | string;
         };
         Device: {
             id: string;
@@ -3011,6 +3127,37 @@ export interface components {
             commands: components["schemas"]["CommandRecord"][];
             instanceId: string;
         };
+        InstanceConfig: {
+            effective: {
+                effort?: unknown;
+                model?: unknown;
+            } & {
+                [key: string]: unknown;
+            };
+            effort: {
+                [key: string]: unknown;
+            } | null;
+            generation: number;
+            instanceId: string;
+            model: string | null;
+            pending: ({
+                /** @enum {string} */
+                boundary?: "next-chapter" | "next-turn";
+                commandId: string;
+                createdAt: string;
+                effort?: unknown;
+                initiator?: unknown;
+                model?: unknown;
+                permissionMode?: unknown;
+                /** @enum {string} */
+                state: "deferred" | "queued";
+            } & {
+                [key: string]: unknown;
+            })[];
+            permissionMode: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         InstanceCreate: {
             /**
              * @description Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). `auto` probes the proxy host's relayBind and falls back to hub-relay; direct-net is a hard 409 `api-via-unreachable` when no bind is configured.
@@ -3115,6 +3262,8 @@ export interface components {
             readonly autoContinue?: boolean;
             /** @description D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance. */
             readonly chapterCause?: string | null;
+            /** @description cb-command-queue (protocol.md §8.5): the runtime-config generation; each committed instance.configure spec merge (and each restore by a withdrawal) adds one. A configure's expectedGeneration is compared against it. */
+            configureSeq?: number;
             connectivity: string;
             createdAt?: string;
             /**
@@ -4239,6 +4388,9 @@ export interface components {
                 auth: string;
                 p256dh: string;
             };
+        };
+        QueuedCommands: {
+            commands: components["schemas"]["CommandRecord"][];
         };
         /** @description cb-requested-by: who asked for an Agent-created dispatch, task or approval card. Stored as a reference only: an owner-origin root turn records the command that carried the owner's input, any other origin records only that origin. The owner's words are never stored with it. Record only, never a gate. */
         RequestedBy: {
@@ -5625,6 +5777,98 @@ export interface operations {
             403: components["responses"]["Error"];
         };
     };
+    queuedCommands: {
+        parameters: {
+            query?: {
+                /** @description 1 or true: only the caller's own (implied for Agent and Bot callers) */
+                mine?: string;
+                /** @description Only queued is accepted; also the default */
+                state?: "queued";
+                instanceId?: string;
+                /** @description Default 50, at most 200 */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Queued commands */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueuedCommands"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    editQueuedCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CommandEdit"];
+            };
+        };
+        responses: {
+            /** @description The edited command */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandEnvelope"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    withdrawQueuedCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CommandWithdraw"];
+            };
+        };
+        responses: {
+            /** @description The withdrawn command */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandEnvelope"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
     deviceList: {
         parameters: {
             query?: never;
@@ -6870,6 +7114,31 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CommandRecord"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    instanceConfig: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Runtime config */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceConfig"];
                 };
             };
             401: components["responses"]["Error"];

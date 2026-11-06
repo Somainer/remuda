@@ -1,6 +1,6 @@
 # Agent/user capability ledger: the human half
 
-> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
+> Status: proposed with ADR D-060 (2026-10-29), decision 12. Rows closed by `ma-admission` (D-057 §4.2 items 1-6, 2026-11-01) were moved from Gap to the Today column, which for them describes the branch that landed it. Likewise for `cb-command-queue` (2026-11-05): `ap-configure` and the queued-command rows. Derived from origin/main: one row per PWA action (the routes in `web/src/app/router.tsx`, and the Hub calls their pages make through `web/src/lib/api.ts`, `web/src/lib/store.ts` and the feature modules) and one row per clap subcommand (`crates/remuda/src/cmd/`). The Agent side is read from the Hub's route filter `restrict_agent_routes` (`crates/remuda-hub/src/agent_scope.rs`) and each handler. Every Hub route (158 method-and-path pairs as generated below) and every clap path (124, of which 101 are leaves and 23 pure command groups) maps to a row, to "Hub routes no human action calls", or to "Not agent actions"; the per-PWA-action coverage of `web/src/lib/api.ts` was checked at `c27e0eac`. The machine half is `docs/design/agent-parity.generated.json`, and `crates/remuda/tests/agent_parity.rs` fails when the two halves drift.
 
 ## The two halves
 
@@ -92,10 +92,13 @@ Two limits recur below:
 | Close the session | commands, `instance.close` | Agent route. As Stop. A chapter closing itself becomes `paused{self}`; pausing Main is the owner's control (main-agent.md §6.5) | — |
 | Answer a question or a plan review inline | `POST /v1/interactions/{id}/answer` | Agent route. Under the D-051 limits | — |
 | Answer an approval inline | `POST /v1/interactions/{id}/answer` | Safety. Approvals are answered only by humans (D-017, D-051(a)) | — |
-| Change the model | commands, `instance.configure` | Gap. `authorize_command` admits only send, cancel, close, `tty.write` and keys for Agent origin | `ap-configure` |
-| Change the effort | commands, `instance.configure` | Gap. As above | `ap-configure` |
-| Toggle ultracode, independently of effort (D-056; `onUltracode` in `web/src/pages/SessionPage.tsx`) | commands, `instance.configure` | Gap. As above | `ap-configure` |
-| Change the permission mode | commands, `instance.configure` | Gap. As above | `ap-configure-mode`, after an owner decision on how OA1 applies to a mode change |
+| Change the model | commands, `instance.configure`; `GET /v1/instances/{id}/config` for the generation | Agent route. Owned targets (`owns()`), no approval; `expectedGeneration` makes a stale write a 409 instead of an overwrite (cb-command-queue closed `ap-configure`) | — |
+| Change the effort | commands, `instance.configure` | Agent route. As "Change the model"; a change that waits for a turn boundary answers `deferred` | — |
+| Toggle ultracode, independently of effort (D-056; `onUltracode` in `web/src/pages/SessionPage.tsx`) | commands, `instance.configure` | Agent route. As "Change the model" | — |
+| Change the permission mode | commands, `instance.configure` | Gap. A configure that carries `permissionMode` stays operator-only for Agent origin (`authorize_command`) | `ap-configure-mode`, after an owner decision on how OA1 applies to a mode change |
+| See your queued sends (「排队中」) | `GET /v1/commands?mine=1&state=queued` | Agent route. Only commands whose Hub-stamped initiator is the caller's instance or lineage (protocol.md §8.5) | — |
+| Edit a queued send | `PATCH /v1/commands/{id}` | Agent route. Own commands only, while provably undelivered; the target must still pass the send rule | — |
+| Withdraw a queued send | `POST /v1/commands/{id}/withdraw` | Agent route. As "Edit a queued send" | — |
 | Turn auto-continue on or off for a session | `PATCH /v1/instances/{id}` | Safety. Act only on what you own: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device only, and an agent turns it on for its own children when it dispatches them | — |
 | Attach a file | `POST /v1/objects` | Gap. Operator-only (`upload` in `crates/remuda-hub/src/objects.rs`) | `ap-attachments` |
 | Open an attachment | `GET /v1/objects/{id}` | Gap. Operator-only for devices; an agent reads only its own session's attachments, through `GET /v1/attachments/{objectId}/content` (D-028) | `ap-attachments` (owned targets) |
@@ -219,11 +222,22 @@ The page's create form is not wired to the Hub yet (`web/src/features/fleet/stor
 | `instance keys` | commands, `instance.keys` | Safety. Keystrokes | — |
 | `instance stop` | commands, `instance.cancel` or `instance.close` | Agent route. Owned targets; any other needs the D-017 approval | — |
 | `instance rm` | commands, `instance.close` | Agent route. As `instance stop` | — |
+| `instance configure` | commands, `instance.configure` | Agent route. Owned targets: `--model`, `--effort`, `--ultracode` and `--expected-generation`; `--permission-mode` is operator-only for Agent origin | — |
+| `instance config` | `GET /v1/instances/{id}/config` | Agent route. Owned targets | — |
 | `instance set` | `PATCH /v1/instances/{id}` | Safety. Owner-only: auto-continue makes the Hub send input to a session after a subscription reset (D-060 R3); the handler takes a Human device, and an agent asks for it on the children it dispatches | — |
 | `instance claim` | `POST /v1/instances/claim` | Safety. As "Claim a herdr pane as an instance": a Human operator only (D-062) | — |
 | `instance release` | `POST /v1/instances/{id}/release` | Safety. As "Release a claimed pane": a Human operator only (D-062) | — |
 | `lineage profile show` | `GET /v1/lineages/{id}/profile` (and `GET /v1/caller` when the lineage is omitted) | Agent route. The caller's own lineage, as the PWA read | — |
 | `lineage profile set` | `GET`, then `PUT /v1/lineages/{id}/profile` | Safety. As the PWA edit: only an unnarrowed Human | — |
+
+### Queued commands: `remuda cmd`
+
+| Subcommand | Hub route | Today (origin/main) | Planned |
+|---|---|---|---|
+| `cmd ls` | `GET /v1/commands?mine=1&state=queued` | Agent route. The caller's own queued commands (Hub-stamped initiator) | — |
+| `cmd edit` | `PATCH /v1/commands/{id}` | Agent route. Own `instance.send` commands while provably undelivered; the send rule on the target | — |
+| `cmd withdraw` | `POST /v1/commands/{id}/withdraw` | Agent route. As `cmd edit`; a queued configure is withdrawn, then resent under a new commandId | — |
+| `cmd deliver` | commands, `instance.send`: the D-055 same-id re-POST of a Hub-held send | Agent route. The send rule; the Hub forwards a still-queued row once, with its edited text | — |
 
 ### Projects, tasks and ownership
 
@@ -396,7 +410,6 @@ Every Gap row above, by the task that closes it. The `ap-*` tasks are defined in
 | `ap-command-read` | a send's receipt, `instance send`'s follow-up read, and every command read (`GET /v1/instances/{id}/commands`, `GET /v1/instances/{id}/commands/{commandId}`) |
 | `ap-gate-reads` | `gate log`; `gate list` without `--project`; the gate parts of `watch` and `report`; the failure log of `gate <branch>` |
 | `ap-agent-list` | `instance list` and `agents`, including `--watch` |
-| `ap-configure` | model, effort and ultracode changes |
 | `ap-configure-mode` | permission-mode changes, after the owner decides how OA1 applies |
 | `ap-resume` | resuming an owned instance that is not a worker |
 | `ap-attachments` | attaching a file; opening an attachment of an owned session |

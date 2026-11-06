@@ -74,6 +74,12 @@ export type Instance = EntityMeta & {
   resumedFrom?: Id | null;
   journalId: Id;
   durableSeq: U64;
+  /**
+   * cb-command-queue: the runtime-config generation (Hub `configureSeq`),
+   * bumped by every committed configure; a configure names it as
+   * `expectedGeneration` so a stale write is a 409, not an overwrite.
+   */
+  configureSeq?: number;
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;
   lastError?: string | null;
   /**

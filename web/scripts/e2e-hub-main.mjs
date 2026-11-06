@@ -10,7 +10,7 @@
  *  - `main`: HUB_E2E_MAIN_UI=1 seats Main; REMUDA_DELEGATED_DECISIONS=1 and
  *    HUB_E2E_LINEAGE_FENCE=1 are for routed-to's D-051 switch and the fake
  *    Node that dispatches for an Agent.
- *  - `fake-node`: HUB_E2E_FAKE_NODE=1 for ux-permmode; `effort-sentinels`
+ *  - `fake-node`: HUB_E2E_FAKE_NODE=1 for ux-permmode and cmd-queue; `effort-sentinels`
  *    runs only effort-sync's sentinel describe (its other cases already run
  *    in the main pass), with the same flag.
  *  - `task-bind`, `project-switcher`, `dir-picker`, `cardsettle`, `api-route`:
@@ -53,7 +53,7 @@ export const GROUPS = [
   },
   {
     name: "fake-node",
-    specs: ["tests/e2e/ux-permmode.hub.spec.ts"],
+    specs: ["tests/e2e/ux-permmode.hub.spec.ts", "tests/e2e/cmd-queue.hub.spec.ts"],
     env: { HUB_E2E_FAKE_NODE: "1" },
   },
   {

@@ -872,7 +872,10 @@ pub(crate) async fn list_instances(client: &HubClient, host: Option<&str>) -> Re
     Ok(json!({ "items": projected, "nextCursor": null }))
 }
 
-async fn list_instance_items(client: &HubClient, host: Option<&str>) -> Result<Vec<Value>> {
+pub(crate) async fn list_instance_items(
+    client: &HubClient,
+    host: Option<&str>,
+) -> Result<Vec<Value>> {
     let caller = client.caller_context().await?;
     if caller.origin == remuda_hub_client::CallerOrigin::Agent {
         let mut items = Vec::new();

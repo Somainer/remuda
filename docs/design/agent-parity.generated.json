@@ -79,7 +79,7 @@
       "method": "DELETE",
       "path": "/v1/tasks/{id}/own",
       "middleware": "admitted",
-      "handler": "grant: dispatch"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "GET",
@@ -162,13 +162,13 @@
     {
       "method": "GET",
       "path": "/v1/gate/jobs",
-      "middleware": "refused",
+      "middleware": "admitted",
       "handler": "scope"
     },
     {
       "method": "GET",
       "path": "/v1/gate/logs/{id}",
-      "middleware": "refused",
+      "middleware": "admitted",
       "handler": "scope"
     },
     {
@@ -253,13 +253,15 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/commands",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
       "method": "GET",
       "path": "/v1/instances/{id}/commands/{commandId}",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
@@ -279,7 +281,8 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/memory-writes",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
@@ -292,7 +295,8 @@
     {
       "method": "GET",
       "path": "/v1/instances/{id}/subagents/{agentId}/transcript",
-      "middleware": "refused",
+      "middleware": "owner-scoped",
+      "owned": "instance",
       "handler": "handler-checked"
     },
     {
@@ -895,7 +899,7 @@
       "method": "POST",
       "path": "/v1/tasks/{id}/own",
       "middleware": "admitted",
-      "handler": "grant: dispatch"
+      "handler": "grant: dispatch; scope"
     },
     {
       "method": "POST",

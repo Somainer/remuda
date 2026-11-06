@@ -248,6 +248,19 @@ async fn require_project_scope(
     Ok((device, scope))
 }
 
+/// The store refusal an ownership mutation returns for a task outside the
+/// caller's project scope; [`map_own`] answers it as the cb-errors 403.
+const OWN_OUT_OF_SCOPE: &str = "own: task project outside scope";
+
+/// Map an ownership mutation's store error: the scope refusal becomes
+/// `out-of-scope` with its reason and next step (ap-own-scope).
+fn map_own(error: StoreError) -> HubError {
+    match &error {
+        StoreError::Forbidden(message) if message == OWN_OUT_OF_SCOPE => HubError::out_of_scope(),
+        _ => map_store(error),
+    }
+}
+
 // ─── Task CRUD ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1073,7 +1086,8 @@ async fn land_task(
 
 // ─── Path ownership ────────────────────────────────────────────────────────
 
-/// `POST /v1/tasks/{id}/own` — `remuda own claim`.
+/// `POST /v1/tasks/{id}/own` — `remuda own claim`. Like every task mutation,
+/// the task must be in the caller's project scope (ap-own-scope).
 async fn claim_own(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1081,6 +1095,7 @@ async fn claim_own(
     Json(body): Json<ClaimBody>,
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
+    let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let patterns = normalize_globs(body.paths.clone());
     if patterns.is_empty() {
@@ -1095,6 +1110,9 @@ async fn claim_own(
         .mutate_task(
             id.clone(),
             move |task, conn| {
+                if !scope.allows_project(task.project_id.as_id().as_str()) {
+                    return Err(StoreError::Forbidden(OWN_OUT_OF_SCOPE.into()));
+                }
                 if task.state.is_terminal() {
                     return Err(StoreError::Conflict(
                         "terminal tasks cannot claim paths".into(),
@@ -1150,7 +1168,7 @@ async fn claim_own(
             authority,
         )
         .await
-        .map_err(map_store)?
+        .map_err(map_own)?
         .ok_or(HubError::NotFound)?;
     state
         .store
@@ -1167,7 +1185,8 @@ async fn claim_own(
     ))
 }
 
-/// `DELETE /v1/tasks/{id}/own` — `remuda own release`.
+/// `DELETE /v1/tasks/{id}/own` — `remuda own release`, in the caller's project
+/// scope like `own claim`.
 async fn release_own(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1175,6 +1194,7 @@ async fn release_own(
     Json(body): Json<ClaimBody>,
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
+    let (_, scope) = require_project_scope(&state, &headers).await?;
     let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let patterns = normalize_globs(body.paths.clone());
     let audit_paths = patterns.clone();
@@ -1183,6 +1203,9 @@ async fn release_own(
         .mutate_task(
             id.clone(),
             move |task, conn| {
+                if !scope.allows_project(task.project_id.as_id().as_str()) {
+                    return Err(StoreError::Forbidden(OWN_OUT_OF_SCOPE.into()));
+                }
                 if patterns.is_empty() {
                     release_all_claims(conn, &task.meta.id.as_id().to_string())?;
                     task.owns.clear();
@@ -1200,7 +1223,7 @@ async fn release_own(
             authority,
         )
         .await
-        .map_err(map_store)?
+        .map_err(map_own)?
         .ok_or(HubError::NotFound)?;
     state
         .store

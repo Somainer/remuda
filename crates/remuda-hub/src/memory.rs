@@ -2251,9 +2251,10 @@ pub fn routes() -> Router<AppState> {
             post(import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
         )
         .route("/v1/memory/derived", get(derived))
-        // The transcript's write rows: one writer chapter's log, Human/Bot
-        // callers only. Deliberately absent from `restrict_agent_routes`, so
-        // an Agent credential is refused before the handler.
+        // The transcript's write rows: one writer chapter's log. Human/Bot
+        // callers read any chapter; the middleware admits an Agent for an
+        // instance it owns, and the handler narrows that to the chapters of
+        // its own lineage (ap-memory-writes).
         .route("/v1/instances/{id}/memory-writes", get(memory_writes))
 }
 
@@ -2632,9 +2633,11 @@ struct MemoryWritesQuery {
 /// memory write log. Without `afterId` the page is the newest rows; with it,
 /// the rows after that row id. Rows are oldest first within the page.
 ///
-/// Human and Bot callers only. The agent-route middleware refuses an Agent
-/// credential (this path is on no agent allowlist), and the handler re-checks,
-/// because memory belongs to the owner and the seat (D-060).
+/// Human and Bot callers read any chapter's rows. An Agent (ap-memory-writes)
+/// reads the rows of a chapter of its own lineage, the same scope as the
+/// entries it reads: the middleware admits an instance the Agent owns, and
+/// this handler narrows that to its own lineage, because a worker's memory is
+/// the worker's seat's, not its creator's (D-060).
 async fn memory_writes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2643,8 +2646,18 @@ async fn memory_writes(
 ) -> Result<Json<MemoryWritePage>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
-    if origin(&device) == InputOrigin::Agent {
-        return Err(HubError::Forbidden);
+    if origin(&device) == InputOrigin::Agent
+        && !crate::agent_scope::is_own_chapter(&state, &device, &instance_id).await?
+    {
+        return Err(HubError::Forbidden.with_next(
+            "not-owner",
+            NextStep::new(
+                action::ASK_OWNER,
+                "memory write receipts are readable only for a chapter of your own lineage; \
+                 another session's memory is its own. Do not retry: read the session's \
+                 journal instead, or ask the owner",
+            ),
+        ));
     }
     if state
         .store

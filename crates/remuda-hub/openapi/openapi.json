@@ -237,6 +237,236 @@
         ],
         "type": "object"
       },
+      "BotCardTicketRequest": {
+        "type": "object",
+        "description": "A Feishu card ↔ interaction ticket, persisted so a dispatcher restart keeps open cards answerable.",
+        "properties": {
+          "ticketId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "interactionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instanceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sessionKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "cardMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "open",
+              "answered",
+              "expired"
+            ],
+            "description": "Defaults to `open`."
+          },
+          "requestVersion": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "processGeneration": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "requestJson": {
+            "type": "string",
+            "minLength": 1
+          },
+          "createdAtMs": {
+            "type": "integer"
+          },
+          "expiresAtMs": {
+            "type": "integer",
+            "description": "Must be after `createdAtMs`."
+          }
+        },
+        "required": [
+          "ticketId",
+          "interactionId",
+          "instanceId",
+          "sessionKey",
+          "requestVersion",
+          "processGeneration",
+          "requestJson",
+          "createdAtMs",
+          "expiresAtMs"
+        ]
+      },
+      "BotCardTicket": {
+        "type": "object",
+        "properties": {
+          "ticketId": {
+            "type": "string"
+          },
+          "interactionId": {
+            "type": "string"
+          },
+          "instanceId": {
+            "type": "string"
+          },
+          "sessionKey": {
+            "type": "string"
+          },
+          "cardMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "requestVersion": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "processGeneration": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "requestJson": {
+            "type": "string"
+          },
+          "createdAtMs": {
+            "type": "integer"
+          },
+          "expiresAtMs": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ticketId",
+          "interactionId",
+          "instanceId",
+          "sessionKey",
+          "cardMessageId",
+          "state",
+          "requestVersion",
+          "processGeneration",
+          "requestJson",
+          "createdAtMs",
+          "expiresAtMs"
+        ]
+      },
+      "BotCardTicketPage": {
+        "type": "object",
+        "properties": {
+          "tickets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BotCardTicket"
+            }
+          }
+        },
+        "required": [
+          "tickets"
+        ]
+      },
+      "BotCardTicketStateRequest": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "open",
+              "answered",
+              "expired"
+            ]
+          },
+          "cardMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "BotExpireSessionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionKey": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionKey"
+        ]
+      },
+      "BotExpiredTickets": {
+        "type": "object",
+        "properties": {
+          "expiredTicketIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "expiredTicketIds"
+        ]
+      },
+      "BotOk": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "BotOwnerAllowlistRequest": {
+        "type": "object",
+        "properties": {
+          "ownerOpenIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Feishu `open_id`s the dispatcher may answer on behalf of."
+          }
+        },
+        "required": [
+          "ownerOpenIds"
+        ]
+      },
+      "BotOwnerAllowlist": {
+        "type": "object",
+        "properties": {
+          "deviceId": {
+            "type": "string"
+          },
+          "ownerOpenIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "deviceId",
+          "ownerOpenIds"
+        ]
+      },
       "CallerContext": {
         "properties": {
           "children": {
@@ -8635,6 +8865,212 @@
         ]
       }
     },
+    "/v1/bot/card-tickets": {
+      "get": {
+        "operationId": "botCardTicketList",
+        "summary": "Open card tickets for dispatcher restart hydration",
+        "tags": [
+          "bot"
+        ],
+        "description": "Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Lists this bot device's open tickets that are not yet due at `nowMs`.",
+        "parameters": [
+          {
+            "name": "nowMs",
+            "in": "query",
+            "required": false,
+            "description": "Hydration cursor (unix ms); tickets due by then are excluded. Defaults to the Hub's clock.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Open tickets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotCardTicketPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "botCardTicketUpsert",
+        "summary": "Upsert one card ticket, stamped with the bot device",
+        "tags": [
+          "bot"
+        ],
+        "description": "Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. A blank id, session key or request, or `expiresAtMs` not after `createdAtMs`, is a 400.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotCardTicketRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotCardTicket"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/bot/card-tickets/expire-session": {
+      "post": {
+        "operationId": "botCardTicketsExpireSession",
+        "summary": "Expire every open ticket of one chat session (`/new`, `/stop`)",
+        "tags": [
+          "bot"
+        ],
+        "description": "Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotExpireSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Expired ticket ids",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotExpiredTickets"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/bot/card-tickets/{id}/state": {
+      "post": {
+        "operationId": "botCardTicketSetState",
+        "summary": "Set a card ticket's state",
+        "tags": [
+          "bot"
+        ],
+        "description": "Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Only this bot device's ticket is changed.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotCardTicketStateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotOk"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/bot/owner-allowlist": {
+      "post": {
+        "operationId": "botOwnerAllowlistSet",
+        "summary": "Replace the owner open_id allowlist the dispatcher relays for",
+        "tags": [
+          "bot"
+        ],
+        "description": "Bot only: a Human or an Agent credential is refused with 403. The Feishu dispatcher's internal surface; the web client never calls it. Replaces the previous list; ids are sorted and deduplicated. An empty list is allowed and fails closed: every relayed answer is then refused. A blank id is a 400.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotOwnerAllowlistRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored allowlist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotOwnerAllowlist"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/caller": {
       "get": {
         "operationId": "callerGet",
@@ -16161,6 +16597,10 @@
     {
       "name": "owner",
       "description": "The owner's notices: `remuda owner notify` and the 「告诉你」 cards (D-060 §11.5)."
+    },
+    {
+      "name": "bot",
+      "description": "The Feishu dispatcher's Bot-only surface (design §5.1): owner allowlist and card tickets."
     },
     {
       "name": "search",

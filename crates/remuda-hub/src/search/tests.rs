@@ -1305,6 +1305,46 @@ async fn a_straddling_node_is_rebuilt_once_per_batch() {
     );
 }
 
+/// r3 item 3: a delta that does not re-render leaves the FTS row alone.
+#[tokio::test]
+async fn a_delta_that_does_not_rerender_leaves_the_fts_row_alone() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    let db = fx.db();
+    db.execute_batch(
+        "CREATE TEMP TABLE text_writes (n INTEGER);
+         CREATE TEMP TRIGGER count_text_writes AFTER UPDATE OF text ON journal_search_docs
+         BEGIN INSERT INTO text_writes VALUES (1); END;",
+    )
+    .unwrap();
+    let writes = || -> i64 {
+        db.query_row("SELECT COUNT(*) FROM text_writes", [], |row| row.get(0))
+            .unwrap()
+    };
+    let at = "2026-11-01T00:00:00.000Z";
+    let mut seq = 0;
+    let mut put = |event: Value| {
+        seq += 1;
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ins, seq, format!("evt-{seq}"), event.to_string(), at],
+        )
+        .unwrap();
+        index_event(&db, &ins, seq, &event, at).unwrap();
+    };
+    put(streamed("m1", "open", &"a ".repeat(4200)));
+    let before = writes();
+    // Past 8 KiB, 100 small deltas stay under the 1 KiB step: no text write.
+    for _ in 0..100 {
+        put(streamed("m1", "append", "b "));
+    }
+    assert_eq!(writes(), before);
+    // Crossing the step re-renders once.
+    put(streamed("m1", "append", &"c ".repeat(600)));
+    assert_eq!(writes(), before + 1);
+}
+
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;

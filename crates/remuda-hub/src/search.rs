@@ -776,7 +776,7 @@ fn index_row(
                 conn.execute(
                     "UPDATE journal_search_docs
                         SET seq = ?2, observed_at = ?3, role = ?4, block = ?5, head = ?6,
-                            raw = ?7, indexed_len = ?8, pending = ?9, text = ?10
+                            raw = ?7, indexed_len = ?8, pending = ?9
                       WHERE id = ?1",
                     params![
                         id,
@@ -787,10 +787,17 @@ fn index_row(
                         doc.head,
                         doc.raw,
                         doc.indexed_len as i64,
-                        doc.pending(),
-                        doc.text
+                        doc.pending()
                     ],
                 )?;
+                // Only a changed text touches the FTS row (its trigger fires
+                // on any UPDATE that names the column).
+                if doc.text != held.text {
+                    conn.execute(
+                        "UPDATE journal_search_docs SET text = ?2 WHERE id = ?1",
+                        params![id, doc.text],
+                    )?;
+                }
             }
             Step::New(doc) => insert_doc(conn, instance_id, kind, &piece.node_id, &doc)?,
         },

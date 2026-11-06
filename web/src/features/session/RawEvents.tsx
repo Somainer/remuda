@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { EarlierWindow } from "../../lib/journal";
 import type { Observation, ObservationKind } from "../../types/generated";
 import { jsonPreview } from "../../lib/format";
 import ui from "../../styles/ui.module.css";
@@ -23,19 +24,64 @@ const KINDS: ObservationKind[] = [
 
 const ROW = 56;
 
+/** Older windows the tab pages through to reach a focused seq (2000 rows each). */
+export const FOCUS_MAX_EARLIER_PAGES = 50;
+
+type Paging = { seq: string; pages: number; exhausted: boolean };
+
 /**
  * The raw journal rows. `focusSeq` (cb-search: a record-search hit opens
  * `/s/:id/events?seq=N`) scrolls to that row and opens its envelope once,
- * when it is loaded; a seq older than the loaded window is named instead.
+ * when it is loaded. A seq below the loaded window is paged to with
+ * `loadEarlier`, one window at a time and at most
+ * {@link FOCUS_MAX_EARLIER_PAGES} windows; the row is named as missing only
+ * once that is exhausted.
  */
-export function RawEvents({ events, focusSeq }: { events: Observation[]; focusSeq?: string }) {
+export function RawEvents({
+  events,
+  focusSeq,
+  loadEarlier,
+}: {
+  events: Observation[];
+  focusSeq?: string;
+  loadEarlier?: () => Promise<EarlierWindow | null>;
+}) {
   const [kind, setKind] = useState<ObservationKind | "">("");
   const [open, setOpen] = useState<string | null>(null);
   const [scroll, setScroll] = useState(0);
+  const [paging, setPaging] = useState<Paging | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const focused = useRef<string | null>(null);
+  const inFlight = useRef(false);
   const filtered = useMemo(() => (kind ? events.filter((e) => e.kind === kind) : events), [events, kind]);
   const focusIndex = focusSeq ? filtered.findIndex((e) => String(e.seq) === focusSeq) : -1;
+  const lowest = useMemo(
+    () => (events.length > 0 ? events.reduce((min, e) => Math.min(min, Number(e.seq)), Infinity) : null),
+    [events],
+  );
+  const loaded = focusSeq ? events.some((e) => String(e.seq) === focusSeq) : false;
+  const current: Paging =
+    paging && paging.seq === focusSeq ? paging : { seq: focusSeq ?? "", pages: 0, exhausted: false };
+  // Paging only helps a row below the lowest one loaded.
+  const below = !!focusSeq && !loaded && lowest !== null && Number(focusSeq) < lowest;
+  const pagingOn = below && !!loadEarlier && !current.exhausted;
+
+  useEffect(() => {
+    if (!pagingOn || !loadEarlier || !focusSeq || inFlight.current) return;
+    inFlight.current = true;
+    const seq = focusSeq;
+    const done = (pages: number, exhausted: boolean) => {
+      inFlight.current = false;
+      setPaging({ seq, pages, exhausted });
+    };
+    loadEarlier().then(
+      (result) => {
+        const pages = current.pages + 1;
+        done(pages, !result || result.end || pages >= FOCUS_MAX_EARLIER_PAGES);
+      },
+      () => done(current.pages + 1, true),
+    );
+  }, [pagingOn, loadEarlier, focusSeq, current.pages, lowest]);
 
   useEffect(() => {
     if (!focusSeq || focusIndex < 0 || focused.current === focusSeq) return;
@@ -53,10 +99,16 @@ export function RawEvents({ events, focusSeq }: { events: Observation[]; focusSe
   return (
     <div data-testid="raw-events" style={{ padding: 12, display: "flex", flexDirection: "column", minHeight: 0, flex: 1 }}>
       <p className={ui.listMeta}>原始事件 · {filtered.length}</p>
-      {focusSeq && focusIndex < 0 && events.length > 0 && kind === "" ? (
-        <p className={ui.listMeta} data-testid="raw-events-focus-missing">
-          seq {focusSeq} 不在已加载的记录里。
-        </p>
+      {focusSeq && !loaded && events.length > 0 && kind === "" ? (
+        pagingOn ? (
+          <p className={ui.listMeta} data-testid="raw-events-focus-paging">
+            正在加载更早的记录，查找 seq {focusSeq}…
+          </p>
+        ) : (
+          <p className={ui.listMeta} data-testid="raw-events-focus-missing">
+            seq {focusSeq} 不在已加载的记录里。
+          </p>
+        )
       ) : null}
       <div className={ui.row} style={{ margin: "8px 0", flexWrap: "wrap" }}>
         <button className={`${ui.chip} ${kind === "" ? ui.chipOn : ""}`} onClick={() => setKind("")}>

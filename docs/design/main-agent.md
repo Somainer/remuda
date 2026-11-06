@@ -1125,7 +1125,7 @@ Memory holds what the seat chose to keep. Journal search finds what was actually
 - **Query.** FTS5 bm25 with memory's quoting (user text never becomes FTS syntax), then a `LIKE` pass for CJK and short terms; at most 50 hits, snippets of at most 200 characters, a 1.5 s budget (`partial: true` past it).
 - **Retention.** A trigger on `journal` deletes a row's record and every document whose row range includes it, in the same transaction as the row, so deleting or purging an instance removes its hits. `scripts/hub-backup.sh` copies `hub.sqlite` whole, so a backup carries the index and its high-water mark and a restore needs no rebuild.
 - **Logs** carry counts and timings only, never the query or a snippet.
-- **PWA.** While the desktop session list's filter has text, a 「会话记录」 card offers to search the same words inside the journals, once, on request (never per keystroke). Each hit names the session, seq, kind and snippet and opens `/s/:id/events?seq=<seq>`: the events tab scrolled to that row with its envelope open, or a note when the row is older than the loaded window.
+- **PWA.** While the desktop session list's filter has text, a 「会话记录」 card offers to search the same words inside the journals, once, on request (never per keystroke). Each hit names the session, seq, kind and snippet and opens `/s/:id/events?seq=<seq>`: the events tab scrolled to that row with its envelope open. A row below the loaded window is paged to (one older window at a time, at most 50); the tab names it missing only when that is exhausted.
 
 ## 13 Phase 1 wire and state budget
 

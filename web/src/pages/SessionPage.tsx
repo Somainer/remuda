@@ -936,7 +936,11 @@ function SessionPageBody({
       >
         {resolvedView === "events" ? (
           // cb-search: a record-search hit opens the events tab at its row.
-          <RawEvents events={events} focusSeq={new URLSearchParams(location.search).get("seq") ?? undefined} />
+          <RawEvents
+            events={events}
+            focusSeq={new URLSearchParams(location.search).get("seq") ?? undefined}
+            loadEarlier={() => hubStore.loadEarlier(instance.id)}
+          />
         ) : resolvedView === "files" ? (
           <FilesView
             hostId={instance.hostId}

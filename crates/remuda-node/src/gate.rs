@@ -11780,15 +11780,21 @@ head -c 1 >/dev/null || exit 4
     #[test]
     fn run_owned_completes_reaps_and_timeout_kills_unreaped_group() {
         let keep = tempfile::TempDir::new().unwrap();
+        // Installed closed and complete (hidden part file, renamed into
+        // place): a direct write leaves the script open for writing while
+        // other test threads fork, and the spawn then fails with ETXTBSY.
         let quick = keep.path().join("quick");
-        std::fs::write(&quick, "#!/bin/sh\nexit 0\n").unwrap();
+        remuda_testing::install_at(&quick, "#!/bin/sh\nexit 0\n").unwrap();
         let long = keep.path().join("long");
-        // Leader + a grandchild, both in the script's new group.
-        std::fs::write(&long, "#!/bin/sh\n(sleep 47.73 &)\nexec sleep 47.73\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        for bin in [&quick, &long] {
-            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // Leader + a grandchild, both in the script's new group. The sleep
+        // duration is unique to this process, so the liveness scan below can
+        // never count a concurrent run of this test.
+        let marker = unique_sleep_duration(1);
+        remuda_testing::install_at(
+            &long,
+            format!("#!/bin/sh\n(sleep {marker} &)\nexec sleep {marker}\n"),
+        )
+        .unwrap();
 
         // Completed path: a generous deadline, normal exit, reaped once.
         let command = std::process::Command::new(quick.to_str().unwrap());
@@ -11821,38 +11827,12 @@ head -c 1 >/dev/null || exit 4
             "the timed-out leader must be SIGKILLed while unreaped: {:?}",
             output.status
         );
-        // No LIVE `sleep 30` from the killed group survives (the group kill
+        // No LIVE sleep from the killed group survives (the group kill
         // reached the grandchild). A killed-and-reparented sleep may be a zombie
-        // pending init's reap, which is excluded by its /proc state (not "Z").
+        // pending init's reap, which the scan excludes.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let live_sleeps: usize = std::fs::read_dir(super::proc_root())
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-                        .filter_map(|name| name.parse::<i32>().ok())
-                        .filter(|pid| {
-                            let base = super::proc_root().join(pid.to_string());
-                            let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
-                                return false;
-                            };
-                            // /proc cmdline separates argv with NUL bytes.
-                            if !cmd.replace('\0', " ").contains("sleep 47.73") {
-                                return false;
-                            }
-                            // Exclude zombies (state field 2 after comm).
-                            if let Ok(stat) = std::fs::read_to_string(base.join("stat"))
-                                && let Some(after) = stat.rsplit_once(')').map(|(_, r)| r)
-                            {
-                                let state = after.split_whitespace().next().unwrap_or("");
-                                return state != "Z";
-                            }
-                            true
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
+            let live_sleeps = live_exact_argv(&["sleep", &marker]);
             if live_sleeps == 0 || std::time::Instant::now() >= deadline {
                 assert_eq!(live_sleeps, 0, "a live group grandchild survived the kill");
                 break;
@@ -11875,13 +11855,14 @@ head -c 1 >/dev/null || exit 4
         let wrapper = keep.path().join("wrapper");
         // Same-group backgrounded transport: stdout detached, stderr inherited
         // (the captured pipe). The leader exits unsuccessfully immediately.
-        std::fs::write(
+        // Installed closed and complete so a concurrent test thread's fork
+        // cannot hold it open for writing (ETXTBSY at the spawn).
+        let marker = unique_sleep_duration(2);
+        remuda_testing::install_at(
             &wrapper,
-            "#!/bin/sh\n(sleep 47.55 >/dev/null) &\necho transport-line >&2\nexit 7\n",
+            format!("#!/bin/sh\n(sleep {marker} >/dev/null) &\necho transport-line >&2\nexit 7\n"),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = std::time::Instant::now();
         let command = std::process::Command::new(wrapper.to_str().unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -11898,7 +11879,7 @@ head -c 1 >/dev/null || exit 4
         // The grandchild was KILLed as part of normal completion.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let left = live_marker_processes("sleep 47.55");
+            let left = live_exact_argv(&["sleep", &marker]);
             if left == 0 || std::time::Instant::now() >= deadline {
                 assert_eq!(left, 0, "the surviving transport grandchild was not killed");
                 break;
@@ -13630,6 +13611,80 @@ head -c 1 >/dev/null || exit 4
     /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline contains the
     /// marker — r19 item 2/3 leftover-process assertion.
     #[cfg(unix)]
+    /// A `sleep` duration no other process uses: this process's pid plus a
+    /// per-test digit (`47.<pid><n>`), so concurrent runs of the same test
+    /// cannot see each other's sleeps.
+    fn unique_sleep_duration(test: u8) -> String {
+        format!("47.{}{test}", std::process::id())
+    }
+
+    /// Live (non-zombie) processes whose argv is exactly `argv`. A substring
+    /// match on the command line also counts unrelated processes that merely
+    /// mention the marker: a shell or grep whose command text contains it
+    /// (2026-11-06: a waiting shell failed a landing gate this way).
+    fn live_exact_argv(argv: &[&str]) -> usize {
+        let Ok(entries) = std::fs::read_dir(super::proc_root()) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| {
+                let base = super::proc_root().join(pid.to_string());
+                let Ok(cmd) = std::fs::read(base.join("cmdline")) else {
+                    return false;
+                };
+                let actual: Vec<&[u8]> = cmd
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .collect();
+                if actual.len() != argv.len()
+                    || actual.iter().zip(argv).any(|(a, b)| *a != b.as_bytes())
+                {
+                    return false;
+                }
+                let Ok(stat) = std::fs::read_to_string(base.join("stat")) else {
+                    return false;
+                };
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("");
+                state != "Z"
+            })
+            .count()
+    }
+
+    #[test]
+    fn live_exact_argv_counts_the_process_not_a_command_that_mentions_it() {
+        let marker = unique_sleep_duration(3);
+        // A shell whose command text mentions the marker (the landing gate saw
+        // a waiting shell like this as a "surviving grandchild").
+        let mut mention = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(": sleep {marker}; exec sleep 30"))
+            .spawn()
+            .unwrap();
+        let mut real = std::process::Command::new("sleep")
+            .arg(&marker)
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            live_exact_argv(&["sleep", &marker]),
+            1,
+            "only the real sleep"
+        );
+        real.kill().unwrap();
+        real.wait().unwrap();
+        assert_eq!(
+            live_exact_argv(&["sleep", &marker]),
+            0,
+            "a reaped sleep is gone"
+        );
+        mention.kill().unwrap();
+        mention.wait().unwrap();
+    }
+
     fn live_marker_processes(marker: &str) -> usize {
         std::fs::read_dir(super::proc_root())
             .map(|entries| {

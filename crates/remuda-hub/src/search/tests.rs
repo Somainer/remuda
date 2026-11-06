@@ -1137,6 +1137,119 @@ async fn the_append_path_and_the_backfill_build_identical_documents() {
     assert_eq!(texts.len(), 8, "{texts:?}");
 }
 
+fn complete(mut event: Value) -> Value {
+    event["payload"]["status"] = json!("complete");
+    event
+}
+
+/// A PTY-shaped stream past the every-row threshold: open, 20 deltas of
+/// ~500 bytes, then a short final delta with a unique word.
+fn long_stream(node: &str, last: Value) -> Vec<Value> {
+    let mut rows = vec![streamed(node, "open", "Start ")];
+    for n in 0..20 {
+        rows.push(streamed(
+            node,
+            "append",
+            &format!("chunk{n} {} ", "filler ".repeat(70)),
+        ));
+    }
+    rows.push(last);
+    rows
+}
+
+/// r3 item 1: a long PTY answer ends with an `append` and no close; its
+/// final delta (under the 1 KiB re-render step) is in the indexed text, live
+/// and through the backfill.
+#[tokio::test]
+async fn the_final_delta_of_a_long_stream_is_findable_live_and_backfilled() {
+    let fx = fixture().await;
+    let rows = long_stream("m1", complete(streamed("m1", "append", "zebrafinch end.")));
+    let live = fx.instance().await;
+    for event in &rows {
+        fx.append(&live, event.clone()).await;
+    }
+    let backfilled = fx.instance().await;
+    let db = fx.db();
+    for (n, event) in rows.iter().enumerate() {
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, '2026-11-01T00:00:00.000Z')",
+            params![
+                backfilled,
+                (n + 1) as i64,
+                format!("evt-{n}"),
+                event.to_string()
+            ],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let mut db = fx.db();
+    while !backfill_batch(&mut db, 7).unwrap().done {}
+    let found = fx.search_limit(human(), "zebrafinch", 10).await;
+    let mut ids: Vec<String> = found
+        .hits
+        .iter()
+        .map(|hit| hit.instance_id.clone())
+        .collect();
+    ids.sort();
+    let mut want = vec![live.clone(), backfilled.clone()];
+    want.sort();
+    assert_eq!(ids, want);
+    for instance in [&live, &backfilled] {
+        let (raw, text, pending): (String, String, bool) = db
+            .query_row(
+                "SELECT raw, text, pending FROM journal_search_docs WHERE instance_id = ?1",
+                [instance],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(raw.len() > 8 * 1024, "{}", raw.len());
+        assert!(
+            text.ends_with("zebrafinch end."),
+            "{}",
+            &text[text.len() - 40..]
+        );
+        assert!(!pending);
+    }
+}
+
+/// A stream whose carrier never marks its end converges too: the settle
+/// sweep renders a lagging document once it has been quiet.
+#[tokio::test]
+async fn an_unmarked_long_stream_is_settled_once_quiet() {
+    let fx = fixture().await;
+    let ins = fx.instance().await;
+    for event in long_stream("m1", streamed("m1", "append", "kestrelwing end.")) {
+        fx.append(&ins, event).await;
+    }
+    // Between renders the tail is in raw only.
+    assert!(fx.search(human(), "kestrelwing").await.hits.is_empty());
+    // Not yet quiet: nothing to settle.
+    assert_eq!(
+        fx.store
+            .journal_search_settle(Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fx.store
+            .journal_search_settle(Duration::ZERO)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(fx.search(human(), "kestrelwing").await.hits.len(), 1);
+    assert_eq!(
+        fx.store
+            .journal_search_settle(Duration::ZERO)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;

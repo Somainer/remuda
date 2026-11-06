@@ -75,6 +75,12 @@ const REDACT_SLACK_BYTES: usize = 4 * 1024;
 pub(crate) const BACKFILL_BATCH_ROWS: usize = 2000;
 /// Writer time one backfill batch may take before it stops early.
 const BACKFILL_BATCH_BUDGET: Duration = Duration::from_millis(100);
+/// A document whose text lags its raw text is rendered once no row has
+/// reached it for this long (a stream whose carrier never marks its end).
+const SETTLE_QUIET: Duration = Duration::from_secs(30);
+/// How often the settle sweep runs, and how many documents one job renders.
+const SETTLE_EVERY: Duration = Duration::from_secs(30);
+const SETTLE_BATCH: usize = 200;
 /// Pause between backfill batches, so appends interleave on the writer.
 const BACKFILL_PAUSE: Duration = Duration::from_millis(20);
 /// Pause after a failed batch before it is retried.
@@ -127,8 +133,11 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             head TEXT NOT NULL,
             raw TEXT NOT NULL,
             indexed_len INTEGER NOT NULL,
+            pending INTEGER NOT NULL,
             text TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS journal_search_docs_pending
+            ON journal_search_docs (observed_at) WHERE pending = 1;
         CREATE INDEX IF NOT EXISTS journal_search_docs_node
             ON journal_search_docs (instance_id, kind, node_id, seq);
         CREATE VIRTUAL TABLE IF NOT EXISTS journal_fts USING fts5(
@@ -202,6 +211,10 @@ pub(crate) struct Piece {
     /// The row's raw text (a message's or result's text, a call's input
     /// delta), bounded.
     pub(crate) text: String,
+    /// The carrier marked the row complete (`payload.status == "complete"`):
+    /// the PTY message fold on its final chunk, claude-print's stream, the
+    /// codex and grok adapters. The document is rendered in full on it.
+    pub(crate) complete: bool,
 }
 
 /// `{"state":"known","value":…}` → the value; a bare value passes through.
@@ -293,6 +306,7 @@ pub(crate) fn extract(event: &Value) -> Option<Piece> {
         .unwrap_or("")
         .to_string();
     let block = payload.get("targetBlock").and_then(Value::as_i64);
+    let complete = payload.get("status").and_then(Value::as_str) == Some("complete");
     let piece = |kind, role, head, input, text: String| Piece {
         kind,
         node_id: node_id.clone(),
@@ -302,6 +316,7 @@ pub(crate) fn extract(event: &Value) -> Option<Piece> {
         head,
         input,
         text: clip_bytes(&text, raw_cap(kind)).to_string(),
+        complete,
     };
     let piece = match journal_event_kind(event) {
         "message" => {
@@ -428,6 +443,14 @@ pub(crate) struct DocState {
     pub(crate) text: String,
 }
 
+impl DocState {
+    /// Whether `text` lags `raw` (a long stream between renders); the
+    /// settle sweep renders such a document once it has been quiet.
+    fn pending(&self) -> bool {
+        self.indexed_len != self.raw.len()
+    }
+}
+
 /// What one row did to its node.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Step {
@@ -551,6 +574,7 @@ pub(crate) fn step(
     let grown = doc.raw.len().saturating_sub(doc.indexed_len);
     if new
         || piece.mode == PieceMode::Snapshot
+        || piece.complete
         || doc.raw.len() <= REINDEX_EVERY_ROW_BYTES
         || grown >= REINDEX_STEP_BYTES
         || doc.text.is_empty()
@@ -608,8 +632,8 @@ fn insert_doc(
     conn.execute(
         "INSERT INTO journal_search_docs
             (instance_id, kind, node_id, first_seq, seq, role, observed_at, block, head,
-             raw, indexed_len, text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             raw, indexed_len, pending, text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             instance_id,
             kind_wire(kind),
@@ -622,6 +646,7 @@ fn insert_doc(
             doc.head,
             doc.raw,
             doc.indexed_len as i64,
+            doc.pending(),
             doc.text
         ],
     )?;
@@ -723,7 +748,7 @@ pub(crate) fn index_event(
                 conn.execute(
                     "UPDATE journal_search_docs
                         SET seq = ?2, observed_at = ?3, role = ?4, block = ?5, head = ?6,
-                            raw = ?7, indexed_len = ?8, text = ?9
+                            raw = ?7, indexed_len = ?8, pending = ?9, text = ?10
                       WHERE id = ?1",
                     params![
                         id,
@@ -734,6 +759,7 @@ pub(crate) fn index_event(
                         doc.head,
                         doc.raw,
                         doc.indexed_len as i64,
+                        doc.pending(),
                         doc.text
                     ],
                 )?;
@@ -747,6 +773,37 @@ pub(crate) fn index_event(
         }
     }
     Ok(true)
+}
+
+/// Render documents whose text lags their raw concatenation and that have
+/// been quiet since `cutoff` (a stream whose carrier never marked its end),
+/// at most `limit`. Returns how many were rendered.
+fn settle_conn(conn: &mut Connection, cutoff: &str, limit: usize) -> Result<usize, StoreError> {
+    let tx = immediate_tx(conn)?;
+    let docs: Vec<(i64, String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, kind, head, raw FROM journal_search_docs
+              WHERE pending = 1 AND observed_at <= ?1
+              ORDER BY observed_at LIMIT ?2",
+        )?;
+        stmt.query_map(params![cutoff, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    for (id, kind, head, raw) in &docs {
+        tx.execute(
+            "UPDATE journal_search_docs SET text = ?2, indexed_len = ?3, pending = 0
+              WHERE id = ?1",
+            params![
+                id,
+                render(kind_from_wire(kind), head, raw),
+                raw.len() as i64
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(docs.len())
 }
 
 // ─── Backfill ──────────────────────────────────────────────────────────────
@@ -899,7 +956,7 @@ pub(crate) fn spawn_backfill(store: Store) {
                                 "journal search backfill done"
                             );
                         }
-                        return;
+                        break;
                     }
                     tokio::time::sleep(BACKFILL_PAUSE).await;
                 }
@@ -909,6 +966,21 @@ pub(crate) fn spawn_backfill(store: Store) {
                     tokio::time::sleep(BACKFILL_RETRY).await;
                 }
             }
+        }
+        // Then, for the Hub's life: render documents whose stream went
+        // quiet without its carrier marking the end.
+        loop {
+            match store.journal_search_settle(SETTLE_QUIET).await {
+                Ok(rendered) if rendered >= SETTLE_BATCH => continue,
+                Ok(rendered) => {
+                    if rendered > 0 {
+                        tracing::debug!(rendered, "journal search settled quiet documents");
+                    }
+                }
+                Err(StoreError::Closed) => return,
+                Err(error) => tracing::warn!(%error, "journal search settle failed"),
+            }
+            tokio::time::sleep(SETTLE_EVERY).await;
         }
     });
 }
@@ -1251,6 +1323,19 @@ impl Store {
     ) -> Result<BackfillStep, StoreError> {
         self.run_named("journal_search_backfill", move |conn| {
             backfill_batch(conn, limit)
+        })
+        .await
+    }
+
+    /// Render up to [`SETTLE_BATCH`] lagging documents quiet for `quiet`
+    /// ([`settle_conn`]).
+    pub(crate) async fn journal_search_settle(&self, quiet: Duration) -> Result<usize, StoreError> {
+        let cutoff = crate::config::rfc3339(
+            time::OffsetDateTime::now_utc()
+                - time::Duration::try_from(quiet).unwrap_or(time::Duration::ZERO),
+        );
+        self.run_named("journal_search_settle", move |conn| {
+            settle_conn(conn, &cutoff, SETTLE_BATCH)
         })
         .await
     }

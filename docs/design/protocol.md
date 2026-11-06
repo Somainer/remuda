@@ -2346,6 +2346,8 @@ D-055 不变（见 decisions.md D-055 的 2026-11-05 修订注）：编辑保留
 - `pending` 列出本实例尚未生效的 configure，每项 `{commandId, state: queued|deferred, boundary?, model?, effort?, initiator?, createdAt}`：`queued` 是 Hub 尚未转发的行，`deferred` 是带 boundary 的行。
 - Worker digest（main-agent.md §10.2）的 `model` 增加 `generation`；`model.configure` 的 `state` 取 `queued`、`accepted` 或 `deferred`，deferred 时另带 `boundary`。仍在 2048 字节以内。
 
+**Agent 来源的 configure（`ap-configure`，2026-11-06 补全）。** Agent（含用 `x-remuda-instance-id` 收窄的 Human 令牌）只能对自己拥有的实例（`owns()`）configure，不需要审批，generation CAS 与 `deferred` 与 Human 相同。payload 只认 `model`/`modelId`、`effort`（其对象带 ultracode 开关）、`effortName` 与 `expectedGeneration`（`instanceId`、`origin` 由 Hub 写入）；带非 null 的 `permissionMode`，或任何其他字段，403 `configure-operator-only`，`next.action` 为 `ask-owner`，提示指向 `ap-configure-mode`（档位变更等所有者决定 OA1 如何适用，main-agent.md §15.2）；`args`、`binaryPath`、`skills` 照 create 的 `restrict_launch_overrides` 403 `operator-only`。模型 id 与 Agent create 的 `model` 用同一词表：一个至多 128 字符的记号，不含空白与控制字符，不以 `-` 开头，否则 400 `model-invalid`（它只能是 `--model` 的值，或终端承载在 `/model` 之后键入的文本，不能变成 flag 或按键）。每条被受理的 Agent configure 写一条审计 `instance.configure`（commandId、改动的字段名、merge 后的 generation，不记字段值），行上带 Agent 的 initiator；`instance.configure.conflict` 也带。Human 与 Bot 的 configure 不变。
+
 **审计。** 编辑写 `command.edit`（commandId、实例、新 revision），撤回写 `command.withdraw`（commandId、实例、revision、`held`），generation 冲突写 `instance.configure.conflict`（实例、commandId、`expectedGeneration`、当前 generation）；行上带调用方设备与 Agent 的 initiator。审计与日志只记类别和 id，绝不记 prompt 文本。 Agent 的 send 排队时 Hub 已把当时的文本记进发送方与目标的 journal；之后被编辑或撤回时，两边 journal 各追加一条不含文本的 Hub 诊断（`queued-command-edited` / `queued-command-withdrawn`，带 commandId 与 revision），先前那条记录不会被当作已送达的内容。
 
 ~~~text
@@ -2475,6 +2477,8 @@ HTTP 409
 **实现现状（`cb-errors`）。** 除首批取值外，当前实现还发出同一词汇的三个原因：`stale-caller`（凭证背后的实例行已不存在，`ask-owner`）、`approval-invalid`（approvalId 未知、过期、已用或不属于本次动作，`fix-request`）、`delivery-unknown`（`instance.configure` 重放的投递结果未知，`read-then-decide`，并带 `commandId`）。
 
 **`ma-admission`（D-057 OA1，2026-11-01）新增四个原因。** Agent 来源 create、dispatch、worker 重生的权限档位按「子不超父」被拒时为 403 `FORBIDDEN`，`next.action` 为 `fix-request`，`hint` 列出子实例 harness 可选的档位：`permission-mode-unknown`（请求的档位不在子实例 harness 的词表里）、`permission-mode-not-inheritable`（省略档位，而创建者自己的档位不在子实例 harness 的词表里）、`beyond-creator`（关闭控制的档位，而创建者自身保留控制）。提交点复读到创建者档位已变时为 409 `CONFLICT`，原因 `creator-mode-changed`，`next.action` 为 `retry-same-command`（什么都没有启动，原请求可直接重发，按创建者当前档位重新受理）。
+
+**2026-11-06 补（ap-actions）：Agent 动作的两个原因。** `configure-operator-only`：Agent 的 `instance.configure` 带了模型、effort、ultracode 与 generation 以外的字段（首先是 `permissionMode`），403 `FORBIDDEN`，`next.action` 为 `ask-owner`，提示指向 `ap-configure-mode`。`model-invalid`：Agent create 或 configure 的模型 id 不在 §8.5 的词表里，400 `BAD_REQUEST`，`next.action` 为 `fix-request`。
 
 **2026-11-05 补（cb-command-queue，§8.5）：排队命令与 configure generation 的拒绝。** Hub HTTP 错误体新增三个 `code`，均为 409，都带 `reason` 与 `next`：
 - `COMMAND_NOT_QUEUED`，`reason: "already-delivered"`：命令不能再证明尚未送达；`next.action` 为 `read-then-decide`，带 `commandId`。

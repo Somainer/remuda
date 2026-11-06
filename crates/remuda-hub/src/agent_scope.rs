@@ -913,6 +913,10 @@ pub async fn prepare_create(
         // The store re-checks scope subset/grants against this same parent
         // row inside the writer; this is the early, cheap rejection.
         require_grant(state, device, remuda_protocol::GrantVerb::Dispatch).await?;
+        // `ap-configure`: the model vocabulary a configure is held to.
+        if let Some(model) = spec.get("model").filter(|value| !value.is_null()) {
+            check_agent_model(model)?;
+        }
         let caller_id = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
         let caller_instance = state
             .store
@@ -970,13 +974,18 @@ pub async fn authorize_command(
         }
         // `ap-configure` (cb-command-queue, main-agent.md §4.2.2): model,
         // effort and ultracode on owned targets, no approval; a permission
-        // mode change stays operator-only until `ap-configure-mode`.
+        // mode change, or any other field, stays operator-only until
+        // `ap-configure-mode`. The generation CAS and `deferred` then apply
+        // as for a Human (`post_command`).
         if operation == "instance.configure" {
-            if payload
-                .get("permissionMode")
-                .is_some_and(|mode| !mode.is_null())
-            {
-                return Err(HubError::operator_only());
+            restrict_launch_overrides(device, payload)?;
+            if let Some(field) = agent_configure_refused_field(payload) {
+                return Err(HubError::configure_operator_field(field));
+            }
+            for key in ["model", "modelId"] {
+                if let Some(model) = payload.get(key).filter(|value| !value.is_null()) {
+                    check_agent_model(model)?;
+                }
             }
             if !owns(state, device, &instance.instance_id).await? {
                 return Err(HubError::not_owner());
@@ -1009,6 +1018,60 @@ pub async fn authorize_command(
         }
     }
     Ok(())
+}
+
+/// The `instance.configure` payload fields an Agent may set (`ap-configure`):
+/// the model (either spelling), the effort (whose object carries the
+/// ultracode switch), and the generation it read. `instanceId` and `origin`
+/// are Hub-written by `post_command` and [`stamp`].
+const AGENT_CONFIGURE_FIELDS: [&str; 7] = [
+    "model",
+    "modelId",
+    "effort",
+    "effortName",
+    "expectedGeneration",
+    "instanceId",
+    "origin",
+];
+
+/// The first configure field an Agent may not set: `permissionMode` before
+/// any other, so the refusal names the field `ap-configure-mode` is about. A
+/// `null` value sets nothing and is not a change.
+fn agent_configure_refused_field(payload: &Value) -> Option<&str> {
+    let object = payload.as_object()?;
+    if object
+        .get("permissionMode")
+        .is_some_and(|mode| !mode.is_null())
+    {
+        return Some("permissionMode");
+    }
+    object
+        .iter()
+        .find(|(key, value)| !value.is_null() && !AGENT_CONFIGURE_FIELDS.contains(&key.as_str()))
+        .map(|(key, _)| key.as_str())
+}
+
+/// `ap-configure`: the model-id vocabulary an Agent may name, one rule for a
+/// create ([`prepare_create`]) and a configure ([`authorize_command`]) alike.
+/// A model id is one token of at most [`remuda_protocol::SEAT_PROFILE_MAX_MODEL`]
+/// characters (the seat profile's bound) with no whitespace or control
+/// character and no leading `-`. A create passes it as the value of
+/// `--model`, and a terminal carrier types it after `/model`, so a value
+/// outside this vocabulary could only be a flag or keystrokes, which an Agent
+/// never chooses (`restrict_launch_overrides`; keys need the D-017 approval).
+pub fn check_agent_model(model: &Value) -> Result<(), HubError> {
+    let Some(text) = model.as_str() else {
+        return Err(HubError::model_invalid(&model.to_string()));
+    };
+    let valid = !text.is_empty()
+        && text.chars().count() <= remuda_protocol::SEAT_PROFILE_MAX_MODEL
+        && !text.starts_with('-')
+        && !text.chars().any(|c| c.is_whitespace() || c.is_control());
+    if valid {
+        Ok(())
+    } else {
+        Err(HubError::model_invalid(text))
+    }
 }
 
 /// True when the addressed instance lies inside the caller's delegation scope.

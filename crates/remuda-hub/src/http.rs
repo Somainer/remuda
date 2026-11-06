@@ -3351,7 +3351,29 @@ pub async fn post_command(
             )
             .await
         {
-            Ok(merged) => generation = Some(merged.configure_seq),
+            Ok(merged) => {
+                generation = Some(merged.configure_seq);
+                // `ap-configure`: an Agent's configure is an audit row naming
+                // the Agent actor (its stamped initiator), fields and ids only.
+                if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+                    let fields: Vec<&str> = ["model", "modelId", "effort", "effortName"]
+                        .into_iter()
+                        .filter(|key| command.payload.get(*key).is_some_and(|v| !v.is_null()))
+                        .collect();
+                    audit_configure(
+                        &state,
+                        &device,
+                        "instance.configure",
+                        &instance_id,
+                        json!({
+                            "commandId": command.command_id,
+                            "fields": fields,
+                            "generation": merged.configure_seq,
+                        }),
+                    )
+                    .await;
+                }
+            }
             Err(store_error) => {
                 return Err(configure_merge_failed(
                     &state,
@@ -3439,6 +3461,35 @@ pub async fn post_command(
     Ok(Json(body))
 }
 
+/// A configure audit row (cb-command-queue, `ap-configure`): the caller's
+/// device and, for an Agent (a narrowed Human included), the Hub-stamped
+/// initiator, so the row names the Agent actor. Best effort.
+async fn audit_configure(
+    state: &AppState,
+    device: &crate::store::Device,
+    action: &str,
+    instance_id: &str,
+    detail: Value,
+) {
+    let initiator = crate::agent_scope::initiator_for(state, device)
+        .await
+        .ok()
+        .flatten();
+    if let Err(error) = state
+        .store
+        .append_audit_as(
+            device.id.clone(),
+            action.to_owned(),
+            Some(instance_id.to_owned()),
+            detail,
+            initiator,
+        )
+        .await
+    {
+        tracing::warn!(%error, action, "configure audit row not written");
+    }
+}
+
 /// Persist a configure's failed first merge with its command (D-055: a
 /// replay reproduces this exact status and body) and return the error.
 async fn configure_merge_failed(
@@ -3450,19 +3501,18 @@ async fn configure_merge_failed(
 ) -> HubError {
     // cb-command-queue: a stale `expectedGeneration` is an audit row.
     if let crate::store::StoreError::GenerationConflict { generation, .. } = &store_error {
-        let _ = state
-            .store
-            .append_audit(
-                device.id.clone(),
-                "instance.configure.conflict".into(),
-                Some(instance_id.to_owned()),
-                json!({
-                    "commandId": command.command_id,
-                    "expectedGeneration": command.payload.get("expectedGeneration"),
-                    "generation": generation,
-                }),
-            )
-            .await;
+        audit_configure(
+            state,
+            device,
+            "instance.configure.conflict",
+            instance_id,
+            json!({
+                "commandId": command.command_id,
+                "expectedGeneration": command.payload.get("expectedGeneration"),
+                "generation": generation,
+            }),
+        )
+        .await;
     }
     let error = map_store(store_error);
     let (http_status, http_body) = error.status_code_and_body();

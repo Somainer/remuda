@@ -362,6 +362,42 @@ impl HubError {
         Self::Forbidden.with_next("operator-only", NextStep::new(action::FIX_REQUEST, hint))
     }
 
+    /// 403 for an Agent `instance.configure` that names a field other than the
+    /// model, effort, ultracode and generation (`ap-configure`): the permission
+    /// mode, like every other field, stays operator-only until
+    /// `ap-configure-mode` (main-agent.md §15.2).
+    pub fn configure_operator_field(field: &str) -> Self {
+        Self::ForbiddenReason(format!(
+            "an Agent seat may not configure `{field}`; only model, effort and ultracode"
+        ))
+        .with_next(
+            "configure-operator-only",
+            NextStep::new(
+                action::ASK_OWNER,
+                format!(
+                    "an Agent seat changes only the model, effort and ultracode of a session \
+                     it owns; `{field}` stays operator-only until `ap-configure-mode` \
+                     (main-agent.md §15.2). Do not retry with it: drop the field, or ask the \
+                     owner to change it"
+                ),
+            ),
+        )
+    }
+
+    /// 400 for a model id outside the vocabulary an Agent may name on a create
+    /// or a configure (`ap-configure`).
+    pub fn model_invalid(model: &str) -> Self {
+        Self::BadRequest(format!("model {model:?} is not a model id")).with_next(
+            "model-invalid",
+            NextStep::new(
+                action::FIX_REQUEST,
+                "a model id is one token of at most 128 characters, with no whitespace or \
+                 control character, that does not start with `-`; name a model the harness \
+                 lists",
+            ),
+        )
+    }
+
     /// 403 for a route the Agent middleware does not admit.
     pub fn agent_route() -> Self {
         Self::Forbidden.with_next(

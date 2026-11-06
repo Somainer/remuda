@@ -175,6 +175,11 @@ A 409 `generation-conflict` carries the current values: decide again from
 them. A `deferred` answer names when it takes effect (`next-turn`: the
 worker's next idle moment; `next-chapter`: its next launch).
 
+From a seat, `configure` changes only the model, effort and ultracode of a
+session you own. A permission-mode change is the owner's (403
+`configure-operator-only`): report what you need instead of retrying. A
+model id is one token with no spaces that does not start with `-`.
+
 ## read
 
 ```bash
